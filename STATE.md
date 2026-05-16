@@ -2,14 +2,175 @@
 
 **PRD version:** 1.0 (locked)
 **Status:** scaffolding
-**Last session:** 002
-**Next session:** 003
+**Last session:** 003
+**Next session:** 004
 
 ---
 
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 003 — Persistence layer (F-002)
+
+**Branch:** `claude/session-001-bootstrap-LXpGZ`
+(Harness-supplied; see ADR-033. The label encodes the harness invocation,
+not the agent session number.)
+
+**Scope chosen:** F-002 Persistence layer end-to-end.
+
+Session 002 left two open paths for Session 003: **(a) F-001 Android
+completion** (cargo tauri android init + NDK + build-android CI job) or
+**(b) F-002 Persistence layer** if Android proved hard. Inspection of this
+session's container found no Android SDK and no NDK installed (the Rust
+android cross-targets are pre-installed, but `sdkmanager` / `cmdline-tools`
+/ `ndk` are not). Bootstrapping the SDK + NDK is a ~1.5 GiB download +
+license-acceptance dance that, combined with `cargo tauri android init`
+template generation and a first Gradle assemble, would easily eclipse the
+"smaller sessions are better" guidance. F-002 has zero such dependencies
+(the migration was shipped in Session 001 and the workspace already
+declares `sqlx` and `tokio`), unblocks five downstream features (F-003,
+F-004, F-006, F-007, F-012), and is the explicit fallback the Session 002
+heads-up named. F-001 Android lands in Session 004.
+
+**Files added (summary):**
+
+- `crates/kino-core/src/db.rs` — new module. The `Db` handle: `SqlitePool`
+  with `max_connections = 4` for file-backed databases (PRD §3 lock-in)
+  and `max_connections = 1` for the in-memory test path (each in-memory
+  pool connection owns a distinct DB unless backed by shared-cache, so a
+  4-way pool would miss migrations on three out of four; ADR-037).
+  Embedded migrations from `migrations/` via `sqlx::migrate!("../../migrations")`.
+  WAL journaling, `synchronous = NORMAL`. Bootstrap of `settings.install_id`
+  (UUID v4) on first launch, idempotent on reopen. Typed methods:
+  `kv_get` / `kv_set` / `install_id` / `journal_mode` / `cw_list` /
+  `cw_upsert` / `cw_delete` / `addons_list` / `addons_insert` /
+  `addons_delete` / `addons_set_enabled` / `addons_reorder`. 15 unit tests
+  cover the entire surface plus the WAL pragma and migration idempotency.
+- `crates/kino-core/src/cw.rs` — `ContinueWatching` domain type matching
+  the `continue_watching` schema. Includes a `progress()` helper clamped
+  to `[0.0, 1.0]` for the F-012 progress bar.
+- `crates/kino-core/src/addon.rs` — `Addon` and `AddonInsert` types
+  matching the `addons` schema.
+- `crates/kino-core/src/lib.rs` — wires the new modules and re-exports
+  `Db`, `DbError`, `INSTALL_ID_KEY`. The crate-level `Error` enum gains a
+  `Db` transparent variant.
+- `crates/kino-core/Cargo.toml` — adds `sqlx` and `tokio` from workspace
+  deps; adds `tempfile = "3"` as a dev-dependency for file-backed tests.
+- `src-tauri/src/commands.rs` — new module exposing eleven Tauri commands
+  that wrap `Db` methods. Errors cross IPC as `String` (the Tauri convention).
+- `src-tauri/src/paths.rs` — new module. Resolves the per-platform DB path
+  per PRD §3 Storage layout: `dirs::config_dir().join("kino")` on Linux
+  (the PRD pins the dir name to `kino/`, not the bundle identifier that
+  Tauri's `app_config_dir()` would yield), `app.path().app_config_dir()`
+  on Android (maps to `Context.filesDir`). Cfg-gated per OS to avoid the
+  unused-import lint that `-D warnings` would catch.
+- `src-tauri/src/lib.rs` — `setup()` now resolves the DB path, opens the
+  pool via `tauri::async_runtime::block_on(Db::open(&path))`, registers
+  it in app state via `app.manage(db)`, and the `invoke_handler` lists
+  the eleven F-002 commands.
+- `src-tauri/Cargo.toml` — adds `kino-core` (path dep), `dirs = "5"`, and
+  `thiserror` (from workspace).
+
+**Features advanced:**
+
+- F-002: not started → complete
+  - **DB created on first launch at PRD §3 path:** `paths::db_path()`
+    resolves to `~/.config/kino/kino.db` on Linux and
+    `Context.filesDir/kino.db` on Android (Tauri AppHandle path resolver).
+    Parent dir is `mkdir -p`'d before the open.
+  - **Migrations apply cleanly and idempotently:** verified by
+    `migration_round_trip_creates_all_tables` (all six PRD tables present)
+    and `migration_is_idempotent_on_reopen` (install_id survives reopen,
+    no error on second `sqlx::migrate!` run).
+  - **Pool size 4 + WAL mode:** `POOL_SIZE = 4`; `journal_mode()` returns
+    `wal` on the file-backed path (`wal_journal_mode_is_active_on_file_backed_db`).
+  - **KV / CW CRUD / addons CRUD Tauri commands:** all eleven registered
+    in `invoke_handler` and exercised through their underlying `Db`
+    methods by the unit tests.
+  - **Unit tests cover migration round-trip, KV operations, CW upsert
+    behavior:** 15 new tests in `db.rs` plus 1 in `cw.rs` (the
+    progress-clamp invariant). Test surface is end-to-end: same code path
+    the IPC layer would hit, just without the Tauri wrapper.
+
+**ADRs filed this session:**
+
+- **ADR-037** (in-memory test pool is single-connection by design): The
+  `sqlx` sqlite in-memory connection mode (`SqliteConnectOptions::in_memory(true)`)
+  gives each connection a private DB unless paired with a `?cache=shared`
+  URI, which `SqliteConnectOptions` does not expose directly. The fix
+  shipped here forces `max_connections = 1` for `Db::open_in_memory()`,
+  used only by unit tests. The file-backed `Db::open()` path keeps the
+  PRD-mandated `max_connections = 4`, and the file-backed WAL test
+  exercises that path. The alternative (every test uses `tempfile` +
+  file-backed DBs) would double test setup time and the WAL pragma is
+  already independently verified.
+- **ADR-038** (DB path resolution is host-side, not core-side): The PRD
+  §3 storage layout differs per OS (XDG on Linux, `Context.filesDir` on
+  Android), and only the Tauri AppHandle can resolve the Android variant
+  at runtime. Rather than push platform branches into `kino-core` (which
+  must stay testable without a Tauri runtime), the host (`src-tauri`) owns
+  path resolution via `paths.rs` and feeds the absolute path to
+  `Db::open()`. `kino-core` exposes the file-name constant (`kino.db`) so
+  the host doesn't have to duplicate it.
+- **ADR-039** (Tauri command error type is `String`): The Tauri 2 IPC
+  layer serializes command return values as JSON; `kino_core::DbError`
+  could be `#[derive(Serialize)]`'d, but mapping its variants to localized
+  user-facing messages is a frontend concern (PRD §5 i18n). For F-002 the
+  commands return `Result<T, String>` with `e.to_string()` on failure;
+  later sessions may swap to a typed error enum once the UI surfaces them.
+  This matches the Tauri 2 cookbook pattern and is reversible without an
+  API break (`String` is a subtype of any serializable error envelope we
+  might invent later).
+
+**Tests added / coverage notes:**
+
+- Rust: 16 new tests (15 in `db.rs`, 1 in `cw.rs`). Workspace total now
+  20 in `kino-core` (was 5) + 3 in `kino-torrent` + 12 + 4 in `kino-addons`
+  = 39 passing.
+- Frontend: no new tests this session. The persistence layer has no
+  frontend surface yet; F-008 / F-012 will exercise the commands.
+
+**Known issues introduced or resolved:**
+
+- **New (introduced):** none — but the "AppImage bundle step not exercised
+  locally in Session 002" entry below stays open. This session also did
+  not run `cargo tauri build` end-to-end because tauri-cli was not
+  pre-installed in this container; `cargo build -p kino-app --target
+  x86_64-unknown-linux-gnu` (debug and release) was the local proxy. CI
+  is the source of truth for the bundle step.
+- **Resolved:** ADR-031 / Session 002's deferred dependency on `kino-core`
+  from `src-tauri/` — the host now depends on it and uses the `Db` type.
+
+**Heads-up for Session 004:**
+
+- **Primary scope: F-001 Android completion.** Install the Android NDK
+  + cmdline-tools (`apt-get install android-sdk` is not sufficient; the
+  Tauri 2 docs recommend bootstrapping `cmdline-tools/latest/bin/sdkmanager`
+  from the Google-hosted zip and then `sdkmanager --install
+  "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+  "ndk;27.0.12077973"`). Set `ANDROID_HOME` + `NDK_HOME` env vars. Run
+  `cargo install tauri-cli --locked --version "^2"` (Session 002 verified
+  this compiles in ~5 min on this container hardware). Then
+  `cd src-tauri && cargo tauri android init` to generate
+  `src-tauri/gen/android/`. Wire signing with the committed
+  `android/keystore/kino-dev.keystore` (alias `kino-dev`, store/key pw
+  `kinodev`). `cargo tauri android build --apk` must produce a signed
+  APK locally. Then add the `build-android` job to `.github/workflows/ci.yml`
+  mirroring the structure of `build-linux`. Flip F-001 to `[x]`.
+- **Secondary scope (if Android lands fast): F-003 Metadata clients
+  scaffolding** — pure-Rust HTTP clients in `kino-metadata` for TMDB /
+  Trakt / TVDB / Fanart.tv, with `wiremock` integration tests. Locked
+  TTLs and retry backoff already live in `kino-core::constants`.
+- The DB path on Linux is `~/.config/kino/kino.db`. The Tauri host opens
+  it in `setup`; nothing else needs to know.
+- If the frontend wants to call the new commands, they're available via
+  `@tauri-apps/api/core`'s `invoke()` with names `kv_get`, `kv_set`,
+  `install_id`, `cw_list`, `cw_upsert`, `cw_delete`, `addons_list`,
+  `addons_insert`, `addons_delete`, `addons_set_enabled`, `addons_reorder`.
+  The TypeScript bindings (typed wrapper module under `frontend/src/ipc/`)
+  are intentionally NOT generated yet — they land with the first feature
+  that consumes them (F-008 Home for CW; F-016 Settings for addons).
 
 ### Session 002 — Tauri host + SolidJS frontend (F-001 desktop completion)
 
@@ -299,9 +460,10 @@ implementation" split.
 ### Foundation
 - [ ] F-001: Project scaffolding _(in progress — Session 001 landed metadata
   + crates + keystore; Session 002 landed src-tauri + frontend + green Linux
-  `cargo tauri build` + extended CI; Session 003 lands `cargo tauri android
+  `cargo tauri build` + extended CI; Session 004 lands `cargo tauri android
   build` + the `build-android` CI job to flip this to `[x]`)_
-- [ ] F-002: Persistence layer
+- [x] F-002: Persistence layer _(Session 003: sqlx pool, WAL,
+  migrations + install_id bootstrap, KV/CW/addons API + Tauri commands, 16 tests)_
 
 ### Metadata & Catalogs
 - [ ] F-003: Metadata clients (TMDB / Trakt / TVDB / Fanart.tv)
@@ -345,6 +507,9 @@ Additional ADRs filed by sessions:
 | ADR-034 | Tauri 2 on Ubuntu 24.04 uses the `libwebkit2gtk-4.1-dev` / `libsoup-3` / Ayatana indicator stack. The CI workflow installs those packages explicitly; cross-distro coverage (22.04 in particular) is a §6B-1 human verification concern. | 002 |
 | ADR-035 | Placeholder Tauri bundle icons (programmatic DejaVu-Bold "k" PNGs) live in `src-tauri/icons/` until a real brand asset replaces them. | 002 |
 | ADR-036 | Frontend lint config uses ESLint 9 flat config (`frontend/eslint.config.js`) + `typescript-eslint` + `eslint-plugin-solid`. One scoped `eslint-disable-next-line solid/reactivity` documents the `@solid-primitives/i18n` `translator()` library boundary the plugin can't analyze across. | 002 |
+| ADR-037 | `Db::open_in_memory()` forces `max_connections = 1`; the file-backed `Db::open()` keeps PRD §3's `max_connections = 4`. `sqlx` in-memory mode gives each connection a private DB unless paired with a `?cache=shared` URI (which `SqliteConnectOptions` does not expose), so a 4-way pool would see migrations on one connection and nothing on the others. | 003 |
+| ADR-038 | DB path resolution lives in the Tauri host (`src-tauri/src/paths.rs`), not in `kino-core`. Linux uses `dirs::config_dir().join("kino")` per PRD §3 (NOT Tauri's default `app_config_dir()`, which would yield `~/.config/dev.kino.app`). Android delegates to `app.path().app_config_dir()` which maps to `Context.filesDir`. `kino-core` exposes the file-name constant only. | 003 |
+| ADR-039 | F-002 Tauri commands return `Result<T, String>` with `e.to_string()` on failure. A typed Serialize'd error enum is deferred until the UI surfaces these errors with localized messages (PRD §5 i18n); String is a subtype of any future envelope so this is a non-breaking choice. | 003 |
 
 ---
 
