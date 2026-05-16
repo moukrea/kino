@@ -1,0 +1,44 @@
+[package]
+name = "kino-app"
+description = "kino Tauri 2 host binary (single process: backend + axum server + librqbit + frontend window)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# `kino-app` is the binary the Tauri CLI drives on every target. The library
+# crate exists so Tauri's Android scaffold (which expects a `cdylib` named
+# after the package) can link the same code without a second source tree.
+[lib]
+name = "kino_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "kino-app"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Workspace crates intentionally NOT depended on yet; the placeholder home in
+# F-001 has no need for them. They wire in as their corresponding features
+# (F-002+) land.
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"

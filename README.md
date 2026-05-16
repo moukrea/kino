@@ -51,21 +51,34 @@ migrations/         sqlx migrations
 
 ## Building
 
-Prerequisites: a stable Rust toolchain (the project pins one via
-`rust-toolchain.toml`), Node 20+, Java 17+ (for Android), Android SDK + NDK
-(for Android targets), and `cargo-tauri` (`cargo install tauri-cli --version
-"^2.0.0"`).
+Prerequisites:
+
+- A stable Rust toolchain (the project pins one via `rust-toolchain.toml`)
+- Node.js 22+
+- `cargo-tauri` (`cargo install tauri-cli --version "^2.0.0" --locked`)
+- For Android (deferred to a later session): Java 17+, Android SDK + NDK
+- For Linux desktop: WebKit2GTK 4.1 and friends (`libwebkit2gtk-4.1-dev`,
+  `libxdo-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev` on Ubuntu
+  24.04)
 
 ```sh
-# Rust workspace (no Tauri, no frontend)
-cargo build --workspace
+# Rust workspace (lint, test, build the crates)
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-targets
 
-# Full app (once src-tauri and frontend are wired up)
-cargo tauri build                          # Linux desktop
-cargo tauri android build                  # Android universal APK
+# Frontend (lint, typecheck, test, production bundle)
+cd frontend
+npm ci
+npm run lint
+npm run typecheck
+npm test
+npm run build
+cd ..
+
+# Full app
+cargo tauri build --target x86_64-unknown-linux-gnu   # Linux desktop
+cargo tauri android build                              # Android (later)
 ```
 
 Build artifacts produced by CI for tagged releases are listed in PRD §F-018.

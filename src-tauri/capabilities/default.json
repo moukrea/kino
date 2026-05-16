@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default capability granted to the main kino window. Surface area grows as features land.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}
