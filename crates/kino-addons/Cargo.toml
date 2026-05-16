@@ -1,0 +1,29 @@
+[package]
+name = "kino-addons"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Stremio addon protocol client for kino."
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+
+[dependencies]
+kino-core = { path = "../kino-core" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+regex = { workspace = true }
+# Protocol-level HTTP client comes online with the F-007 session.
+
+[dev-dependencies]

@@ -1,0 +1,54 @@
+name: ci
+
+# PRD §F-018: triggered on push to any branch and on pull request. The full
+# matrix (lint / test / build-linux / build-android) lands as the Tauri host
+# and frontend wire up; this Session 001 workflow exercises the Rust
+# workspace that exists today, then no-ops the rest of the matrix so we
+# don't ship a broken build badge.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  rust:
+    name: rust (fmt / clippy / test)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --all-targets
+
+  # build-linux and build-android jobs land once src-tauri and frontend are
+  # wired in. Until then keep them out of the workflow so a green CI badge
+  # actually means something.
