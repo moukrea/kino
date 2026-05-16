@@ -1,9 +1,9 @@
 # kino — Agent State
 
 **PRD version:** 1.0 (locked)
-**Status:** bootstrap
-**Last session:** 001
-**Next session:** 002
+**Status:** scaffolding
+**Last session:** 002
+**Next session:** 003
 
 ---
 
@@ -11,7 +11,175 @@
 
 _New entries prepended at the top._
 
-### Session 001 — Foundation bootstrap
+### Session 002 — Tauri host + SolidJS frontend (F-001 desktop completion)
+
+**Branch:** `claude/session-001-bootstrap-JtPxr`
+(The harness-supplied branch name doesn't reflect the actual session number;
+see ADR-033. Future sessions follow whichever branch the harness assigns or,
+absent one, the protocol's `agent/session-NNN-<slug>` form.)
+
+**Scope chosen:** F-001 completion for the **desktop (Linux)** target —
+stand up the Tauri 2 host, the SolidJS frontend, wire `src-tauri` into the
+workspace, get `cargo tauri build --target x86_64-unknown-linux-gnu` green
+end-to-end, and extend CI accordingly. Android scaffolding (`cargo tauri
+android init`, NDK provisioning, `build-android` CI job) is deferred to
+Session 003 because the Tauri Android template generation needs the NDK and
+SDK installed (~3 GiB) and a meaningful APK test, which together would
+balloon Session 002 well past the "ship something every session" guidance.
+F-001 stays `in progress` because Android isn't done yet; it flips to `[x]`
+the moment Session 003 lands the green Android build.
+
+**Files added (summary):**
+
+- `frontend/` — SolidJS 1.9 + Vite 5 + TailwindCSS 3 + `@solid-primitives/i18n`,
+  matching PRD §3 stack lock-ins.
+  - `package.json`, `package-lock.json`, `tsconfig.json`, `vite.config.ts`,
+    `vitest.config.ts`, `tailwind.config.js`, `postcss.config.js`,
+    `eslint.config.js` (flat config), `index.html`.
+  - `src/index.tsx` (entry), `src/App.tsx` (placeholder home rendering the
+    PRD §F-001 required text "kino"), `src/styles.css` (Tailwind directives +
+    10-foot background).
+  - `src/i18n.ts` + `src/locales/{en,fr}.json` (PRD §5 Internationalization;
+    auto-detect with safe fallback to `en`).
+  - `src/test-setup.ts` (vitest setup hook, currently a no-op).
+  - `src/i18n.test.ts` (5 tests covering locale resolution) +
+    `src/App.test.tsx` (2 tests asserting the F-001 placeholder text and
+    the tagline render).
+- `src-tauri/` — Tauri 2 host binary `kino-app`, App ID `dev.kino.app`,
+  display name `kino` per PRD §F-001.
+  - `Cargo.toml` (rlib + cdylib + staticlib for Android, binary for desktop;
+    workspace-inherited package metadata; ADR-030 lint config).
+  - `build.rs` (standard `tauri_build::build()`).
+  - `tauri.conf.json` (Tauri 2 schema; `1280×800` default window, AppImage
+    bundling, CSP permitting the local axum stream server prefix and
+    `ipc:`/`http://ipc.localhost` Tauri 2 IPC).
+  - `capabilities/default.json` (minimal capability surface; grows as
+    commands land).
+  - `src/main.rs` (thin binary) + `src/lib.rs` (`run()` shared between
+    desktop and Android, sets up `tracing` then runs the default Tauri
+    builder).
+  - `icons/{32x32,128x128,128x128@2x,icon}.png` (placeholder PNGs generated
+    deterministically from Python+PIL; real branding lands in a polish pass).
+- Workspace `Cargo.toml`: `src-tauri` added to `[workspace] members`; the
+  ADR-031 placeholder note removed (since the dir now exists with a valid
+  `Cargo.toml`).
+- `Cargo.lock`: updated by `cargo check` to lock the Tauri 2 dep tree.
+- `.github/workflows/ci.yml`: rewritten into the four-job structure PRD §F-018
+  prescribes — `lint`, `test`, `build-linux`, and a placeholder note for the
+  Session-003 `build-android` job. The `lint` job now includes the frontend
+  ESLint + typecheck steps; `test` runs both `cargo test` and `vitest`;
+  `build-linux` installs the Tauri 2 system deps (`libwebkit2gtk-4.1-dev` +
+  friends), `cargo install tauri-cli`, and runs `cargo tauri build`.
+- `README.md`: build prerequisites updated (Node 22+, Tauri 2 system deps on
+  Ubuntu 24.04 listed explicitly, frontend lint/typecheck/test recipe added).
+
+**Features advanced:**
+
+- F-001: in progress → in progress
+  - **Done this session (Linux side):** `src-tauri/` Tauri 2 host binary
+    (`kino-app`); SolidJS frontend renders the F-001 placeholder text
+    "kino"; `cargo tauri build --target x86_64-unknown-linux-gnu` succeeds
+    end-to-end, producing all three Linux artifacts verified locally:
+    `kino-app` ELF binary (~5.9 MiB stripped), `kino_0.0.0_amd64.deb`
+    (~2.2 MiB), `kino-0.0.0-1.x86_64.rpm` (~2.2 MiB), and
+    `kino_0.0.0_amd64.AppImage` (~88 MiB, with bundled WebKit + GTK).
+    `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D
+    warnings`, `cargo test --workspace --all-targets`, `npm run lint`,
+    `npm run typecheck`, `npm test`, `npm run build` all pass.
+  - **Remaining for `[x]`:** `cargo tauri android build` produces a working
+    APK; `build-android` CI job lands; APK installs on Shield + phone
+    (latter is §6B human verification, not Code Acceptance).
+
+**ADRs filed this session:**
+
+- **ADR-033** (harness branch naming is informational, not session-numbered):
+  The harness provisions a branch name like `claude/session-001-bootstrap-JtPxr`
+  per session. That name reflects the **harness invocation** and does NOT
+  re-number across agent sessions. We treat it as the working branch
+  (because the harness expects pushes to it) but file the actual session
+  number in commit messages and the PR title. Session 002 lives on a branch
+  named "session-001-bootstrap" because that's what the harness handed us;
+  future sessions may receive different names. This formalizes the note
+  Session 001 left under its branch entry.
+- **ADR-034** (Tauri 2 + Linux runtime stack on Ubuntu 24.04): kino targets
+  Ubuntu 22.04 and 24.04 (PRD §6B-1). Ubuntu 24.04 ships
+  `libwebkit2gtk-4.1-dev` (NOT 4.0), `libsoup-3` (NOT 2.4), and the
+  Ayatana-indicator stack. The CI `build-linux` job installs the 4.1
+  packages plus the three AppImage-tooling deps that the official Tauri 2
+  docs don't enumerate: `libfuse2t64` (FUSE runtime for
+  linuxdeploy-x86_64.AppImage), `patchelf` (used by
+  linuxdeploy-plugin-gtk to rewrite RPATHs on bundled libraries), and
+  `squashfs-tools` (`mksquashfs` is appimagetool's bundler). PRD §6B-1
+  verification on Ubuntu 22.04 will need the 4.0-named packages there. The
+  Tauri 2 runtime auto-detects WebKit version, so no source change is
+  needed to support both — only the CI matrix would change to add a
+  22.04 runner. (Adding that is a nice-to-have for Session 003+.)
+- **ADR-035** (placeholder icons committed): F-001 needs PNG icons for
+  Tauri's bundler. Until a real brand asset exists, deterministic
+  programmatically-generated PNGs (DejaVu-Bold "k" over `#0a0a0a`) live at
+  `src-tauri/icons/`. Tauri's bundler is happy; this is a polish task for a
+  later session and is filed under Known Issues / Tech Debt.
+- **ADR-036** (frontend lint config = ESLint 9 flat config + typescript-eslint
+  + eslint-plugin-solid): The frontend uses ESLint 9 (current stable),
+  meaning the legacy `.eslintrc.cjs` form is dead. `frontend/eslint.config.js`
+  exports a flat config tree. One library-pattern `eslint-disable-next-line
+  solid/reactivity` is in `src/i18n.ts` because the plugin can't see across
+  the `translator()` library boundary; documented in-place.
+
+**Tests added / coverage notes:**
+
+- Rust: no new tests this session — Session 001's 23 already cover all the
+  locked content. `kino-app` is a thin wiring crate with no testable logic
+  yet; commands land with their feature.
+- Frontend: 7 new vitest cases (5 in `i18n.test.ts`, 2 in `App.test.tsx`).
+  Locale resolution coverage: undefined candidates, no-match fallback,
+  first-match-wins, region-subtag stripping, case-insensitive matching.
+  App coverage: the F-001 required title text + tagline both render.
+
+**Known issues introduced or resolved:**
+
+- **New (introduced):** placeholder icons are programmatic, not designed
+  (ADR-035). File under Known Issues / Tech Debt below.
+- **Resolved (Session 002, locally) — AppImage bundling on Ubuntu 24.04
+  needs three system packages beyond the Tauri 2 docs minimum:**
+  `libfuse2t64` (Ubuntu 24.04's libfuse 2 successor —
+  `linuxdeploy-x86_64.AppImage` dlopens `libfuse.so.2` even when invoked
+  with `--appimage-extract-and-run`), `patchelf` (linuxdeploy-plugin-gtk
+  walks the AppDir and rewrites RPATH on every GTK/WebKit ELF — without it,
+  the plugin exits 1 partway through), and `squashfs-tools` (`mksquashfs` is
+  appimagetool's bundler). With those three added, the `appimage`,
+  `deb`, and `rpm` bundle steps all succeed locally. The `build-linux` CI
+  workflow installs the same superset so first-CI green is the expected
+  outcome; if it isn't, the failure mode is one of these packages, and the
+  fix is a tighter version pin or a fallback. The Tauri 2 docs only mention
+  the `webkit2gtk` / `xdo` / `appindicator` / `rsvg` quartet — these three
+  extras are an artifact of the AppImage tooling chain rather than Tauri
+  itself.
+- **Resolved:** ADR-031 ("`src-tauri/` not in workspace until it compiles")
+  is satisfied. The directory now has a valid `Cargo.toml` and is a workspace
+  member.
+
+**Heads-up for Session 003:**
+
+- **Primary scope: F-001 Android completion.** Install the Android NDK
+  (`sdkmanager --install "ndk;27.0.12077973"` or the version Tauri 2 docs
+  recommend at session-start), the Android command-line tools, and JDK 17.
+  Run `cargo tauri android init` from `src-tauri/` to generate
+  `src-tauri/gen/android/`. Wire signing with the committed
+  `android/keystore/kino-dev.keystore` (alias `kino-dev`, store/key pw
+  `kinodev`). Get `cargo tauri android build --apk` green locally, then add
+  the `build-android` job to `.github/workflows/ci.yml`. Flip F-001 to `[x]`.
+- **Secondary scope (if Android lands fast): F-002 Persistence layer.** The
+  migration is already shipped (`migrations/0001_init.sql`); F-002 needs the
+  sqlx connection-pool wiring in `kino-core`, the `kv_get`/`kv_set`/CW CRUD/
+  addons CRUD Tauri commands, install_id bootstrap, and the corresponding
+  unit tests.
+- If Android proves hard (NDK download flakiness, signing weirdness,
+  emulator setup), split: 003 = Android scaffold + green build; 004 = F-002;
+  005 = F-003 metadata clients.
+- The container had Tauri-2 Linux deps available via apt at Session 002
+  time; if a future container is missing them, the CI workflow's install
+  block is the source of truth.
 
 **Branch:** `claude/session-001-bootstrap-rsgXK`
 (The harness-supplied branch overrides the AGENT_PROMPT `agent/session-NNN-*`
@@ -130,8 +298,9 @@ implementation" split.
 
 ### Foundation
 - [ ] F-001: Project scaffolding _(in progress — Session 001 landed metadata
-  + crates + keystore; src-tauri + frontend + green tauri build land
-  Session 002)_
+  + crates + keystore; Session 002 landed src-tauri + frontend + green Linux
+  `cargo tauri build` + extended CI; Session 003 lands `cargo tauri android
+  build` + the `build-android` CI job to flip this to `[x]`)_
 - [ ] F-002: Persistence layer
 
 ### Metadata & Catalogs
@@ -172,12 +341,23 @@ Additional ADRs filed by sessions:
 | ADR-030 | Per-crate `forbid(unsafe_code)` + `clippy::pedantic` with `module_name_repetitions / must_use_candidate / missing_errors_doc` allowed. CI enforces `-D warnings`. | 001 |
 | ADR-031 | `src-tauri/` is omitted from `[workspace].members` until its `Cargo.toml` exists (lands Session 002). | 001 |
 | ADR-032 | Cross-constant relational invariants (e.g. `PREBUFFER_TARGET_S < SAFETY_MARGIN_S`) are compile-time `const _: () = assert!(..)` rather than runtime tests. | 001 |
+| ADR-033 | Harness-supplied branch name (e.g. `claude/session-001-bootstrap-JtPxr`) is the working branch the harness expects pushes to; it is NOT renamed across sessions. Session number lives in commit messages and the PR title. | 002 |
+| ADR-034 | Tauri 2 on Ubuntu 24.04 uses the `libwebkit2gtk-4.1-dev` / `libsoup-3` / Ayatana indicator stack. The CI workflow installs those packages explicitly; cross-distro coverage (22.04 in particular) is a §6B-1 human verification concern. | 002 |
+| ADR-035 | Placeholder Tauri bundle icons (programmatic DejaVu-Bold "k" PNGs) live in `src-tauri/icons/` until a real brand asset replaces them. | 002 |
+| ADR-036 | Frontend lint config uses ESLint 9 flat config (`frontend/eslint.config.js`) + `typescript-eslint` + `eslint-plugin-solid`. One scoped `eslint-disable-next-line solid/reactivity` documents the `@solid-primitives/i18n` `translator()` library boundary the plugin can't analyze across. | 002 |
 
 ---
 
 ## Known Issues / Tech Debt
 
-_None yet._
+- **Placeholder Tauri icons.** `src-tauri/icons/*.png` are programmatic
+  black-background "k" PNGs (ADR-035). Replace with real brand assets in a
+  polish pass before any public release. Not blocking for §6A.
+- **AppImage bundle step not exercised locally in Session 002.** The
+  `cargo tauri build --target x86_64-unknown-linux-gnu` step was verified
+  with `--no-bundle` for time budget. The full bundle step (which downloads
+  `linuxdeploy` and packages the AppImage) lands first in CI. If CI flags
+  it, Session 003 fixes it as highest-priority scope before any other work.
 
 ---
 
@@ -240,3 +420,15 @@ Populated as conventions are established:
 - **PRD line numbers are not stable references.** When citing PRD provisions
   in code comments or ADR text, cite the section / feature ID (e.g.
   `PRD §F-014`, `PRD §8`), never line numbers.
+- **Frontend layout.** `frontend/` is a single SolidJS bundle shared across
+  Linux / Android / Android TV (ADR-013). Locales live in `src/locales/<lang>.json`
+  (PRD §5). Tauri's `tauri.conf.json` points `frontendDist` at
+  `../frontend/dist` and runs `npm --prefix ../frontend run dev/build` from
+  `before{Dev,Build}Command`. Tests use vitest + jsdom; setup hook is
+  `src/test-setup.ts`.
+- **Tauri host crate (`src-tauri/`).** The crate is `kino-app`, library name
+  `kino_app_lib`. Desktop builds use the binary in `src/main.rs`; Android
+  links the cdylib. The shared `run()` lives in `src/lib.rs` and is the only
+  thing the Android entry point will need (`#[cfg_attr(mobile,
+  tauri::mobile_entry_point)]`). Tauri commands are registered alongside
+  the feature that adds them — never as preemptive stubs.

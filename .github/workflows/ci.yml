@@ -1,10 +1,10 @@
 name: ci
 
 # PRD §F-018: triggered on push to any branch and on pull request. The full
-# matrix (lint / test / build-linux / build-android) lands as the Tauri host
-# and frontend wire up; this Session 001 workflow exercises the Rust
-# workspace that exists today, then no-ops the rest of the matrix so we
-# don't ship a broken build badge.
+# matrix is `lint` / `test` / `build-linux` / `build-android`. The Android job
+# lands once the Tauri Android scaffold is generated (Session 003+, F-001
+# completion plus NDK provisioning); until then build-android is omitted so
+# the green badge actually means something.
 
 on:
   push:
@@ -18,8 +18,8 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
-  rust:
-    name: rust (fmt / clippy / test)
+  lint:
+    name: lint (cargo fmt + clippy + frontend lint + typecheck)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -29,6 +29,25 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Install Tauri 2 Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libfuse2t64 \
+            patchelf \
+            squashfs-tools
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
       - name: Cache cargo registry + target
         uses: actions/cache@v4
         with:
@@ -36,8 +55,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
           restore-keys: |
+            ${{ runner.os }}-cargo-lint-
             ${{ runner.os }}-cargo-
 
       - name: cargo fmt --check
@@ -46,9 +66,131 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: frontend lint
+        working-directory: frontend
+        run: npm run lint
+
+      - name: frontend typecheck
+        working-directory: frontend
+        run: npm run typecheck
+
+  test:
+    name: test (cargo test + vitest)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install Tauri 2 Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libfuse2t64 \
+            patchelf \
+            squashfs-tools
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-
+            ${{ runner.os }}-cargo-
+
       - name: cargo test
         run: cargo test --workspace --all-targets
 
-  # build-linux and build-android jobs land once src-tauri and frontend are
-  # wired in. Until then keep them out of the workflow so a green CI badge
-  # actually means something.
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: frontend test
+        working-directory: frontend
+        run: npm test
+
+  build-linux:
+    name: build-linux (cargo tauri build)
+    runs-on: ubuntu-24.04
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Tauri 2 Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libfuse2t64 \
+            patchelf \
+            squashfs-tools
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-build-linux-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-linux-
+            ${{ runner.os }}-cargo-
+
+      - name: Install tauri-cli
+        run: cargo install tauri-cli --version "^2.0.0" --locked
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: cargo tauri build
+        run: cargo tauri build --target x86_64-unknown-linux-gnu
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kino-linux-x86_64-debug-build
+          path: |
+            target/x86_64-unknown-linux-gnu/release/kino-app
+            target/x86_64-unknown-linux-gnu/release/bundle/**/*
+          if-no-files-found: warn
+
+  # build-android lands in the session that wires up the Tauri Android
+  # scaffold (NDK + targets + cargo tauri android init + signing). Tracked in
+  # STATE.md Feature Tracker under F-001 / F-018.
