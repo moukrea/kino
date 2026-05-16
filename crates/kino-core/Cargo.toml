@@ -26,4 +26,10 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 
+# Persistence (PRD §3, §F-002). Pulls in the sqlx runtime so any consumer
+# (kino-app, tests) shares one tokio runtime.
+sqlx = { workspace = true }
+tokio = { workspace = true }
+
 [dev-dependencies]
+tempfile = "3"

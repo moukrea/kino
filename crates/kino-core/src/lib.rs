@@ -1,17 +1,22 @@
 //! `kino-core` — shared types and primitives used by every other crate.
 //!
-//! This crate is intentionally dependency-light. It holds:
+//! This crate holds:
 //!
 //! - Locked numeric constants from PRD §8 (see [`constants`]).
-//! - Shared data types ([`title`], [`stream`]) shaped by the PRD.
+//! - Shared data types ([`title`], [`stream`], [`cw`], [`addon`]) shaped by
+//!   the PRD.
+//! - The persistence layer ([`db`]) wired to the workspace-root
+//!   `migrations/` directory (PRD §F-002).
 //! - The crate-level error type [`Error`].
-//!
-//! Heavier subsystems (DB access, settings loading, install-id management)
-//! are wired in by the persistence-layer session (F-002).
 
+pub mod addon;
 pub mod constants;
+pub mod cw;
+pub mod db;
 pub mod stream;
 pub mod title;
+
+pub use db::{Db, DbError, INSTALL_ID_KEY};
 
 /// Crate-level error type. Kept narrow on purpose; subsystems add their own
 /// thiserror enums and convert when crossing module boundaries.
@@ -23,6 +28,8 @@ pub enum Error {
     NotFound(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Db(#[from] DbError),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
