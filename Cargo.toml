@@ -1,0 +1,82 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kino-core",
+    "crates/kino-torrent",
+    "crates/kino-server",
+    "crates/kino-addons",
+    "crates/kino-metadata",
+]
+# `src-tauri` is intentionally NOT in this list yet. It is added in the session
+# that wires up the Tauri host binary (see STATE.md Feature Tracker). Adding it
+# here before its Cargo.toml exists would break `cargo build --workspace`.
+
+[workspace.package]
+# Single workspace version per ADR-026. Bumped by the release session only.
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.94"
+license = "MIT"
+authors = ["kino contributors"]
+repository = "https://github.com/moukrea/kino"
+readme = "../../README.md"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# HTTP client (per PRD §3)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "brotli"] }
+
+# HTTP server (per PRD §3)
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Persistence (per PRD §3)
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "macros", "migrate", "chrono"] }
+
+# Errors (per PRD §3, ADR-017)
+thiserror = "1"
+anyhow = "1"
+
+# Logging (per PRD §3, ADR-017)
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+# Time
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+
+# IDs
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Hashing (used by the daily trending seed per F-004)
+sha2 = "0.10"
+
+# Seeded PRNG (per ADR-028)
+rand = "0.8"
+rand_chacha = "0.3"
+
+# Regex (used by stream filename parsing per §8)
+regex = "1"
+
+# Test utilities
+wiremock = "0.6"
+tokio-test = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[profile.dev]
+opt-level = 0
+debug = true

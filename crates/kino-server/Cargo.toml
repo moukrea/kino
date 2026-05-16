@@ -1,0 +1,28 @@
+[package]
+name = "kino-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Local HTTP server (axum, 127.0.0.1) that exposes torrent streams to the platform player."
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+
+[dependencies]
+kino-core = { path = "../kino-core" }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+# axum / tower wiring lands in F-013 alongside the librqbit integration; this
+# crate is intentionally a thin shell until then.
+
+[dev-dependencies]

@@ -1,0 +1,30 @@
+[package]
+name = "kino-torrent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "librqbit wrapper and adaptive-buffer scheduler for kino."
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+
+[dependencies]
+kino-core = { path = "../kino-core" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# librqbit itself is added in the session that implements F-013. Pulling it
+# in now would force every other session to compile a torrent engine on the
+# critical path with nothing to validate.
+
+[dev-dependencies]

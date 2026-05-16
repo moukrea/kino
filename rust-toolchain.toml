@@ -1,0 +1,14 @@
+# Pinned per PRD §3 ("latest stable at Session 001; MSRV = that version, no chasing").
+# Session 001 selected 1.94.1 — the stable release available when the workspace
+# was bootstrapped. Do not bump without a human PRD revision.
+[toolchain]
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-linux-android",
+    "armv7-linux-androideabi",
+    "i686-linux-android",
+    "x86_64-linux-android",
+]
+profile = "minimal"
