@@ -4,12 +4,17 @@
 //! that owns it. Errors cross the IPC boundary as plain strings — the Tauri
 //! frontend bindings surface them through the standard `Result` shape.
 //!
-//! F-002 ships KV (settings), Continue Watching, and addon CRUD. Later
-//! features extend this module rather than introducing parallel registries.
+//! F-002 ships KV (settings), Continue Watching, and addon CRUD. F-003 adds
+//! the per-provider credential-test commands. Later features extend this
+//! module rather than introducing parallel registries.
 
 use kino_core::addon::{Addon, AddonInsert};
 use kino_core::cw::ContinueWatching;
 use kino_core::Db;
+use kino_metadata::{
+    FanartClient, TmdbClient, TraktClient, TvdbClient, FANART_API_KEY, TMDB_API_KEY, TRAKT_API_KEY,
+    TVDB_API_KEY,
+};
 use tauri::State;
 
 /// Convert a `kino-core` error into the string the Tauri IPC layer
@@ -86,4 +91,45 @@ pub async fn addons_set_enabled(
 #[tauri::command]
 pub async fn addons_reorder(db: State<'_, Db>, ids: Vec<String>) -> Result<(), String> {
     db.addons_reorder(&ids).await.map_err(ipc)
+}
+
+// ---- F-003: metadata-provider credential tests --------------------------
+//
+// Each command pulls the provider's API key from `settings`, builds a fresh
+// client, and reports whether the upstream accepts the key. The frontend
+// uses these to drive the setup wizard (F-016).
+
+async fn require_key(db: &Db, setting_key: &str, provider: &'static str) -> Result<String, String> {
+    db.kv_get(setting_key)
+        .await
+        .map_err(ipc)?
+        .ok_or_else(|| format!("{provider} API key not configured (settings.{setting_key})"))
+}
+
+#[tauri::command]
+pub async fn test_tmdb(db: State<'_, Db>) -> Result<(), String> {
+    let key = require_key(&db, TMDB_API_KEY, "TMDB").await?;
+    let client = TmdbClient::new(key).map_err(ipc)?;
+    client.test_credentials().await.map_err(ipc)
+}
+
+#[tauri::command]
+pub async fn test_trakt(db: State<'_, Db>) -> Result<(), String> {
+    let key = require_key(&db, TRAKT_API_KEY, "Trakt").await?;
+    let client = TraktClient::new(key).map_err(ipc)?;
+    client.test_credentials().await.map_err(ipc)
+}
+
+#[tauri::command]
+pub async fn test_tvdb(db: State<'_, Db>) -> Result<(), String> {
+    let key = require_key(&db, TVDB_API_KEY, "TVDB").await?;
+    let client = TvdbClient::new(key).map_err(ipc)?;
+    client.test_credentials().await.map_err(ipc)
+}
+
+#[tauri::command]
+pub async fn test_fanart(db: State<'_, Db>) -> Result<(), String> {
+    let key = require_key(&db, FANART_API_KEY, "Fanart.tv").await?;
+    let client = FanartClient::new(key).map_err(ipc)?;
+    client.test_credentials().await.map_err(ipc)
 }

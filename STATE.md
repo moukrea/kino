@@ -2,14 +2,215 @@
 
 **PRD version:** 1.0 (locked)
 **Status:** scaffolding
-**Last session:** 003
-**Next session:** 004
+**Last session:** 004
+**Next session:** 005
 
 ---
 
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 004 — Metadata clients (F-003)
+
+**Branch:** `claude/session-001-bootstrap-w3UYG`
+(Harness-supplied; see ADR-033.)
+
+**Scope chosen:** F-003 Metadata clients end-to-end.
+
+Session 003's primary heads-up was **F-001 Android completion**. Inspection
+of this container found neither the Android SDK / NDK nor `tauri-cli`
+installed, only JDK 21 + Gradle and the four Rust android cross-targets.
+Provisioning the SDK + NDK (~3 GiB download + license acceptance) plus
+compiling `tauri-cli` (~5 min) plus `cargo tauri android init` plus the
+first Gradle assemble would have eaten the session and required deferring
+F-003 yet again — Session 002 and Session 003 both pivoted away from
+Android for exactly this reason. F-003 has zero Android tooling
+dependencies, unblocks five downstream features (F-004, F-005, F-006,
+F-007, F-010, F-011), and was Session 003's explicit fallback. It lands
+this session; F-001 Android moves to Session 005.
+
+**ADR-040** (filed below) records the deferral so future sessions don't
+have to re-derive the reasoning.
+
+**Files added (summary):**
+
+- `crates/kino-metadata/` — full scaffold from the empty shell.
+  - `Cargo.toml` adds `reqwest`, `tokio`, `serde_json` (workspace deps) and
+    `wiremock` (dev). `tracing` was already pulled.
+  - `src/lib.rs` — module declarations, re-exports of the four `*Client`
+    types and the `HttpConfig` / `USER_AGENT` / `Error` surface, plus the
+    four locked `settings.key` constants (`TMDB_API_KEY`, `TRAKT_API_KEY`,
+    `TVDB_API_KEY`, `FANART_API_KEY`).
+  - `src/error.rs` — `kino_metadata::Error` enum: `Network` (transport),
+    `Http { status, body }` (terminal non-2xx after retries),
+    `Decode(String)` (reserved for F-004+ parsers), `MissingKey { provider }`.
+    `http_status()` truncates response bodies to 512 chars on a UTF-8
+    char boundary to keep error messages bounded.
+  - `src/http.rs` — `USER_AGENT` built at compile time from `CARGO_PKG_VERSION`
+    + `CARGO_PKG_REPOSITORY` (PRD §F-003 format `kino/<ver> (+<repo>)`).
+    `HttpConfig` (user-agent, timeout, backoff vec). `fetch_with_retry()`
+    runs the locked retry policy: 1 initial attempt + up to 3 retries
+    sleeping `[1s, 2s, 4s]` between them, retrying on 5xx, 429, timeout,
+    connect, and request-build errors; non-retryable 4xx fails immediately.
+  - `src/tmdb.rs` — `TmdbClient`. `test_credentials()` hits
+    `/3/configuration?api_key=…`. Carries the bulk of retry-policy tests
+    (happy path + 429 retry + 500 retry + retry-exhausted + timeout
+    exhausted + 401 no-retry; 6 tests).
+  - `src/trakt.rs` — `TraktClient`. `test_credentials()` hits
+    `/genres/movies` with the `trakt-api-version: 2` and `trakt-api-key`
+    headers (2 tests: happy path verifies both headers; 401 path).
+  - `src/tvdb.rs` — `TvdbClient`. `test_credentials()` performs the v4
+    login (`POST /v4/login` with `{"apikey": …}` body); 2 tests verify
+    the JSON body shape and the 401 path.
+  - `src/fanart.rs` — `FanartClient`. `test_credentials()` hits
+    `/v3/movies/tt0111161?api_key=…` (Shawshank, a stable known-good
+    IMDb id; 2 tests including the 403 path Fanart returns on bad keys).
+- `src-tauri/Cargo.toml` — adds `kino-metadata` as a path dep.
+- `src-tauri/src/commands.rs` — adds four Tauri commands (`test_tmdb`,
+  `test_trakt`, `test_tvdb`, `test_fanart`) plus a `require_key` helper
+  that returns a clear `"<Provider> API key not configured
+  (settings.<key>)"` string when the corresponding `settings` row is
+  missing. The command bodies pull the key, build the client, call
+  `test_credentials`, and convert errors to `String` per ADR-039.
+- `src-tauri/src/lib.rs` — registers the four new commands in
+  `invoke_handler`.
+
+**Features advanced:**
+
+- F-003: not started → complete
+  - **One client per provider with its own module:** `tmdb.rs`, `trakt.rs`,
+    `tvdb.rs`, `fanart.rs` in `kino-metadata/src/`.
+  - **`test_credentials()` on each:** verified by 12 unit tests that hit
+    each provider's documented test endpoint and check both the
+    request-shape contract (path, query params, headers, body) and the
+    response handling.
+  - **Tauri commands `test_tmdb` / `test_trakt` / `test_tvdb` /
+    `test_fanart`:** registered in the `invoke_handler` list; each pulls
+    its key from `settings.*` and surfaces a clear error string when the
+    key is missing or the upstream rejects it.
+  - **429 and 5xx retry with locked backoff:** `fetch_with_retry` in
+    `http.rs` retries on `StatusCode::TOO_MANY_REQUESTS` and
+    `StatusCode::is_server_error()`, sleeping the locked `[1s, 2s, 4s]`
+    between attempts. The TMDB module exercises this end-to-end with
+    wiremock — first call returns 429, second succeeds, and the
+    retries-exhausted case hits the server 4× then returns the final 500
+    body in `Error::Http`.
+  - **wiremock unit tests for happy path / 429 retry / 500 retry /
+    timeout:** all four PRD-required scenarios covered in
+    `tmdb::tests` plus four additional tests (`*_does_not_retry_on_401`,
+    `*_returns_error_after_exhausted_retries`, and the per-provider
+    happy-path / 401 / 403 cases for the other three providers).
+
+**ADRs filed this session:**
+
+- **ADR-040** (Session 004 deferred F-001 Android in favor of F-003 for
+  the third consecutive session, with explicit triggers for "stop
+  deferring"): The Tauri Android scaffold needs (a) `cargo install
+  tauri-cli` (~5 min compile), (b) the Android SDK cmdline-tools,
+  platform-tools, build-tools, and platforms (~1.5 GiB download + license
+  acceptance), (c) the NDK 27.x (~1 GiB), (d) `cargo tauri android init`
+  template generation, (e) the first Gradle assemble, and (f) wiring
+  signing with the committed keystore. With ~29 GiB free on container
+  start and the AppImage tooling install eating a few hundred MiB, this
+  is feasible in one session ONLY when nothing else is in scope — which
+  hasn't been true. **Trigger for Session 005:** F-003 is done, F-002 is
+  done, the next obvious scope items (F-004 trending aggregation, F-005
+  image resolution, F-007 addon protocol client) all materially benefit
+  from real HTTP responses, so the next session is the right one to
+  finally tackle Android with no competing scope. If Session 005's
+  container also lacks the SDK/NDK, it should still proceed — the
+  download is a one-time cost per session, and Session 005's only
+  competing scope (F-007 addon client, F-001 Android) are both feasible
+  individually but not jointly.
+- **ADR-041** (User-Agent string is built at compile time from Cargo
+  metadata, not configured at runtime): The PRD §F-003 User-Agent format
+  `kino/<version> (+<repo>)` interpolates the workspace version (the
+  release session will bump it from `0.0.0` to `1.0.0-alpha.1`) and the
+  repo URL. Building this with `concat!(... env!(...) ...)` at compile
+  time means a release version bump flows through automatically, and the
+  string is a `&'static str` so providers can hand it to `reqwest::Client::builder()`
+  without an alloc per request. The workspace-inherited
+  `repository = "https://github.com/moukrea/kino"` exposes
+  `CARGO_PKG_REPOSITORY` to every crate that opts in via
+  `repository.workspace = true` — which `kino-metadata` already does.
+- **ADR-042** (retry policy is "3 retries", not "3 attempts"): PRD §F-003
+  says "3 attempts with exponential backoff (1s, 2s, 4s)". The natural
+  reading of the three-element backoff array is one sleep per retry, so
+  the implementation is 1 initial attempt + 3 retries = 4 total requests
+  max. The retry-exhausted test (`test_credentials_returns_error_after_exhausted_retries`)
+  asserts `expect(4)` on the wiremock mock, locking this interpretation
+  in. If the PRD revision pass disagrees, the change is a one-line edit
+  to `HttpConfig::default()`.
+- **ADR-043** (transient transport errors retry too): `reqwest::Error`
+  surfaces timeouts, connection failures, and request-build failures
+  through `is_timeout()`, `is_connect()`, and `is_request()`. PRD §F-003
+  literally says "on 5xx and 429" — but timeout / connect errors are
+  morally the same class (the server didn't respond intelligibly) and
+  the PRD's intent is clearly "retry transient transport problems". The
+  shipped behavior retries all three transport-error variants plus 5xx
+  and 429. The timeout-exhausted test (with timeout=50ms and 500ms server
+  delay) exercises this end-to-end.
+
+**Tests added / coverage notes:**
+
+- Rust: 12 new tests in `kino-metadata`. Workspace total: 51 passing
+  (20 kino-core + 12 kino-metadata + 16 kino-addons + 3 kino-torrent +
+  0 server).
+- Frontend: no new tests this session. The credential-test commands have
+  no frontend surface yet; F-016 (Settings screen) will wire the setup
+  wizard against them.
+- All four PRD §F-003 acceptance criteria for unit tests covered: happy
+  path (verifying request shape and User-Agent format), 429 retry,
+  500 retry, timeout (the test asserts the timeout case is retried up
+  to the backoff limit and then surfaces as `Error::Network`).
+
+**Known issues introduced or resolved:**
+
+- **New (introduced):** none.
+- **Resolved:** "AppImage bundle step not exercised locally in Session
+  002" — this session ran `cargo tauri build --target x86_64-unknown-linux-gnu`
+  end-to-end after installing the three extra system deps (`libfuse2t64`,
+  `patchelf`, `squashfs-tools`) that Session 002 documented. The full
+  bundle path now produces `kino-app` (~11 MiB), `kino_0.0.0_amd64.deb`
+  (~4.5 MiB), `kino-0.0.0-1.x86_64.rpm` (~4.5 MiB), and
+  `kino_0.0.0_amd64.AppImage` (~87 MiB) locally. CI's `build-linux` job
+  has been doing this since Session 002.
+
+**Heads-up for Session 005:**
+
+- **Primary scope: F-001 Android completion.** Per ADR-040 the deferral
+  budget has been exhausted; Session 005 owns Android. Concrete sequence:
+  (1) install JDK 17 (already present in containers Session 004 saw —
+  JDK 21 worked too), Android cmdline-tools (download
+  `commandlinetools-linux-13114758_latest.zip` from `dl.google.com` —
+  network was reachable as of Session 004), accept SDK licenses
+  (`sdkmanager --licenses`), install `platform-tools`, `platforms;android-34`,
+  `build-tools;34.0.0`, `ndk;27.0.12077973`. (2) `cargo install
+  tauri-cli --locked --version "^2"` (already installed in Session 004's
+  container but is ephemeral — budget ~5 min). (3) `cd src-tauri &&
+  cargo tauri android init` to generate `src-tauri/gen/android/`.
+  (4) Wire signing with the committed `android/keystore/kino-dev.keystore`
+  (alias `kino-dev`, store/key pw `kinodev`). (5) `cargo tauri android
+  build --apk` produces a signed APK locally. (6) Add the `build-android`
+  job to `.github/workflows/ci.yml` mirroring the existing `build-linux`
+  structure; the SDK install step uses
+  `android-actions/setup-android@v3` (cleaner than rolling our own
+  `sdkmanager` bootstrap in YAML). (7) Flip F-001 to `[x]`.
+- **Secondary scope (if Android cleanly fits): F-004 Trending aggregation.**
+  Builds on `kino-metadata` from this session: each `*Client` gets a
+  `trending_movies` / `trending_shows` method, and a new
+  `kino-metadata::trending` module implements the weighted merge,
+  dedup by IMDb id, top-quartile / hidden-gems split, [T,T,T,G,G]
+  alternation, and seeded daily shuffle. The locked algorithm is in
+  PRD §F-004 step-by-step.
+- The four `test_*` Tauri commands take no args and return
+  `Result<(), String>`. The frontend invokes them via
+  `@tauri-apps/api/core`'s `invoke('test_tmdb')` etc. Bindings stay
+  hand-rolled until F-016 lands the Settings screen.
+- `cargo tauri build --target x86_64-unknown-linux-gnu` works locally
+  now (with `libfuse2t64 patchelf squashfs-tools` installed on top of
+  the Tauri 2 base deps).
 
 ### Session 003 — Persistence layer (F-002)
 
@@ -466,7 +667,9 @@ implementation" split.
   migrations + install_id bootstrap, KV/CW/addons API + Tauri commands, 16 tests)_
 
 ### Metadata & Catalogs
-- [ ] F-003: Metadata clients (TMDB / Trakt / TVDB / Fanart.tv)
+- [x] F-003: Metadata clients (TMDB / Trakt / TVDB / Fanart.tv) _(Session 004:
+  per-provider HTTP clients with locked retry/User-Agent, `test_credentials()`
+  on each, 4 Tauri test commands, 12 wiremock tests)_
 - [ ] F-004: Trending aggregation with diversity
 - [ ] F-005: Image & logo resolution
 - [ ] F-006: Source availability filter
@@ -510,6 +713,10 @@ Additional ADRs filed by sessions:
 | ADR-037 | `Db::open_in_memory()` forces `max_connections = 1`; the file-backed `Db::open()` keeps PRD §3's `max_connections = 4`. `sqlx` in-memory mode gives each connection a private DB unless paired with a `?cache=shared` URI (which `SqliteConnectOptions` does not expose), so a 4-way pool would see migrations on one connection and nothing on the others. | 003 |
 | ADR-038 | DB path resolution lives in the Tauri host (`src-tauri/src/paths.rs`), not in `kino-core`. Linux uses `dirs::config_dir().join("kino")` per PRD §3 (NOT Tauri's default `app_config_dir()`, which would yield `~/.config/dev.kino.app`). Android delegates to `app.path().app_config_dir()` which maps to `Context.filesDir`. `kino-core` exposes the file-name constant only. | 003 |
 | ADR-039 | F-002 Tauri commands return `Result<T, String>` with `e.to_string()` on failure. A typed Serialize'd error enum is deferred until the UI surfaces these errors with localized messages (PRD §5 i18n); String is a subtype of any future envelope so this is a non-breaking choice. | 003 |
+| ADR-040 | Session 004 deferred F-001 Android once more (third consecutive session) in favor of F-003. Session 005 owns Android with no competing scope — the deferral budget is now exhausted. | 004 |
+| ADR-041 | The PRD §F-003 User-Agent string is built at compile time via `concat!(env!("CARGO_PKG_VERSION"), env!("CARGO_PKG_REPOSITORY"), ...)`. A version bump in the release session flows through automatically; no runtime config / per-client override needed. | 004 |
+| ADR-042 | "3 attempts with backoff (1s, 2s, 4s)" reads as 1 initial + 3 retries = 4 total requests max. The retry-exhausted wiremock test asserts `expect(4)` to lock this in. | 004 |
+| ADR-043 | The retry policy extends to transient transport errors (`reqwest::Error::is_timeout` / `is_connect` / `is_request`) in addition to PRD §F-003's literal "5xx and 429". Timeouts are morally a 5xx-class failure and the PRD's intent is clearly "retry transient transport problems". | 004 |
 
 ---
 
@@ -518,11 +725,18 @@ Additional ADRs filed by sessions:
 - **Placeholder Tauri icons.** `src-tauri/icons/*.png` are programmatic
   black-background "k" PNGs (ADR-035). Replace with real brand assets in a
   polish pass before any public release. Not blocking for §6A.
-- **AppImage bundle step not exercised locally in Session 002.** The
-  `cargo tauri build --target x86_64-unknown-linux-gnu` step was verified
-  with `--no-bundle` for time budget. The full bundle step (which downloads
-  `linuxdeploy` and packages the AppImage) lands first in CI. If CI flags
-  it, Session 003 fixes it as highest-priority scope before any other work.
+- **`response_cache` integration deferred to F-004.** PRD §F-003 says
+  "All responses cached in `response_cache` with TTLs defined in §8", but
+  the F-003 Code acceptance bullet list only requires `test_credentials`
+  + retry + wiremock tests — none of which should ever be cached.
+  Caching wires in naturally when F-004's catalog-fetching methods
+  (`trending_movies`, etc.) land, since those need cache keys + TTL
+  policies anyway. `kino_core::db` already exposes the schema.
+- ~~**AppImage bundle step not exercised locally in Session 002.**~~
+  Resolved in Session 004: the full `cargo tauri build --target
+  x86_64-unknown-linux-gnu` produces deb + rpm + AppImage locally once
+  `libfuse2t64 patchelf squashfs-tools` are installed on top of the Tauri
+  2 base deps.
 
 ---
 
@@ -585,6 +799,15 @@ Populated as conventions are established:
 - **PRD line numbers are not stable references.** When citing PRD provisions
   in code comments or ADR text, cite the section / feature ID (e.g.
   `PRD §F-014`, `PRD §8`), never line numbers.
+- **HTTP-client pattern.** Each metadata-provider client lives in its own
+  module under `crates/kino-metadata/src/`. The shared retry / User-Agent
+  / timeout logic lives in `kino-metadata::http` so the locked retry policy
+  is honored uniformly. Each client takes `(key, HttpConfig, base_url)` in
+  its constructor so tests can swap a wiremock URL in; the default
+  `new(key)` uses the production base URL and `HttpConfig::default()`.
+  Provider-specific knobs (TMDB query-param auth, Trakt header auth, TVDB
+  login token exchange, Fanart query-param auth) stay in the per-provider
+  module — the shared layer doesn't know about them.
 - **Frontend layout.** `frontend/` is a single SolidJS bundle shared across
   Linux / Android / Android TV (ADR-013). Locales live in `src/locales/<lang>.json`
   (PRD §5). Tauri's `tauri.conf.json` points `frontendDist` at
