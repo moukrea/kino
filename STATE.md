@@ -2,14 +2,307 @@
 
 **PRD version:** 1.0 (locked)
 **Status:** features-in-progress
-**Last session:** 012
-**Next session:** 013
+**Last session:** 013
+**Next session:** 014
 
 ---
 
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 013 — F-008 row 5 addon catalogs enumeration
+
+**Branch:** `claude/session-001-bootstrap-w5ZiC`
+(Harness-supplied; see ADR-033.)
+
+**Scope chosen:** Resolve the Session-011 carryover from ADR-068 — wire
+PRD §F-008 row 5 (addon catalog rows under the four locked rows) end to
+end. New Tauri command `list_home_catalogs(kind, locale)` that walks
+enabled addons in `display_order`, expands each manifest's catalogs,
+fetches `GET /catalog/{type}/{id}.json` per catalog with the workspace's
+bounded-concurrency dispatcher, applies the PRD §F-009 manifest-types
+filter for the Movies / Series sub-homes, drops empty rows, and caches
+the bundle for `SEARCH_TTL_S` (1h). Frontend swaps the Session-011
+"coming soon" placeholder for a `<For>` over the resource result that
+renders one `<Row>` per `HomeCatalog`. Out of scope: F-010 Title detail,
+F-011 Search, F-012 CW upsert/auto-save, F-016 Settings — each gets
+its own session per the carryover plan.
+
+**Files changed (summary):**
+
+- `src-tauri/src/commands.rs` — new `// ---- F-008 row 5: addon catalogs
+  enumeration ----` block between `get_weekly_trending` and the F-005
+  `resolve_artwork` section. Adds the public `HomeCatalog` IPC shape,
+  the `list_home_catalogs(db, kind: Option<TitleKind>, locale)` Tauri
+  command, the cache-bypassing `list_home_catalogs_uncached` core (so
+  unit tests can drive it with `HttpConfig::for_test()` without going
+  through `response_cache`), the `CatalogWorkItem` / `CatalogOutcome`
+  scheduling structs, the `fetch_catalog_row` per-task fetcher, and
+  three pure helpers (`meta_preview_to_summary`, `coerce_catalog_id`,
+  `parse_release_year`). Dispatch reuses the F-006 `Semaphore(AVAILABILITY_CONCURRENCY = 8)` budget so a Home load fanning out
+  both availability checks AND catalog fetches doesn't exceed the
+  workspace-wide outbound-addon ceiling. Per-catalog network / decode
+  failures are logged via `tracing::warn!` and skipped; one flaky
+  addon must not blank the entire Home row stack. Empty catalogs
+  (`metas: []`) are dropped — rendering a labeled-but-empty row in a
+  10-foot UI is worse UX than not rendering it. 12 new unit tests
+  cover: empty addons → empty result; single catalog returns + IMDb-
+  id coercion + year parse; kind filter on catalogs; F-009 manifest-
+  types filter (movie-only addon contributes nothing to Series);
+  empty catalogs are dropped; display_order × catalog_index ordering
+  preserved despite arbitrary JoinSet completion order; disabled
+  addons are not consulted (`expect(0)`); addons declaring catalogs
+  but not the `catalog` resource are skipped; per-catalog 500 is
+  tolerated alongside a 200 sibling; catalog-name fallback
+  (`"{addon} — {id}"` when manifest omits the name); plus pure-
+  function tests for `coerce_catalog_id` and `parse_release_year`.
+- `src-tauri/src/lib.rs` — adds `commands::list_home_catalogs` to the
+  `invoke_handler!` registry between `get_weekly_trending` and
+  `resolve_artwork`.
+- `frontend/src/lib/tauri.ts` — new `HomeCatalog` TS type mirroring
+  the Rust shape; new `listHomeCatalogs(kind, locale)` typed wrapper
+  around `invoke("list_home_catalogs", ...)`.
+- `frontend/src/routes/Home.tsx` — Session-011 file-header comment
+  updated (row 5 is no longer "deferred — see ADR-068"; it now reads
+  the PRD-locked wording verbatim). New `catalogsResource` driven by
+  the active `[props.kind, locale()]` tuple so the Movies / Series
+  sub-homes auto-refire with the F-009 filter applied. The placeholder
+  `<section data-testid="row-addon-catalogs-placeholder">` is replaced
+  with a `<For each={catalogsResource() ?? []}>` that renders one
+  `<Row>` per `HomeCatalog`; `focusIdPrefix` and `testId` are both
+  `row-cat-{addon_id}-{catalog_id}` so the F-017 focus manager and
+  vitest selectors stay aligned. `For` imported from `solid-js`.
+- `frontend/src/routes/HomeView.test.tsx` — extends the existing
+  `vi.mock("../lib/tauri", ...)` to add `listHomeCatalogs: vi.fn()`,
+  exposes a `catalog(...)` factory helper, and adds a new
+  `describe("HomeView addon catalog rows (F-008 row 5)")` block with
+  5 tests: one Row per `HomeCatalog`; DOM order matches `listHomeCatalogs`
+  return order; `kind="series"` is forwarded to the wrapper; `kind=null`
+  is forwarded as `null` to the wrapper (NOT split into two calls like
+  trending / weekly are — the backend handles the unfiltered walk);
+  empty resource result renders zero catalog rows.
+- `frontend/src/routes/Home.test.tsx` — the "four rows in locked order"
+  test no longer references the now-removed
+  `row-addon-catalogs-placeholder` data-testid; it asserts the three
+  data-bearing rows (rows 2-4) in DOM order. New test
+  `renders no addon-catalog rows when listHomeCatalogs returns empty`
+  pins that the dynamic tail correctly produces zero rows in the
+  no-Tauri-host vitest environment.
+- `frontend/src/locales/{en,fr}.json` — `home.fromAddons` and
+  `home.addonsComingSoon` removed; they were the placeholder strings
+  and are no longer referenced. The catalog row labels come from the
+  manifest-supplied `name` field, so no per-locale string is needed.
+
+**Files NOT touched:**
+
+- `crates/kino-addons/*` — the `AddonClient::catalog` /
+  `Manifest::catalogs` / `MetaPreview` / `CatalogResponse` surface is
+  already what F-008 row 5 needs (Session 008 shipped it).
+- `crates/kino-core/*` — no new DB methods or domain types needed;
+  the addon walk uses existing `db.addons_list()` (already sorted by
+  `display_order ASC` per Session 003) and the cache uses the
+  existing `cache_get` / `cache_set` API.
+- Trending / weekly / availability commands — F-008 row 5 is its own
+  pipeline; no changes to the existing F-004 / F-006 commands.
+
+**Features advanced:**
+
+- F-008 row 5 ("Catalogs from installed addons, in addon
+  `display_order` then catalog order within each addon"): placeholder
+  → **complete**. The F-008 feature itself was already marked complete
+  in Session 011's entry (all five §6A code-acceptance criteria
+  shipped); row 5 was a §6B "Catalog rows from addons appear under
+  the locked rows" carryover. That §6B item is now structurally
+  observable on a live build with Cinemeta installed (the bootstrap
+  installs Cinemeta on first launch per Session 008) and is
+  exercised by the new wiremock-backed Rust tests + the frontend
+  catalog-row tests.
+- F-009 "Addon catalog rows filtered: only catalogs whose addon
+  manifest declares the matching type" — this code-acceptance line
+  was unobservable in Session 012 (no catalog enumeration existed);
+  it now ships via the manifest-types filter test in
+  `list_home_catalogs_skips_addon_when_manifest_types_dont_match_kind`.
+
+**ADRs filed this session:**
+
+- **ADR-073** (resolves ADR-068): F-008 row 5 ships via
+  `list_home_catalogs(kind, locale)` as the single Tauri command, NOT
+  one-Row-per-Tauri-call. Three options were on the table:
+  (a) one Tauri call per catalog (frontend orchestrates the per-addon
+  enumeration). Rejected: pushes the addon walk to the frontend,
+  forces every consumer (Movies, Series, Home) to re-implement the
+  same loop, doubles the IPC chatter for a Home with N catalogs from
+  M addons (1 + N round trips vs 1).
+  (b) embed catalog enumeration inside `get_trending_pools` /
+  `get_weekly_trending`. Rejected: confuses two distinct PRD rows
+  (rows 2/3 are F-004 merge output, row 5 is F-007-protocol fetches);
+  the response shape and cache key would have to be a union type.
+  (c) one new top-level command returning the bundle. Shipped: matches
+  the locked PRD row layout 1:1, single cache row per `(kind, locale)`
+  pair, backend handles per-catalog tolerance + ordering invariants
+  in one place. The cache-bypassing `list_home_catalogs_uncached`
+  helper lives next to the command so tests don't need to touch
+  `response_cache`.
+- **ADR-074**: Empty addon catalogs (catalogs that fetch successfully
+  but return `metas: []`) are dropped from the response — they do NOT
+  render as labeled empty rows on the Home screen. Rationale: PRD
+  §F-008's `<Row>` empty-state convention is the muted `"—"`
+  placeholder, designed for in-progress data fetches. An addon
+  catalog that's permanently empty (e.g. a region-locked catalog,
+  a misconfigured `/catalog/{type}/{id}` endpoint that just returns
+  an empty list) would leave a permanent labeled gap in the row
+  stack with nothing actionable in it — net-negative 10-foot UI
+  affordance. The CW row's "hide when empty" rule (PRD §F-008
+  acceptance) is the closer prior art; we extend that principle to
+  the dynamic-tail rows. Failed fetches (network 5xx, decode error)
+  are ALSO dropped, with a `tracing::warn!` for debugging; the user-
+  visible behavior is identical to "empty catalog" so the row
+  doesn't flicker between "showing nothing because the network is
+  slow" and "showing the empty `"—"` placeholder".
+- **ADR-075**: Stremio addon catalog ids of the form `"tt0133093"` are
+  coerced to `"imdb:tt0133093"` on the way into `TitleSummary`. The
+  rest of the workspace (F-005 `resolve_artwork`, F-004 aggregator,
+  future F-010 detail) expects the provider-prefixed shape
+  (`imdb:N` / `tmdb:N` / `tvdb:N`); coercing at the addon-protocol
+  boundary keeps consumers free of "is this an IMDb id or a kino
+  id?" branching. Already-prefixed ids (containing a `:`) pass
+  through unchanged so anime addons like Kitsu (`"kitsu:1234"`)
+  survive intact even though the artwork resolver can't process them
+  — better to surface the addon's own id in the downstream
+  "unsupported `title_id`" error than silently mangle it.
+- **ADR-076**: F-008 row 5 reuses the F-006 `AVAILABILITY_CONCURRENCY
+  = 8` semaphore budget instead of introducing a new
+  `CATALOGS_CONCURRENCY` constant. The Home load fans out availability
+  checks AND catalog fetches at the same time and both hit the same
+  addon connection pool; a shared 8-permit ceiling matches the PRD
+  §F-006 "8 concurrent stream queries" intent and avoids the worst-
+  case 16 simultaneous outbound connections to one addon if the two
+  budgets were independent. If a future session observes contention
+  (Shield Pro on a slow link), splitting the budget is a one-line
+  change.
+- **ADR-077**: `list_home_catalogs` cache uses `SEARCH_TTL_S = 1h`
+  rather than the trending command's "next UTC midnight" approach.
+  Trending is determinism-locked (PRD §F-004 "same UTC day returns
+  identical ordering" — the daily-shuffle seed depends on the day);
+  addon catalogs have no such invariant — Cinemeta's "Popular Movies"
+  ticks intra-day as TMDB votes shift, Torrentio's "Trending" reshuffles
+  on its own cadence. 1h is the PRD §8-locked TTL for live-list data
+  (it's the `SEARCH_TTL_S` value), close enough to the addons' typical
+  `cacheMaxAge` hints to keep Home content fresh without re-fetching
+  on every navigation. Per-catalog response caching (honoring each
+  addon's `cacheMaxAge`) is a candidate future cost-optimization, not
+  a correctness lever.
+
+**Tests added / coverage notes:**
+
+- Rust: **12 new tests** in `kino-app::commands::tests`. Workspace
+  Rust totals: **187 passing (was 175)**.
+  - `list_home_catalogs_empty_addons_returns_empty`
+  - `list_home_catalogs_returns_single_catalog_in_order` (also covers
+    IMDb-id coercion + year parsing)
+  - `list_home_catalogs_filters_by_kind` (Movies request, series
+    endpoint pinned `expect(0)`)
+  - `list_home_catalogs_skips_addon_when_manifest_types_dont_match_kind`
+    (F-009 manifest-types invariant)
+  - `list_home_catalogs_drops_empty_catalog_rows` (ADR-074)
+  - `list_home_catalogs_preserves_display_order_then_catalog_order`
+    (PRD §F-008 row 5 ordering invariant across two addons × two
+    catalogs each)
+  - `list_home_catalogs_skips_disabled_addons` (`expect(0)`)
+  - `list_home_catalogs_skips_catalog_endpoint_addons_without_catalog_resource`
+    (defensive: malformed addon manifest doesn't trigger a 404 storm)
+  - `list_home_catalogs_tolerates_per_catalog_fetch_failure` (one
+    catalog 200, one 500; the surviving row makes it through)
+  - `list_home_catalogs_falls_back_to_id_when_catalog_name_missing`
+    (`"{addon} — {id}"` shape)
+  - `coerce_catalog_id_prefixes_imdb_style_ids` (pure-function unit
+    test covering `tt{digits}`, already-prefixed, anime, bare `tt`,
+    `ttabc` malformed)
+  - `parse_release_year_handles_stremio_shapes` (`1999`, `2024-`,
+    `2014-2019`, `1994-01-15`, empty, `N/A`, 3-digit)
+- Frontend: **6 new tests** in `routes/HomeView.test.tsx` and 1
+  rewritten + 1 new in `routes/Home.test.tsx`. Frontend totals:
+  **101 passing (was 95)**.
+  - `HomeView addon catalog rows (F-008 row 5)`:
+    - `renders one Row per HomeCatalog returned by listHomeCatalogs`
+    - `preserves the listHomeCatalogs ordering in the DOM`
+    - `forwards the active kind filter to listHomeCatalogs` (Series)
+    - `passes kind=null to listHomeCatalogs from the unfiltered Home`
+    - `renders no addon-catalog row when the resource resolves empty`
+  - `Home route`:
+    - `renders the three locked data rows in PRD §F-008 order`
+      (rewritten — was "four PRD §F-008 data rows"; the
+      addon-catalogs-placeholder testid no longer exists)
+    - `renders no addon-catalog rows when listHomeCatalogs returns empty`
+      (new — pins that the `<For>` is correctly empty in the no-Tauri
+      vitest environment)
+
+**Known issues introduced or resolved:**
+
+- **Resolved:**
+  - **Addon catalogs row was a placeholder section.** Shipped this
+    session as a dynamic `<For>` over the new Tauri command. The
+    F-008 §6B "Catalog rows from addons appear under the locked rows"
+    line is now structurally observable on a live build (Cinemeta
+    auto-installs on first launch per Session 008's bootstrap, so
+    even a fresh install has at least one addon contributing rows).
+  - **F-009 "addon catalog rows filtered" had no implementation
+    target.** Session 012 marked F-009 complete but the manifest-
+    types filter was unreachable until catalog enumeration existed.
+    The Session 013 `list_home_catalogs_skips_addon_when_manifest_types_dont_match_kind`
+    test now pins the invariant.
+- **New (introduced):** —
+
+**Convention additions for future sessions:**
+
+- **Per-feature cache-bypassing test harness.** New backend commands
+  that go through `response_cache` should ship a `*_uncached(db,
+  ..., http_config: &HttpConfig)` private helper alongside the
+  `#[tauri::command]` entry point. The Tauri command becomes a thin
+  cache-around wrapper, the helper is the testable core, and unit
+  tests drive the helper with `HttpConfig::for_test()` without
+  needing to populate `response_cache` rows by hand. F-006's
+  `check_availability_with_config` is the prior art; Session 013's
+  `list_home_catalogs_uncached` follows the same shape.
+- **Stremio-id coercion at the addon-protocol boundary.** Any new
+  surface that consumes addon-returned ids (F-010 detail clicks,
+  F-011 search results, F-012 CW upserts triggered by addon-sourced
+  tiles) MUST pass the id through `coerce_catalog_id` (or an
+  equivalent prefixing step) before storing it in `TitleSummary` or
+  `ContinueWatching`. Storing raw `"tt..."` ids upstream of the
+  resolver creates a "is this prefixed yet?" branch every consumer
+  has to know about.
+
+**Verification:**
+
+- `cargo fmt --all --check` ✓
+- `cargo clippy --workspace --all-targets -- -D warnings` ✓
+- `cargo test --workspace` ✓ (187 passing; was 175)
+- `cargo build --workspace` ✓
+- `npm run lint` ✓
+- `npm run typecheck` ✓
+- `npm test` ✓ (101 passing; was 95)
+- `npm run build` ✓ (production bundle: 46.35 kB JS + 11.75 kB CSS,
+  gzip 17.50 + 3.01 kB — essentially unchanged from Session 012)
+- Full `cargo tauri build --target x86_64-unknown-linux-gnu` skipped:
+  bundle layout / Tauri config unchanged from Session 011 which
+  exercised the deb+rpm bundlers locally. CI exercises the full
+  triple (deb+rpm+AppImage) on every push.
+
+**Android note:** No Android-specific changes this session. The
+existing Session 005 signed-universal APK build path is unaffected;
+the `list_home_catalogs` command is platform-neutral and links into
+the Android `cdylib` automatically via `lib.rs`'s shared `run()`.
+
+**Carryover for next session:** No carryover. The remaining UI
+features (F-010 Title detail view, F-011 Search, F-012 Continue
+Watching, F-016 Settings screen) and the streaming features (F-013
+Embedded torrent engine, F-014 Adaptive buffer, F-015 Native player
+integration) are independent slices. Suggested next-session scope:
+F-010 Title detail view — it's the next user-facing feature in the
+F-008→F-009→F-010 chain and unblocks the F-012 CW upsert wiring (the
+detail view's Play button is what fires the CW write).
 
 ### Session 012 — F-009 Movies and Series sub-homes
 
@@ -2981,21 +3274,24 @@ implementation" split.
 ### UI
 - [x] F-008: Home screen (10-foot UI) _(Session 011: Solid Router
   shell with five routes, left-hand nav rail (collapsed/expanded),
-  five-row Home composition in PRD-locked order with the
-  addon-catalogs row reserved as a placeholder section (ADR-068),
-  `<Tile>` (2:3 poster, 1.08 focus scale, 600ms info overlay) +
-  `<Row>` (monotonic windowing for virtualization) + `<NavRail>`
-  components, two new Tauri commands `get_trending_pools` +
-  `get_weekly_trending`, `aggregate_pools` lifted from
-  `kino-metadata::trending`. 19 frontend tests + 3 Rust trending
-  tests added. The CW row hides when empty per PRD acceptance.)_
+  five-row Home composition in PRD-locked order with `<Tile>` (2:3
+  poster, 1.08 focus scale, 600ms info overlay) + `<Row>` (monotonic
+  windowing for virtualization) + `<NavRail>` components, two new
+  Tauri commands `get_trending_pools` + `get_weekly_trending`,
+  `aggregate_pools` lifted from `kino-metadata::trending`. Session
+  013 closed the ADR-068 carryover: row 5 (addon catalogs) is now
+  data-driven via `list_home_catalogs(kind, locale)` with manifest-
+  types filtering per F-009, per-catalog `Semaphore`-bounded
+  dispatch reusing the F-006 ceiling, and empty-row pruning.)_
 - [x] F-009: Movies and Series sub-homes _(Session 012: `HomeView`
   parameterized by `kind`; Movies / Series routes filter trending +
   weekly + CW to the matching kind; unfiltered Home interleaves
   both kinds via `interleaveByKind`; `data-kind` Tile attribute
   unlocks the "no movie tile in Series" §6A test; 11 new
-  `HomeView.test.tsx` tests. Addon catalogs row still deferred per
-  ADR-068.)_
+  `HomeView.test.tsx` tests. Session 013 added the addon catalog
+  row filter — "only catalogs whose addon manifest declares the
+  matching type" — that this feature called out, now structurally
+  observable via the new wiremock test.)_
 - [ ] F-010: Title detail view
 - [ ] F-011: Search
 - [ ] F-012: Continue Watching
@@ -3063,11 +3359,16 @@ Additional ADRs filed by sessions:
 | ADR-065 | F-017 `<Focusable>` exposes a render-prop API (`{({ focused, showRing, ref, onClick }) => JSX}`) instead of wrapping its child in a div. F-008/F-009/F-010 tiles need to be `<button>` for native focus / activate semantics; an extra `<div>` wrapper would force CSS sizing mismatches and add a DOM node the focus manager doesn't need. The render-prop pattern lets each consumer pick its host element and spread `ref` / `onClick` directly. A thin `<FocusableButton>` shorthand is a candidate future polish if the verbosity becomes a recurring annoyance across feature sessions. | 010 |
 | ADR-066 | F-008 typed Tauri-IPC wrappers live in `frontend/src/lib/tauri.ts`. Solid components import named functions (`getTrendingPools`, `cwList`, `resolveArtwork`) instead of calling `invoke()` with stringly-typed command names. Single mock surface for tests, TS contract enforcement against the Rust types, and a `hasTauri()` capability check so the bundle still renders in plain `vite dev` / vitest jsdom without crashing on missing `__TAURI_INTERNALS__`. | 011 |
 | ADR-067 | F-001's "shows 'kino' on the home screen" placeholder is a point-in-time scaffolding acceptance, not a forever invariant. Session 002 / 010 preserved the text inside the F-017 demonstrator; F-008's locked Home composition replaces it entirely — that IS the design (F-001 was scaffolding under the real Home). The historical F-001 acceptance is upheld by git history; tests that asserted the placeholder text were rewritten to assert shell behavior. | 011 |
-| ADR-068 | F-008 addon catalogs row (PRD §F-008 row 5) is shipped as a labeled placeholder section in Session 011 and the real catalog enumeration is deferred to a follow-up session. The five §6A code-acceptance criteria for F-008 (D-pad traversal, CW empty-state hiding, focus indicator, 600ms info overlay, virtualization) are met without it; "Catalog rows from addons appear under the locked rows" is §6B human verification, not §6A. Shipping the data wiring needs a new Tauri command + a frontend per-catalog row loop; both are tractable but together would have doubled this session's surface area. | 011 |
+| ADR-068 | F-008 addon catalogs row (PRD §F-008 row 5) is shipped as a labeled placeholder section in Session 011 and the real catalog enumeration is deferred to a follow-up session. The five §6A code-acceptance criteria for F-008 (D-pad traversal, CW empty-state hiding, focus indicator, 600ms info overlay, virtualization) are met without it; "Catalog rows from addons appear under the locked rows" is §6B human verification, not §6A. Shipping the data wiring needs a new Tauri command + a frontend per-catalog row loop; both are tractable but together would have doubled this session's surface area. _(Resolved by ADR-073 in Session 013.)_ | 011 |
 | ADR-069 | F-008 Tile sizing is `width: clamp(140px, 18vw, 240px); aspect-ratio: 2/3` rather than a hardcoded 240×360. The upper bound matches the PRD §F-008 reference, the `18vw` middle yields ~8 tiles per 1920px row (Stremio / Plex 10-foot UI feel), and the 140px floor stops tile collapse on a 360px-wide phone. The PRD's "scaled responsively" wording is satisfied; the empirical sweep on Shield + 4K TV is a §6B-3 human-verification concern. | 011 |
 | ADR-070 | F-008 row virtualization uses a monotonic in-DOM window (`INITIAL_WINDOW = 12`, `WINDOW_STEP = 6`, `TAIL_TRIGGER = 3`) rather than a third-party virtual-list library. ~50 lines of code, zero new deps, plays naturally with the F-017 focus manager (Focusables outside the window simply don't exist), satisfies PRD §F-008 "rows lazy-load tiles beyond viewport (virtualization)". The window doesn't shrink — once a tile is rendered it stays in the DOM for the lifetime of the row, so backward navigation is smooth and there's no flicker. A future polish pass could add an upper bound + recycling if Shield TV memory pressure surfaces. | 011 |
 | ADR-071 | F-008 trending-pool aggregation reuses the F-004 fetch + dedup + score + split pipeline (`merge_by_id` + `split_pools`) but skips the alternation step. New public `aggregate_pools(...)` returns `TrendingPools { top_trending, hidden_gems }`; existing `aggregate(...)` unchanged. Each pool gets its own `ChaCha20Rng::from_seed(SHA256(date || install_id))` instance so the gems ordering doesn't depend on `top.len()` — same-day same-install determinism is preserved per pool independently. | 011 |
 | ADR-072 | F-009 unfiltered Home (`kind = null`) renders a mixed movies + series feed by firing both `getTrendingPools` / `getWeeklyTrending` calls in parallel and interleaving the two lists 1:1 at index granularity via `interleaveByKind`. This matches PRD §F-009's "Movies and Series are filtered variants of Home", which positions Home as the unfiltered superset. Two rejected alternatives: (a) "default Home to movies-only" (the Session 011 punt — leaves series invisible on the top-level route, contradicting the F-009 framing) and (b) "concat movies then series" (visually unbalanced — series tiles would only appear after the user scrolls past 20+ movie tiles, defeating the mixed-feed intent). The 1:1 interleave caps the per-row item count at the sum of both pools (PRD §F-004 `TRENDING_RESULT_COUNT = 50` per kind → up to 100 mixed); the F-008 row virtualization handles the larger window without rendering all of them. | 012 |
+| ADR-073 | F-008 row 5 ships via a single Tauri command `list_home_catalogs(kind, locale)` returning `Vec<HomeCatalog>` rather than one Tauri call per catalog or an embedding in `get_trending_pools` / `get_weekly_trending`. Rejected alternatives: (a) frontend-orchestrated per-catalog calls (pushes addon walk to every route, multiplies IPC chatter), (b) embedding in trending commands (confuses row 2/3 F-004 merge output with row 5 F-007 protocol fetches; response shape becomes a union). The shipped command also exposes a cache-bypassing `list_home_catalogs_uncached` helper so unit tests drive the dispatch path with `HttpConfig::for_test()` without populating `response_cache` rows by hand (the F-006 `check_availability_with_config` pattern). Resolves ADR-068. | 013 |
+| ADR-074 | F-008 row 5 drops empty addon catalogs (catalogs that fetch successfully but return `metas: []`) from the response — they do NOT render as labeled empty rows on the Home screen. Failed fetches (5xx / decode) are also dropped (with `tracing::warn!`); the user-visible behavior is identical to "empty catalog" so the row doesn't flicker between fetch states. PRD §F-008's existing CW "hide when empty" rule is the closest prior art; we extend the same principle to the dynamic-tail rows. Net effect: row 5 is a list of useful catalogs, not a permanent series of labeled gaps. | 013 |
+| ADR-075 | Stremio addon catalog ids of the form `"tt0133093"` are coerced to `"imdb:tt0133093"` on the way into `TitleSummary` at the addon-protocol boundary (`coerce_catalog_id` in `kino-app::commands`). The rest of the workspace (F-005 `resolve_artwork`, F-004 aggregator, future F-010 detail) expects the provider-prefixed shape (`imdb:N` / `tmdb:N` / `tvdb:N`); coercing at the boundary keeps consumers free of "is this an IMDb id or a kino id?" branching. Already-prefixed ids (containing a `:`) pass through unchanged, so anime addons like Kitsu (`"kitsu:1234"`) survive intact — better to surface the addon's own id in the downstream "unsupported `title_id`" error than silently mangle it. | 013 |
+| ADR-076 | F-008 row 5 dispatch reuses the F-006 `AVAILABILITY_CONCURRENCY = 8` semaphore budget instead of introducing a separate `CATALOGS_CONCURRENCY` constant. The Home load fans out availability checks AND catalog fetches simultaneously against the same addon connection pool; a shared 8-permit ceiling matches the PRD §F-006 "8 concurrent stream queries" intent and avoids the worst-case 16 simultaneous outbound connections to one addon. If future Shield-on-slow-link testing surfaces contention, splitting the budget is a one-line change. | 013 |
+| ADR-077 | F-008 row 5 cache uses `SEARCH_TTL_S = 1h` rather than the trending command's "next UTC midnight" approach. Trending is determinism-locked (PRD §F-004 same-UTC-day invariant via the daily-shuffle seed); addon catalogs have no such invariant (Cinemeta's "Popular" ticks intra-day, Torrentio's "Trending" reshuffles on its own cadence). `SEARCH_TTL_S` is the PRD §8-locked TTL for live-list data — close enough to addons' typical `cacheMaxAge` hints to keep Home fresh without refetching on every navigation. Per-catalog response caching (honoring each addon's own `cacheMaxAge`) is a candidate future cost-optimization, not a correctness lever. | 013 |
 
 ---
 

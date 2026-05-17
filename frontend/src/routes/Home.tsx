@@ -4,8 +4,8 @@
 //   2. Trending Now (F-004 top pool)
 //   3. Hidden Gems (F-004 gems pool)
 //   4. Trending This Week (TMDB-only /trending/{type}/week)
-//   5. Catalogs from installed addons (deferred — see ADR-068; lands
-//      in a follow-up session)
+//   5. Catalogs from installed addons, in addon `display_order` then
+//      catalog order within each addon (PRD §F-008 row 5)
 //
 // The Home route accepts no kind filter and renders a mixed
 // movies + series feed (PRD §F-009: "Movies and Series sub-homes are
@@ -16,7 +16,10 @@
 // interleaves them via [`interleaveByKind`] — alternating movie /
 // series at each index — to produce a balanced mixed row. CW is
 // already kind-tagged so the `kind === null` path simply does not
-// filter it.
+// filter it. Row 5 is fed by a single `listHomeCatalogs(kind, locale)`
+// Tauri call that handles the per-addon walk, the F-009 manifest-types
+// filter, and per-catalog `GET /catalog/{type}/{id}.json` fetching
+// backend-side; the frontend just iterates the returned bundle.
 //
 // `HomeView` is parameterized by `kind` so `Movies.tsx` and
 // `Series.tsx` (F-009 sub-homes) can mount the same row stack with
@@ -28,6 +31,7 @@
 import {
   createResource,
   createSignal,
+  For,
   onMount,
   Show,
   type Component,
@@ -42,7 +46,9 @@ import {
   getTrendingPools,
   getWeeklyTrending,
   hasTauri,
+  listHomeCatalogs,
   type ContinueWatching,
+  type HomeCatalog,
   type TitleSummary,
   type TitleKind,
   type TrendingPools,
@@ -162,6 +168,27 @@ export const HomeView: Component<HomeViewProps> = (props) => {
     },
   );
 
+  // PRD §F-008 row 5: addon catalog rows. One call returns the full
+  // bundle; backend handles addon walk, kind filter (F-009), per-
+  // catalog fetch, and empty-row pruning. Resource re-fires when the
+  // active kind or locale changes so the sub-homes always re-query
+  // with the F-009 filter applied.
+  const [catalogsResource] = createResource<
+    HomeCatalog[],
+    [TitleKind | null, string]
+  >(
+    () => [props.kind, locale()] as [TitleKind | null, string],
+    async ([kind, loc]) => {
+      if (!hasTauri()) return [];
+      try {
+        return await listHomeCatalogs(kind, loc);
+      } catch (e) {
+        console.warn("list_home_catalogs failed", e);
+        return [];
+      }
+    },
+  );
+
   // CW summaries are rendered as Tiles so we coerce the cw rows into
   // TitleSummary shape (the existing meta_json field can carry the
   // poster / year / title when CW upsert happens — F-012's session
@@ -256,17 +283,16 @@ export const HomeView: Component<HomeViewProps> = (props) => {
         testId="row-trending-this-week"
       />
 
-      <section
-        class="flex flex-col gap-2"
-        data-testid="row-addon-catalogs-placeholder"
-      >
-        <h2 class="px-6 text-lg font-semibold tracking-wide text-neutral-200">
-          {t("home.fromAddons")}
-        </h2>
-        <p class="px-6 text-sm text-neutral-500">
-          {t("home.addonsComingSoon")}
-        </p>
-      </section>
+      <For each={catalogsResource() ?? []}>
+        {(cat) => (
+          <Row
+            label={cat.catalog_name}
+            focusIdPrefix={`row-cat-${cat.addon_id}-${cat.catalog_id}`}
+            items={cat.items}
+            testId={`row-cat-${cat.addon_id}-${cat.catalog_id}`}
+          />
+        )}
+      </For>
     </div>
   );
 };

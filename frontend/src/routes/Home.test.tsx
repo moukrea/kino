@@ -48,7 +48,7 @@ describe("Home route", () => {
     expect(host.querySelector('[data-testid="home-title"]')).not.toBeNull();
   });
 
-  it("renders the four PRD §F-008 data rows in locked order", () => {
+  it("renders the three locked data rows in PRD §F-008 order", () => {
     host = document.createElement("div");
     document.body.appendChild(host);
     dispose = mount(host);
@@ -59,11 +59,15 @@ describe("Home route", () => {
       host.querySelector('[data-testid="row-continue-watching"]'),
     ).toBeNull();
 
+    // The four data-bearing rows (rows 2-5) without the addon-catalogs
+    // tail. Row 5 is now data-driven via `listHomeCatalogs`; with no
+    // Tauri host in this test environment, the resource resolves to []
+    // and no `row-cat-*` rows are rendered. The `Home (F-008 row 5)`
+    // suite below pins the dynamic-row case.
     const expectedOrder = [
       "row-trending-now",
       "row-hidden-gems",
       "row-trending-this-week",
-      "row-addon-catalogs-placeholder",
     ];
 
     const rendered = expectedOrder.map(
@@ -84,6 +88,20 @@ describe("Home route", () => {
       expect(curr).not.toBeNull();
       expect(curr! > prev!).toBe(true);
     }
+  });
+
+  it("renders no addon-catalog rows when listHomeCatalogs returns empty", () => {
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    dispose = mount(host);
+
+    // No Tauri host in this test → `listHomeCatalogs` returns []. The
+    // `<For>` over the resource must therefore render zero `row-cat-*`
+    // sections (not a placeholder, not an empty row).
+    const catRows = host.querySelectorAll<HTMLElement>(
+      '[data-testid^="row-cat-"]',
+    );
+    expect(catRows.length).toBe(0);
   });
 
   it("exposes HOME_ROW_ORDER matching the PRD locked sequence", () => {
