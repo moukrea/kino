@@ -45,6 +45,11 @@ pub fn run() {
                 tracing::error!(error = %e, "failed to open kino database");
                 e.to_string()
             })?;
+            // PRD §F-007: install Cinemeta as a non-removable default
+            // addon on first launch. Runs once (gated by a settings
+            // marker); failure here doesn't block startup — the user can
+            // retry from Settings → Addons.
+            tauri::async_runtime::block_on(commands::bootstrap_default_addons(&db));
             app.manage(db);
             tracing::info!("kino host started (PRD §F-002 persistence ready)");
             Ok(())
@@ -67,6 +72,10 @@ pub fn run() {
             commands::test_fanart,
             commands::get_trending,
             commands::resolve_artwork,
+            commands::get_recommended_addons,
+            commands::install_addon,
+            commands::uninstall_addon,
+            commands::set_addon_order,
         ])
         .run(tauri::generate_context!())
         .expect("kino: error while running tauri application");

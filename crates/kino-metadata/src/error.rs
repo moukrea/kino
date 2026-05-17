@@ -2,8 +2,13 @@
 //!
 //! Each provider client returns this. The Tauri host converts to `String`
 //! at the IPC boundary per ADR-039.
+//!
+//! HTTP-layer errors flow in from `kino_core::http::HttpError` via the
+//! `From` impl below; the variants here keep their existing shape so the
+//! lift from `kino-metadata::http` to `kino-core::http` (Session 008,
+//! ADR-055) is invisible to downstream callers.
 
-use reqwest::StatusCode;
+use kino_core::http::HttpError;
 
 /// Errors that can surface from any metadata client call.
 #[derive(Debug, thiserror::Error)]
@@ -30,24 +35,11 @@ pub enum Error {
     MissingKey { provider: &'static str },
 }
 
-impl Error {
-    /// Build an [`Error::Http`] from a status code and response body.
-    pub(crate) fn http_status(status: StatusCode, body: String) -> Self {
-        const MAX_BODY: usize = 512;
-        let mut body = body;
-        if body.len() > MAX_BODY {
-            // Truncate on a char boundary; `floor_char_boundary` is unstable,
-            // so walk back until we hit one.
-            let mut end = MAX_BODY;
-            while !body.is_char_boundary(end) {
-                end -= 1;
-            }
-            body.truncate(end);
-            body.push('…');
-        }
-        Self::Http {
-            status: status.as_u16(),
-            body,
+impl From<HttpError> for Error {
+    fn from(e: HttpError) -> Self {
+        match e {
+            HttpError::Network(r) => Self::Network(r),
+            HttpError::Http { status, body } => Self::Http { status, body },
         }
     }
 }

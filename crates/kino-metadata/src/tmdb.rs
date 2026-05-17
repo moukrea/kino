@@ -12,8 +12,8 @@ use serde::Deserialize;
 
 use crate::artwork::{LocalizedAsset, ProviderBundle};
 use crate::error::Error;
-use crate::http::{fetch_with_retry, HttpConfig};
 use crate::trending::ProviderItem;
+use kino_core::http::{fetch_with_retry, HttpConfig};
 use kino_core::title::{TitleKind, TitleSummary};
 
 /// Production TMDB base URL.

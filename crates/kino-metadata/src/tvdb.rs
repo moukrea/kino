@@ -18,8 +18,8 @@ use tokio::sync::RwLock;
 
 use crate::artwork::{LocalizedAsset, ProviderBundle};
 use crate::error::Error;
-use crate::http::{fetch_with_retry, HttpConfig};
 use crate::trending::ProviderItem;
+use kino_core::http::{fetch_with_retry, HttpConfig};
 use kino_core::title::{TitleKind, TitleSummary};
 
 /// TVDB v4 artwork type ids the F-005 resolver cares about.
@@ -186,10 +186,12 @@ impl TvdbClient {
         .await;
         let response = match request_result {
             Ok(r) => r,
-            Err(Error::Http { status, .. }) if status == StatusCode::NOT_FOUND.as_u16() => {
+            Err(kino_core::http::HttpError::Http { status, .. })
+                if status == StatusCode::NOT_FOUND.as_u16() =>
+            {
                 return Ok(None);
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         };
         let envelope: ExtendedEnvelope = response
             .json()

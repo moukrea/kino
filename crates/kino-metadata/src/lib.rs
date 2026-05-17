@@ -18,7 +18,6 @@
 pub mod artwork;
 pub mod error;
 pub mod fanart;
-pub mod http;
 pub mod tmdb;
 pub mod trakt;
 pub mod trending;
@@ -30,7 +29,10 @@ pub use artwork::{
 };
 pub use error::Error;
 pub use fanart::FanartClient;
-pub use http::{HttpConfig, USER_AGENT};
+// HTTP plumbing lives in `kino_core::http` since Session 008 (ADR-055); the
+// re-exports are kept here so existing imports `kino_metadata::HttpConfig` /
+// `kino_metadata::USER_AGENT` continue to compile.
+pub use kino_core::http::{HttpConfig, USER_AGENT};
 pub use tmdb::TmdbClient;
 pub use trakt::TraktClient;
 pub use trending::{aggregate, ProviderItem};
