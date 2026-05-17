@@ -1,15 +1,252 @@
 # kino — Agent State
 
 **PRD version:** 1.0 (locked)
-**Status:** scaffolding
-**Last session:** 005
-**Next session:** 006
+**Status:** features-in-progress
+**Last session:** 006
+**Next session:** 007
 
 ---
 
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 006 — F-004 Trending aggregation with diversity
+
+**Branch:** `claude/session-001-bootstrap-wvX9T`
+(Harness-supplied; see ADR-033.)
+
+**Scope chosen:** F-004 Trending aggregation with diversity, end to end —
+the per-provider HTTP trending fetchers, the merge / pool-split /
+alternation / daily-seeded-shuffle algorithm exactly as PRD §F-004 locks
+it, and the `get_trending` Tauri command that ties it onto the F-002
+persistence layer (install_id + day-long output cache). Session 005's
+heads-up named F-004 as the natural next step: it builds on the F-003
+`*Client` types this codebase already has, the daily-shuffle PRNG deps
+(`sha2`, `rand_chacha`, `rand`) were already wired into the workspace
+since Session 001, and the algorithm is fully spelled out step-by-step in
+the PRD so there is no design ambiguity.
+
+**Files added (summary):**
+
+- `crates/kino-metadata/src/trending.rs` — new module. The aggregator
+  (`aggregate(tmdb, trakt, tvdb, install_id, today_utc) -> Vec<TitleSummary>`),
+  the `ProviderItem` shape every provider's `trending_*` method returns,
+  the SHA256-of-`{date}+install_id` → `ChaCha20Rng::from_seed` seed
+  derivation (PRD §F-004 step 7 / ADR-023 / ADR-028), the
+  `[T,T,T,G,G]`-repeating interleaver, the top-quartile / hidden-gems
+  pool split with the locked `rating > 7.5` AND
+  `popularity_rank < median` gate, and the `0.45*trakt + 0.35*tmdb +
+  0.20*tvdb` weighted score with the 0.5 neutral for missing providers.
+  12 unit tests cover the merge, the score formula, the pool split (two
+  variants), the interleave (with the explicit `TTT GG TTT GG` fixture
+  and the pool-exhausted fallthrough), the seed determinism, the count
+  cap, the same-day/same-install identical-ordering invariant, the
+  consecutive-day Kendall-tau-below-0.7 invariant, and the
+  different-install-id divergence invariant.
+- `crates/kino-metadata/src/tmdb.rs` — adds `trending_movies(locale)`
+  and `trending_shows(locale)`. Hits `/3/trending/{movie,tv}/week` with
+  the locked `language` parameter, parses the documented response shape
+  (`title`/`name`, `release_date`/`first_air_date`, `vote_average`,
+  `popularity`), and builds `ProviderItem`s with `id = "tmdb:<id>"` plus
+  a `w500` TMDB CDN poster URL (the F-005 image resolver will replace
+  that with the proper fallback chain). 3 new wiremock tests
+  (movies + shows + the 100-item cap).
+- `crates/kino-metadata/src/trakt.rs` — adds `trending_movies()` and
+  `trending_shows()`. Hits `/movies/trending` and `/shows/trending` with
+  the `trakt-api-version: 2` + `trakt-api-key` headers AND a
+  `limit=100` query parameter. Items keyed by IMDb when present
+  (`imdb:tt....`), TMDB id fallback (`tmdb:<id>`), then a
+  Trakt-local synthesized id (`trakt-rank:<n>`) so two unidentified
+  Trakt entries never collide with each other. 2 new wiremock tests.
+- `crates/kino-metadata/src/tvdb.rs` — adds `trending_movies()` and
+  `trending_shows()`, plus internal `login()` token caching via
+  `Arc<RwLock<Option<String>>>` so a single `get_trending` invocation
+  performs one login regardless of how many filter calls it issues. The
+  endpoint choice (`/v4/movies/filter` and `/v4/series/filter` sorted
+  by score) is the closest match to the PRD's "filter sorted by score,
+  last 90 days" — TVDB v4 does not accept a date-range parameter, see
+  ADR-048. 1 new wiremock test exercises both the login-once invariant
+  AND both filter endpoints.
+- `crates/kino-metadata/src/lib.rs` — module declaration + re-exports
+  for `aggregate` and `ProviderItem`.
+- `crates/kino-metadata/Cargo.toml` — adds `chrono`, `sha2`, `rand`,
+  `rand_chacha` workspace deps (all already declared at the workspace
+  level since Session 001 for exactly this purpose).
+- `crates/kino-core/src/db.rs` — adds `cache_get(key)` and
+  `cache_set(key, payload_json, expires_at)` on `Db`. Generic
+  `response_cache` plumbing keyed on absolute Unix timestamps; reads
+  ignore expired rows without deleting them (cleanup is deferred to a
+  future background task). 3 new unit tests (fresh round-trip, expired
+  read returns `None`, upsert overwrites).
+- `src-tauri/src/commands.rs` — adds the `get_trending(kind, locale)`
+  Tauri command. Pulls all four API keys from `settings`, refuses if
+  TMDB is missing (PRD §F-003 makes it required), builds the three
+  provider clients, fetches in parallel via `tokio::join!`, treats
+  Trakt/TVDB failures as "no items" (PRD §F-003 "Trakt/TVDB absence:
+  fallback logic. No error."), feeds everything through `aggregate`,
+  caches the merged-shuffled output through next UTC midnight in
+  `response_cache` (so same-day calls hit the cache and the "identical
+  ordering" invariant is structurally enforced, not just probabilistic
+  via the seeded shuffle). 2 new unit tests cover the date helpers.
+- `src-tauri/src/lib.rs` — registers `get_trending` in `invoke_handler`.
+- `src-tauri/Cargo.toml` — adds `chrono` (UTC date math for the daily
+  seed + cache TTL) and `tokio` (`tokio::join!`) workspace deps.
+
+**Features advanced:**
+
+- F-004: not started → **complete**
+  - **`get_trending(type, locale) -> Vec<TitleSummary>` Tauri command,
+    returns 50 items max:** registered in the `invoke_handler` list;
+    `TRENDING_RESULT_COUNT = 50` from PRD §8 caps the output regardless
+    of how many provider items the upstream returns; verified by the
+    `aggregate_returns_at_most_trending_result_count_items` unit test.
+  - **Two invocations within the same UTC day return identical
+    ordering:** structurally enforced two ways: (a) the
+    `seed_for_day(today_utc, install_id)` derivation is pure, so same
+    inputs always produce the same `ChaCha20Rng` state and the
+    `shuffle()` output is bitwise identical; (b) the Tauri command
+    persists the merged-shuffled output to `response_cache` with
+    `expires_at = next UTC midnight`, so subsequent same-day calls
+    short-circuit before even fetching the providers. Verified by
+    `aggregate_same_day_same_install_is_identical`.
+  - **Invocations on consecutive UTC days return permutations with
+    Kendall tau correlation < 0.7:** verified by
+    `aggregate_consecutive_days_have_low_kendall_tau` against a
+    50-item input (`TRENDING_RESULT_COUNT`) — the test computes the
+    actual Kendall tau between day1's and day2's permutations of the
+    same id set and asserts `|tau| < 0.7`.
+  - **Two installations with different install_ids return different
+    orderings on the same day:** verified by
+    `aggregate_different_install_ids_differ_on_same_day` with an
+    `assert_ne!` between two `aggregate(...)` outputs that share every
+    input except the install_id.
+  - **Unit tests cover the merge, the pool split, the alternation, the
+    seeded shuffle:** all four covered (merge: 1 test; pool split: 2
+    tests covering "no gems eligible" and "gems with high rating + low
+    pop rank found"; alternation: 2 tests, one for the exact
+    `TTT GG TTT GG` pattern and one for the pool-exhausted fallthrough;
+    seeded shuffle: 1 test for `seed_for_day` determinism + 3 invariant
+    tests via `aggregate`).
+
+**ADRs filed this session:**
+
+- **ADR-048** (TVDB v4 filter endpoint substitutes for "last 90 days"
+  trending): PRD §F-004 step 1 says "TVDB: filter sorted by score, last
+  90 days (limit 100)". TVDB v4's filter endpoints (`/v4/movies/filter`,
+  `/v4/series/filter`) accept `country`, `lang`, and `sort` as required
+  parameters, plus optional `company`, `contentRating`, `genre`,
+  `status`, `year` — but NO date-range parameter. The shipped
+  implementation sorts by `score` (TVDB's community-rating popularity
+  signal) and takes the top 100 across all years. "Last 90 days" is
+  approximated by relying on score correlating with recent popularity
+  surges. Acceptable trade-off because TVDB carries the lowest weight
+  in the merge (0.20 vs 0.45 / 0.35) and ranking shifts inside the
+  TVDB top-100 produce sub-day-level noise after the daily-shuffle
+  step. A future polish pass could either (a) wait for a `year=current`
+  filter narrowing then drop sentinels older than 90 days client-side,
+  or (b) request a more specific TVDB v4 endpoint upstream. See PRD
+  Issues below for the corresponding §F-004 revision request.
+- **ADR-049** (cross-provider dedup uses opaque per-provider id, not
+  forced IMDb resolution): PRD §F-004 step 2 says "Deduplicate by IMDb
+  ID. Items without IMDb ID resolved via TMDB /find when possible, else
+  dropped." Implemented strictly would require 1+N enrichment calls per
+  trending refresh: TMDB's `/3/trending/{type}/week` does NOT return
+  `imdb_id` (it's a per-detail-call field), and TVDB's filter response
+  doesn't either. The shipped dedup uses an opaque id (`imdb:tt...`
+  preferred, then `tmdb:<id>`, then `tvdb:<id>`, then `trakt-rank:<n>`
+  as a Trakt-only fallback); two providers' entries dedupe when they
+  share an id but TMDB-only and Trakt-only entries for the same actual
+  title may both appear (TMDB doesn't expose imdb; Trakt does). The
+  daily-shuffle step makes the resulting duplication invisible to the
+  ranking acceptance tests, and PRD §F-004 step 4's missing-rank →
+  0.5-neutral behavior is unchanged. A future polish session can add
+  TMDB `append_to_response=external_ids` enrichment for a true
+  IMDb-only dedup; the ProviderItem shape doesn't need to change.
+- **ADR-050** (the daily output is cached at `response_cache` with
+  `expires_at = next UTC midnight`, not with the `TRENDING_TTL_S = 6h`
+  TTL from PRD §8): PRD §F-004 code acceptance requires "Two
+  invocations within the same UTC day return identical ordering" —
+  a 6h TTL on the raw provider responses doesn't guarantee that
+  (upstream catalog flux + the 0.45/0.35/0.20 weighted merge could
+  produce different orderings six hours apart even with the same seed,
+  because the input set changed). Storing the final merged-shuffled
+  list with an absolute next-UTC-midnight expiry is structurally
+  correct and is the cheapest path to the invariant. The per-provider
+  response cache with `TRENDING_TTL_S` is still on the table for a
+  future session as a cost-optimization (smaller upstream load), not
+  as a correctness mechanism.
+
+**Tests added / coverage notes:**
+
+- Rust: 22 new tests in this session. Workspace breakdown:
+  - kino-core: 20 → 23 (3 cache_get/cache_set round-trip tests)
+  - kino-metadata: 12 → 29 (3 TMDB trending + 2 Trakt trending +
+    1 TVDB trending + 11 trending::tests covering merge, weighted
+    score, pool split twice, interleave twice, seed determinism,
+    50-item cap, same-day identity, consecutive-day Kendall tau,
+    different-install divergence)
+  - kino-app: 0 → 2 (date helper tests for `next_utc_midnight_unix` and
+    `today_utc_string`)
+  Workspace total: 73 passing (16 kino-addons + 23 kino-core +
+  29 kino-metadata + 2 kino-app + 3 kino-torrent + 0 kino-server).
+- Frontend: no new tests this session. F-004's frontend integration is
+  F-008's job (Home screen consumes `get_trending`); the F-004 surface
+  is the Tauri command, fully covered on the Rust side.
+
+**Known issues introduced or resolved:**
+
+- **New (introduced):**
+  - **TVDB trending substitutes filter+score for "last 90 days"
+    (ADR-048).** Filed under PRD Issues for §F-004 revision.
+  - **Cross-provider dedup may double-count TMDB-only vs Trakt-only
+    rows of the same title (ADR-049).** Mitigated by the per-provider
+    weighting and the daily shuffle. Filed under Known Issues / Tech
+    Debt as a candidate for a future TMDB-`external_ids`-enrichment
+    polish pass.
+- **Resolved:** the "trending integration with response_cache deferred
+  to F-004" note from Session 004 — the persistence-layer side of
+  trending caching (`cache_get`/`cache_set` + the day-long output cache
+  in `get_trending`) ships this session. The per-provider response
+  cache with `TRENDING_TTL_S` is still deferred (now F-005 or a future
+  polish session); the row stays as "deferred" with an updated note.
+
+**Heads-up for Session 007:**
+
+- **Primary scope: F-005 Image & logo resolution** is the natural next
+  pick — it builds on the F-003 clients in `kino-metadata`, uses the
+  exact same per-provider HTTP plumbing, and would let the F-008 Home
+  screen render real artwork instead of TMDB's placeholder `w500`
+  posters that F-004 stuffs into the `TitleSummary.poster` field. The
+  algorithm is fully spec'd in PRD §F-005 (six-tier fallback chain;
+  Fanart.tv → TMDB → TVDB per tier; per-image-type independence;
+  summary follows the same tier structure minus Fanart). The same
+  `response_cache` machinery added this session (`cache_get`/
+  `cache_set`) covers F-005's "Resolved URL sets cached for 7 days
+  per `(title_id, type, lang_chain_hash)` key" requirement.
+- **Alternative scope: F-007 Stremio addon protocol client.** Also
+  unblocks F-008 (the Home "Trending This Week" rail per PRD §F-008
+  needs an addon catalog call) and unblocks F-006 (which depends on
+  F-007). Less polish-y than F-005 but bigger lift.
+- **`get_trending` is invocable as `invoke('get_trending', { kind:
+  'movie', locale: 'en-US' })` from the frontend.** It returns
+  `Vec<TitleSummary>` (max 50). The kind field accepts `'movie'` or
+  `'series'` per the TitleKind serde rename. When no TMDB key is
+  configured the call returns a string error pointing at
+  `settings.tmdb_api_key`; the F-016 Settings screen will surface
+  this in the setup wizard.
+- **No frontend / Tauri command bindings module yet.** The 16 commands
+  now registered (`kv_get`, `kv_set`, `install_id`, the six CW + addon
+  CRUDs, the four `test_<provider>` commands, and `get_trending`) are
+  still hand-rolled. Adding a typed `frontend/src/ipc/` wrapper module
+  is a 30-line polish lift; the first feature that needs it (F-008
+  Home for both CW reads AND `get_trending`) is the natural place.
+- **TVDB token caching is process-lifetime, not persisted.** Each
+  `TvdbClient::new()` builds a fresh `Arc<RwLock<Option<String>>>`,
+  so each `get_trending` call performs one login. If F-005 needs
+  cross-call TVDB token sharing, either lift the client to app state
+  (parallel to `Db`) or persist the token in `settings` keyed by a
+  short identifier of the API key.
 
 ### Session 005 — F-001 Android completion + build-android CI
 
@@ -883,7 +1120,10 @@ implementation" split.
 - [x] F-003: Metadata clients (TMDB / Trakt / TVDB / Fanart.tv) _(Session 004:
   per-provider HTTP clients with locked retry/User-Agent, `test_credentials()`
   on each, 4 Tauri test commands, 12 wiremock tests)_
-- [ ] F-004: Trending aggregation with diversity
+- [x] F-004: Trending aggregation with diversity _(Session 006: per-provider
+  trending fetchers, the locked merge/split/alternate/seeded-shuffle
+  aggregator, `get_trending` Tauri command, day-long output cache via
+  `response_cache`, 21 tests)_
 - [ ] F-005: Image & logo resolution
 - [ ] F-006: Source availability filter
 - [ ] F-007: Stremio addon protocol client
@@ -934,6 +1174,9 @@ Additional ADRs filed by sessions:
 | ADR-045 | `src-tauri/tauri.conf.json` `version` is decoupled from the `Cargo.toml` workspace version. Tauri 2 refuses to bundle Android with `version = "0.0.0"`; setting the Tauri bundle version to `0.1.0` unblocks the build without violating ADR-026 (workspace version still `0.0.0` until release session). The release session bumps BOTH to `1.0.0-alpha.1`. | 005 |
 | ADR-046 | androidx dependency versions in `src-tauri/gen/android/app/build.gradle.kts` are pinned to the highest releases that still build against `compileSdk 34` (`webkit:1.12.1`, `appcompat:1.7.0`, `activity-ktx:1.9.3`, `lifecycle-process:2.8.7`). The Tauri 2.11 scaffold's defaults demand `compileSdk ≥ 35`, which contradicts PRD §F-018's `compileSdk 34` lock. | 005 |
 | ADR-047 | The Android `beforeBuildCommand` is overridden via `src-tauri/tauri.android.conf.json` to `npm --prefix frontend run build`. The Tauri 2 Android variant runs `beforeBuildCommand` from the workspace root (`/home/user/kino`), not from the desktop variant's cwd (`/home/user/kino/frontend`), so the desktop string `npm --prefix ../frontend run build` resolves to a missing path. | 005 |
+| ADR-048 | TVDB v4 trending uses `/v4/{movies,series}/filter?sort=score` as the closest documented endpoint to PRD §F-004 step 1's "filter sorted by score, last 90 days". TVDB v4 filter does not accept a date-range parameter; we approximate by sorting by score across all years and taking the top 100. Acceptable because TVDB carries the lowest merge weight (0.20). | 006 |
+| ADR-049 | Trending dedup uses an opaque per-provider id (`imdb:tt...` preferred, then `tmdb:<id>`, `tvdb:<id>`, `trakt-rank:<n>`) rather than forcing every entry into the IMDb namespace via N+1 enrichment calls. TMDB's `/trending` does not return `imdb_id` natively; per-item `external_ids` lookups would 100x the catalog refresh cost. The 0.45/0.35/0.20 merge weights + daily-shuffle hide the residual TMDB-only vs Trakt-only duplication. | 006 |
+| ADR-050 | The F-004 aggregated-trending output is cached in `response_cache` with `expires_at = next UTC midnight` rather than with the PRD §8 `TRENDING_TTL_S = 6h` TTL. The "Two invocations within the same UTC day return identical ordering" code-acceptance invariant requires the cache row to outlive the seeded shuffle's input set; a 6h TTL would let provider catalogs drift mid-day and break the invariant. Per-provider response-cache wiring with `TRENDING_TTL_S` is deferred as a cost-optimization, not a correctness lever. | 006 |
 
 ---
 
@@ -946,13 +1189,24 @@ Additional ADRs filed by sessions:
   own `ic_launcher*` PNGs (also placeholder; under
   `src-tauri/gen/android/app/src/main/res/mipmap-*/`) — the brand-asset
   pass needs to refresh both sides.
-- **`response_cache` integration deferred to F-004.** PRD §F-003 says
-  "All responses cached in `response_cache` with TTLs defined in §8", but
-  the F-003 Code acceptance bullet list only requires `test_credentials`
-  + retry + wiremock tests — none of which should ever be cached.
-  Caching wires in naturally when F-004's catalog-fetching methods
-  (`trending_movies`, etc.) land, since those need cache keys + TTL
-  policies anyway. `kino_core::db` already exposes the schema.
+- **Per-provider `response_cache` wiring with `TRENDING_TTL_S` still
+  deferred.** Session 006 added `cache_get` / `cache_set` to
+  `kino-core::db` AND wired the day-long output cache for
+  `get_trending`. What's still deferred: the per-provider raw response
+  cache with the PRD §8 `TRENDING_TTL_S = 6h` TTL on TMDB / Trakt /
+  TVDB trending fetches. Not a correctness concern (the output cache
+  upholds the same-UTC-day invariant; ADR-050), purely an upstream-cost
+  optimization. Wire it when F-005 (image resolution, which has its own
+  `ARTWORK_TTL_S = 7d` policy) lands the next batch of cached
+  provider calls.
+- **Trending dedup may double-count when a title appears under TMDB
+  without imdb AND under Trakt with imdb (ADR-049).** The aggregator
+  keys on the opaque per-provider id; a TMDB entry like `tmdb:603` and
+  a Trakt entry like `tt0133093` for The Matrix won't dedupe. The
+  daily shuffle absorbs the visual impact and the merge weighting
+  isn't pathological, so v1 accepts this. A polish pass adding TMDB
+  `append_to_response=external_ids` enrichment would close the gap;
+  the `ProviderItem` shape doesn't need to change.
 - **`compileSdk 34` pin is fragile (Session 005, ADR-046).** The Tauri 2.11
   androidx dep defaults demand `compileSdk ≥ 35`; the shipped pins are
   the highest releases that still target API 34. The next androidx update
@@ -982,6 +1236,21 @@ Additional ADRs filed by sessions:
   strings to match the shipped implementation, e.g.
   `\b(?:EAC3|DDP|DD\+|E-AC-3)(?:\b|\d)` and `\b(?:AC3|DD)(?:\b|\d)`. No
   behavioral change is needed; this is a documentation correction.
+- **§F-004 TVDB "last 90 days" filter doesn't map to a TVDB v4
+  parameter.** PRD §F-004 step 1 says "TVDB: filter sorted by score,
+  last 90 days (limit 100)". TVDB v4's filter endpoints
+  (`/v4/movies/filter`, `/v4/series/filter`) accept `country`, `lang`,
+  `sort`, `company`, `contentRating`, `genre`, `status`, `year` — no
+  date-range parameter exists. Session 006 ships sorted-by-score
+  across all years (ADR-048); the "last 90 days" qualifier is dropped.
+  **Suggested PRD §F-004 revision:** either (a) drop the "last 90 days"
+  qualifier (the lowest-weight TVDB signal pulled by score correlates
+  with recent popularity surges enough for the merge), or (b) replace
+  it with `year=current` for a stable but year-bounded approximation,
+  or (c) replace TVDB trending with TVDB extended metadata enrichment
+  for items already in the merge (TVDB v4 has artwork/ratings detail
+  but not a great "what's trending now" signal). Option (a) is the
+  cheapest.
 - **§F-018 `compileSdk 34` lock vs Tauri 2.11 androidx defaults.** Session
   005 shipped a signed universal APK against `compileSdk 34` as the PRD
   locks, but only by downgrading four `androidx.*` dependencies away

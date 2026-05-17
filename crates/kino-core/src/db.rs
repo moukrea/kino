@@ -315,6 +315,55 @@ impl Db {
         tx.commit().await?;
         Ok(())
     }
+
+    // ---- response_cache ------------------------------------------------
+    //
+    // Generic key → JSON payload cache with absolute expiry timestamps.
+    // F-004 stores its day-long aggregated-trending payloads here; later
+    // features (F-005 artwork, F-006 stream availability via its own table,
+    // F-007 addon catalogs) extend the same surface.
+
+    /// Return the cached payload for `key` if present and not yet expired.
+    /// Expired rows are NOT deleted on read — periodic cleanup is a future
+    /// background task; reads simply ignore stale entries.
+    pub async fn cache_get(&self, key: &str) -> Result<Option<String>, DbError> {
+        let now = now_unix();
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT payload_json FROM response_cache \
+             WHERE key = ? AND expires_at > ?",
+        )
+        .bind(key)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(p,)| p))
+    }
+
+    /// Upsert a cache row. `expires_at` is an absolute Unix timestamp in
+    /// seconds. Callers compute it from a TTL (e.g. `now + TRENDING_TTL_S`)
+    /// or from a boundary like "next UTC midnight" (F-004's daily output
+    /// cache).
+    pub async fn cache_set(
+        &self,
+        key: &str,
+        payload_json: &str,
+        expires_at: i64,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO response_cache (key, payload_json, etag, expires_at) \
+             VALUES (?, ?, NULL, ?) \
+             ON CONFLICT(key) DO UPDATE SET \
+               payload_json = excluded.payload_json, \
+               etag = NULL, \
+               expires_at = excluded.expires_at",
+        )
+        .bind(key)
+        .bind(payload_json)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 fn now_unix() -> i64 {
@@ -658,5 +707,32 @@ mod tests {
         let clone = db.clone();
         db.kv_set("x", "y").await.unwrap();
         assert_eq!(clone.kv_get("x").await.unwrap().as_deref(), Some("y"));
+    }
+
+    #[tokio::test]
+    async fn cache_set_then_get_returns_fresh_payload() {
+        let db = Db::open_in_memory().await.unwrap();
+        let future = now_unix() + 600;
+        db.cache_set("k", "{\"v\":1}", future).await.unwrap();
+        let got = db.cache_get("k").await.unwrap();
+        assert_eq!(got.as_deref(), Some("{\"v\":1}"));
+    }
+
+    #[tokio::test]
+    async fn cache_get_ignores_expired_row() {
+        let db = Db::open_in_memory().await.unwrap();
+        let past = now_unix() - 10;
+        db.cache_set("k", "stale", past).await.unwrap();
+        assert!(db.cache_get("k").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn cache_set_overwrites_existing_row() {
+        let db = Db::open_in_memory().await.unwrap();
+        let t = now_unix() + 600;
+        db.cache_set("k", "first", t).await.unwrap();
+        db.cache_set("k", "second", t).await.unwrap();
+        let got = db.cache_get("k").await.unwrap();
+        assert_eq!(got.as_deref(), Some("second"));
     }
 }

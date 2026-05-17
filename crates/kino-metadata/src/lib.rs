@@ -20,6 +20,7 @@ pub mod fanart;
 pub mod http;
 pub mod tmdb;
 pub mod trakt;
+pub mod trending;
 pub mod tvdb;
 
 pub use error::Error;
@@ -27,6 +28,7 @@ pub use fanart::FanartClient;
 pub use http::{HttpConfig, USER_AGENT};
 pub use tmdb::TmdbClient;
 pub use trakt::TraktClient;
+pub use trending::{aggregate, ProviderItem};
 pub use tvdb::TvdbClient;
 
 /// `settings.key` storing the TMDB API key (PRD §F-003).
