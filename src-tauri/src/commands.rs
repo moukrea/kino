@@ -10,12 +10,14 @@
 
 use chrono::{Datelike, NaiveDate, TimeZone, Utc};
 use kino_addons::{
-    normalize_manifest_url, AddonClient, AddonError, Manifest, RecommendedAddon,
-    CINEMETA_MANIFEST_URL, RECOMMENDED_ADDONS,
+    normalize_manifest_url, AddonClient, AddonError, CatalogDescriptor, Manifest, MetaPreview,
+    RecommendedAddon, CINEMETA_MANIFEST_URL, RECOMMENDED_ADDONS,
 };
 use kino_core::addon::{Addon, AddonInsert};
 use kino_core::availability::AvailabilityRow;
-use kino_core::constants::{ARTWORK_TTL_S, AVAILABILITY_CONCURRENCY, AVAILABILITY_TIMEOUT_S};
+use kino_core::constants::{
+    ARTWORK_TTL_S, AVAILABILITY_CONCURRENCY, AVAILABILITY_TIMEOUT_S, SEARCH_TTL_S,
+};
 use kino_core::cw::ContinueWatching;
 use kino_core::http::HttpConfig;
 use kino_core::title::{Artwork, TitleKind, TitleSummary};
@@ -423,6 +425,348 @@ pub async fn get_weekly_trending(
     }
 
     Ok(summaries)
+}
+
+// ---- F-008 row 5: addon catalogs enumeration ---------------------------
+//
+// `list_home_catalogs(kind, locale)` (PRD §F-008 row 5 + §F-009).
+//
+// Walks installed enabled addons in their persisted `display_order` and
+// enumerates each addon's manifest-declared catalogs. For every (addon,
+// catalog) pair that matches the requested `kind` filter, fetches the
+// catalog payload via `AddonClient::catalog`, converts each entry to the
+// home-screen [`TitleSummary`] shape, and returns the bundle as
+// `Vec<HomeCatalog>` — one row per non-empty catalog, in the PRD-locked
+// "addon `display_order` then catalog order within each addon" sequence.
+//
+// `kind` filter semantics (PRD §F-008 / §F-009):
+// - `None` → unfiltered Home; every catalog of every enabled addon is
+//   surfaced regardless of `catalog.type`.
+// - `Some(Movie | Series)` → only catalogs whose `catalog.type` matches
+//   AND whose owning addon manifest's top-level `types` array includes
+//   the kind. F-009: "only catalogs whose addon manifest declares the
+//   matching type".
+//
+// Failure handling: per-catalog network / decode failures are logged via
+// `tracing::warn!` and skipped — one flaky addon must not blank the
+// whole Home row stack. Catalogs that fetch successfully but return
+// empty `metas` are also dropped (rendering an empty addon row in a
+// 10-foot UI is worse UX than showing nothing — F-008 row 5 is meant to
+// expose USEFUL addon content, not pad the home screen).
+//
+// Concurrency: per-catalog fetches are dispatched via
+// `tokio::task::JoinSet` bounded by a `Semaphore(AVAILABILITY_CONCURRENCY = 8)`.
+// Reuses the existing F-006 concurrency budget — Home loads typically
+// fan out availability checks alongside catalog fetches, and 8 is the
+// PRD §F-006 ceiling on simultaneous outbound addon connections.
+//
+// Caching: full result cached in `response_cache` for `SEARCH_TTL_S = 1h`
+// (the closest PRD §8 TTL constant covering live addon-served lists)
+// keyed by `home_catalogs:{kind_str|"all"}:{locale}`. The TTL is shorter
+// than trending's same-UTC-day because addon catalogs (Cinemeta's
+// "Popular Movies", Torrentio's "Trending", etc.) tick more frequently
+// than the merged TMDB/Trakt/TVDB trending list.
+
+/// One PRD §F-008 row 5 catalog row delivered to the frontend. Each
+/// instance maps to one `<Row>` rendered under the four locked rows of
+/// the home screen.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HomeCatalog {
+    /// Persisted [`Addon::id`] this catalog belongs to. Used by the
+    /// frontend as part of the row's focusable-id prefix so D-pad
+    /// navigation across rows stays unambiguous when two addons declare
+    /// catalogs with the same `id`.
+    pub addon_id: String,
+    /// User-facing addon name from the manifest. Falls back to the
+    /// addon's id when the manifest omits it (Stremio guarantees `name`
+    /// in practice; this is defensive).
+    pub addon_name: String,
+    /// Catalog id as declared in the manifest (`{id}` in
+    /// `GET /catalog/{type}/{id}.json`).
+    pub catalog_id: String,
+    /// `"movie"` or `"series"` — the kind this catalog serves. Mirrored
+    /// from the manifest's `CatalogDescriptor::kind`.
+    pub catalog_kind: String,
+    /// User-facing catalog label from the manifest. Falls back to a
+    /// `"{Addon} — {id}"` composite when the manifest omits the
+    /// catalog's `name`.
+    pub catalog_name: String,
+    /// Catalog items, in the addon's own returned order. Empty catalogs
+    /// are filtered out before this struct is constructed, so callers
+    /// can safely assume `items.len() >= 1`.
+    pub items: Vec<TitleSummary>,
+}
+
+/// `list_home_catalogs(kind, locale)` (PRD §F-008 row 5 + §F-009).
+///
+/// Returns the dynamic tail of the home-screen row stack: one
+/// [`HomeCatalog`] per non-empty addon catalog matching the kind filter,
+/// in the PRD-locked addon-`display_order` then catalog-order sequence.
+///
+/// `kind = None` returns every catalog (unfiltered Home);
+/// `kind = Some(Movie | Series)` filters per PRD §F-009.
+#[tauri::command]
+pub async fn list_home_catalogs(
+    db: State<'_, Db>,
+    kind: Option<TitleKind>,
+    locale: String,
+) -> Result<Vec<HomeCatalog>, String> {
+    let kind_key = kind.map_or("all", TitleKind::as_str);
+    let cache_key = format!("home_catalogs:{kind_key}:{locale}");
+
+    if let Some(cached) = db.cache_get(&cache_key).await.map_err(ipc)? {
+        if let Ok(parsed) = serde_json::from_str::<Vec<HomeCatalog>>(&cached) {
+            return Ok(parsed);
+        }
+        tracing::warn!(key = %cache_key, "discarding malformed cached home-catalogs payload");
+    }
+
+    let fetched = list_home_catalogs_uncached(&db, kind, &HttpConfig::default()).await?;
+
+    let payload = serde_json::to_string(&fetched).map_err(|e| e.to_string())?;
+    let expires_at = now_unix().saturating_add(i64::try_from(SEARCH_TTL_S).unwrap_or(i64::MAX));
+    if let Err(e) = db.cache_set(&cache_key, &payload, expires_at).await {
+        tracing::warn!(error = %e, "failed to persist home-catalogs cache");
+    }
+
+    Ok(fetched)
+}
+
+/// Cache-bypassing core of [`list_home_catalogs`]. Exists as a separate
+/// function so the unit tests can drive it with a `for_test()`
+/// [`HttpConfig`] (zero backoffs, short timeout) without going through
+/// the `response_cache` round-trip.
+async fn list_home_catalogs_uncached(
+    db: &Db,
+    kind: Option<TitleKind>,
+    http_config: &HttpConfig,
+) -> Result<Vec<HomeCatalog>, String> {
+    let installed = db.addons_list().await.map_err(ipc)?;
+
+    // Plan: walk addons in display_order, expand each into the catalogs
+    // that survive the kind filter, build a work item with a stable
+    // (addon_index, catalog_index) for output reassembly.
+    let mut plan: Vec<CatalogWorkItem> = Vec::new();
+    for (addon_index, addon) in installed.into_iter().enumerate() {
+        if !addon.enabled {
+            continue;
+        }
+        let manifest = match serde_json::from_value::<Manifest>(addon.manifest_json.clone()) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    addon = %addon.id,
+                    error = %e,
+                    "could not parse persisted manifest; skipping for catalogs"
+                );
+                continue;
+            }
+        };
+        // F-009: addon-level types declaration gates whether ANY of its
+        // catalogs surface for a given kind. An addon whose manifest says
+        // `types: ["movie"]` contributes zero rows to the Series sub-home
+        // even if it happens to declare a series catalog (the catalog
+        // would be unreachable per the addon's own protocol promise).
+        if let Some(k) = kind {
+            if !manifest.types.iter().any(|t| t == k.as_str()) {
+                continue;
+            }
+        }
+        // Also skip addons that don't declare the `catalog` resource at
+        // all — fetching `GET /catalog/...` against them would 404.
+        if !manifest.resources.iter().any(|r| r.name() == "catalog") {
+            continue;
+        }
+        let client = match AddonClient::with_options(&addon.manifest_url, http_config.clone()) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    addon = %addon.id,
+                    error = %e,
+                    "could not build addon client for catalog enumeration; skipping"
+                );
+                continue;
+            }
+        };
+        for (catalog_index, catalog) in manifest.catalogs.iter().enumerate() {
+            if let Some(k) = kind {
+                if catalog.kind != k.as_str() {
+                    continue;
+                }
+            }
+            plan.push(CatalogWorkItem {
+                addon_index,
+                catalog_index,
+                addon_id: addon.id.clone(),
+                addon_name: manifest.name.clone(),
+                client: client.clone(),
+                catalog: catalog.clone(),
+            });
+        }
+    }
+
+    if plan.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Dispatch with Semaphore-bounded concurrency. Reuses the F-006
+    // ceiling because the typical caller (Home load) is firing
+    // availability checks at the same time and the two budgets share
+    // the addon connection pool.
+    let semaphore = Arc::new(Semaphore::new(AVAILABILITY_CONCURRENCY));
+    let mut set: tokio::task::JoinSet<Option<CatalogOutcome>> = tokio::task::JoinSet::new();
+    for item in plan {
+        let permit = Arc::clone(&semaphore);
+        set.spawn(async move {
+            let _permit = permit.acquire_owned().await.ok();
+            fetch_catalog_row(item).await
+        });
+    }
+
+    let mut rows: Vec<CatalogOutcome> = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(Some(outcome)) => rows.push(outcome),
+            Ok(None) => {}
+            Err(e) => tracing::warn!(error = %e, "home catalog dispatch task panicked"),
+        }
+    }
+
+    // Restore the deterministic PRD §F-008 ordering: addon display_order
+    // first, then catalog index within each addon.
+    rows.sort_by(|a, b| {
+        a.addon_index
+            .cmp(&b.addon_index)
+            .then_with(|| a.catalog_index.cmp(&b.catalog_index))
+    });
+    Ok(rows.into_iter().map(|o| o.row).collect())
+}
+
+/// One scheduled catalog fetch. The (`addon_index`, `catalog_index`)
+/// pair preserves the original walk order so we can re-sort after the
+/// concurrent dispatch.
+struct CatalogWorkItem {
+    addon_index: usize,
+    catalog_index: usize,
+    addon_id: String,
+    addon_name: String,
+    client: AddonClient,
+    catalog: CatalogDescriptor,
+}
+
+/// Successful fetch result paired with its original ordering keys.
+struct CatalogOutcome {
+    addon_index: usize,
+    catalog_index: usize,
+    row: HomeCatalog,
+}
+
+async fn fetch_catalog_row(item: CatalogWorkItem) -> Option<CatalogOutcome> {
+    let CatalogWorkItem {
+        addon_index,
+        catalog_index,
+        addon_id,
+        addon_name,
+        client,
+        catalog,
+    } = item;
+    let resp = match client.catalog(&catalog.kind, &catalog.id).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                addon = %addon_id,
+                catalog = %catalog.id,
+                error = %e,
+                "addon catalog fetch failed; skipping row"
+            );
+            return None;
+        }
+    };
+    let items: Vec<TitleSummary> = resp
+        .metas
+        .into_iter()
+        .map(meta_preview_to_summary)
+        .collect();
+    if items.is_empty() {
+        // Drop empty catalogs entirely — rendering a labeled but empty
+        // row in a 10-foot UI is worse than not rendering it at all.
+        return None;
+    }
+    let catalog_name = catalog
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("{addon_name} — {}", catalog.id));
+    Some(CatalogOutcome {
+        addon_index,
+        catalog_index,
+        row: HomeCatalog {
+            addon_id,
+            addon_name,
+            catalog_id: catalog.id,
+            catalog_kind: catalog.kind,
+            catalog_name,
+            items,
+        },
+    })
+}
+
+/// Convert a Stremio [`MetaPreview`] (addon-protocol shape) to the
+/// home-screen [`TitleSummary`] (kino-internal shape).
+///
+/// Stremio addons commonly return IMDb-style ids (`"tt0133093"`) directly
+/// for movies / series. Our downstream `resolve_artwork` and trending
+/// pipeline both expect the provider-prefixed shape (`"imdb:tt0133093"`,
+/// `"tmdb:603"`, `"tvdb:N"`), so we coerce raw `"tt…"` ids to the
+/// `imdb:` namespace here. Already-prefixed ids (containing a `:`) pass
+/// through unchanged; non-standard shapes (anime addons returning
+/// `"kitsu:..."`, etc.) also pass through so the artwork resolver's
+/// downstream "unsupported `title_id`" error surfaces with the addon's
+/// own id rather than a silently-mangled one.
+fn meta_preview_to_summary(meta: MetaPreview) -> TitleSummary {
+    let id = coerce_catalog_id(&meta.id);
+    let kind = match meta.kind.as_str() {
+        "series" => TitleKind::Series,
+        // Default everything else to Movie — addons sometimes emit
+        // "film" / "movies" / etc. and the F-008 row treats anything
+        // non-series as a movie tile. The id-prefixed shape is what the
+        // resolver uses to disambiguate downstream.
+        _ => TitleKind::Movie,
+    };
+    let year = meta.release_info.as_deref().and_then(parse_release_year);
+    let rating = meta
+        .imdb_rating
+        .as_deref()
+        .and_then(|s| s.parse::<f64>().ok());
+    TitleSummary {
+        id,
+        kind,
+        title: meta.name,
+        year,
+        poster: meta.poster,
+        rating,
+    }
+}
+
+/// Coerce a Stremio catalog id to the provider-prefixed shape the rest
+/// of the workspace consumes. Returns `imdb:tt…` for IMDb-style ids,
+/// passes everything else through unchanged.
+fn coerce_catalog_id(raw: &str) -> String {
+    if raw.starts_with("tt") && raw.len() > 2 && raw[2..].chars().all(|c| c.is_ascii_digit()) {
+        format!("imdb:{raw}")
+    } else {
+        raw.to_string()
+    }
+}
+
+/// Parse a year from Stremio's `releaseInfo` field. Addons emit one of
+/// `"2024"`, `"2024-"` (open-ended series range), `"2014-2019"` (closed
+/// range), `"1994-01-15"` (full date). We take the four leading digits.
+fn parse_release_year(s: &str) -> Option<u16> {
+    let head: String = s.chars().take_while(char::is_ascii_digit).collect();
+    if head.len() != 4 {
+        return None;
+    }
+    head.parse::<u16>().ok()
 }
 
 // ---- F-005: image & logo resolution -----------------------------------
@@ -1691,6 +2035,469 @@ mod tests {
             .await
             .unwrap();
         assert!(got.is_empty());
+    }
+
+    // ---- F-008 row 5: list_home_catalogs ------------------------------
+
+    fn catalog_manifest_body(id: &str, types: &[&str], catalogs: &str) -> String {
+        let types_arr = types
+            .iter()
+            .map(|t| format!("\"{t}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            r#"{{
+                "id": "{id}",
+                "version": "1.0.0",
+                "name": "{id}",
+                "types": [{types_arr}],
+                "resources": ["catalog", "meta"],
+                "catalogs": {catalogs}
+            }}"#
+        )
+    }
+
+    async fn install_catalog_addon(
+        db: &Db,
+        id: &str,
+        manifest_url: &str,
+        types: &[&str],
+        catalogs_json: &str,
+    ) {
+        let manifest_json: serde_json::Value =
+            serde_json::from_str(&catalog_manifest_body(id, types, catalogs_json)).unwrap();
+        db.addons_insert(&AddonInsert {
+            id: id.into(),
+            manifest_url: manifest_url.into(),
+            manifest_json,
+            display_order: None,
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_home_catalogs_empty_addons_returns_empty() {
+        let db = Db::open_in_memory().await.unwrap();
+        let got = list_home_catalogs_uncached(&db, None, &HttpConfig::for_test())
+            .await
+            .unwrap();
+        assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_home_catalogs_returns_single_catalog_in_order() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalog/movie/top.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"metas": [
+                        {"id": "tt1", "type": "movie", "name": "Matrix",
+                         "poster": "https://p1", "releaseInfo": "1999"},
+                        {"id": "tt2", "type": "movie", "name": "Heat",
+                         "releaseInfo": "1995-"}
+                    ]}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let db = Db::open_in_memory().await.unwrap();
+        let manifest_url = format!("{}/manifest.json", server.uri());
+        install_catalog_addon(
+            &db,
+            "cinemeta",
+            &manifest_url,
+            &["movie", "series"],
+            r#"[{"type": "movie", "id": "top", "name": "Popular"}]"#,
+        )
+        .await;
+
+        let got = list_home_catalogs_uncached(&db, None, &HttpConfig::for_test())
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].addon_id, "cinemeta");
+        assert_eq!(got[0].catalog_id, "top");
+        assert_eq!(got[0].catalog_kind, "movie");
+        assert_eq!(got[0].catalog_name, "Popular");
+        assert_eq!(got[0].items.len(), 2);
+        // IMDb-style ids are coerced to the workspace's provider-prefixed
+        // shape so downstream artwork resolution recognizes them.
+        assert_eq!(got[0].items[0].id, "imdb:tt1");
+        assert_eq!(got[0].items[0].title, "Matrix");
+        assert_eq!(got[0].items[0].year, Some(1999));
+        assert_eq!(got[0].items[1].id, "imdb:tt2");
+        assert_eq!(got[0].items[1].year, Some(1995));
+    }
+
+    #[tokio::test]
+    async fn list_home_catalogs_filters_by_kind() {
+        // Cinemeta-shaped addon with one movie catalog + one series
+        // catalog. Movies-kind call must surface only the movie row.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalog/movie/top.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"metas": [{"id": "tt1", "type": "movie", "name": "M"}]}"#),
+            )
+            .mount(&server)
+            .await;
+        // Series catalog endpoint MUST NOT be hit when the kind filter
+        // is Movie. `expect(0)` pins this in the dispatcher.
+        Mock::given(method("GET"))
+            .and(path("/catalog/series/top.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"{"metas": [{"id": "tt2", "type": "series", "name": "S"}]}"#,
+                ),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let db = Db::open_in_memory().await.unwrap();
+        let manifest_url = format!("{}/manifest.json", server.uri());
+        install_catalog_addon(
+            &db,
+            "cinemeta",
+            &manifest_url,
+            &["movie", "series"],
+            r#"[
+                {"type": "movie", "id": "top", "name": "Popular Movies"},
+                {"type": "series", "id": "top", "name": "Popular Series"}
+            ]"#,
+        )
+        .await;
+
+        let got = list_home_catalogs_uncached(&db, Some(TitleKind::Movie), &HttpConfig::for_test())
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].catalog_kind, "movie");
+    }
+
+    #[tokio::test]
+    async fn list_home_catalogs_skips_addon_when_manifest_types_dont_match_kind() {
+        // PRD §F-009: "only catalogs whose addon manifest declares the
+        // matching type". A movie-only addon must contribute nothing to
+        // the Series sub-home even if (defensively) it declares a series
+        // catalog.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalog/series/top.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"{"metas": [{"id": "tt2", "type": "series", "name": "S"}]}"#,
+                ),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let db = Db::open_in_memory().await.unwrap();
+        let manifest_url = format!("{}/manifest.json", server.uri());
+        install_catalog_addon(
+            &db,
+            "movies-only",
+            &manifest_url,
+            &["movie"],
+            r#"[{"type": "series", "id": "top", "name": "Series"}]"#,
+        )
+        .await;
+
+        let got =
+            list_home_catalogs_uncached(&db, Some(TitleKind::Series), &HttpConfig::for_test())
+                .await
+                .unwrap();
+        assert!(
+            got.is_empty(),
+            "movie-only addon must not appear in Series sub-home"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_home_catalogs_drops_empty_catalog_rows() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalog/movie/top.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"metas": []}"#))
+            .mount(&server)
+            .await;
+
+        let db = Db::open_in_memory().await.unwrap();
+        let manifest_url = format!("{}/manifest.json", server.uri());
+        install_catalog_addon(
+            &db,
+            "empty-cat",
+            &manifest_url,
+            &["movie"],
+            r#"[{"type": "movie", "id": "top", "name": "Popular"}]"#,
+        )
+        .await;
+
+        let got = list_home_catalogs_uncached(&db, None, &HttpConfig::for_test())
+            .await
+            .unwrap();
+        assert!(got.is_empty(), "empty catalogs must be filtered out");
+    }
+
+    #[tokio::test]
+    async fn list_home_catalogs_preserves_display_order_then_catalog_order() {
+        // Two addons, each with two catalogs. After dispatch they should
+        // come back as: addon-a/cat-1, addon-a/cat-2, addon-b/cat-1,
+        // addon-b/cat-2 — even though the JoinSet completes in arbitrary
+        // order.
+        let server = MockServer::start().await;
+        // addon-a catalogs.
+        Mock::given(method("GET"))
+            .and(path("/a/catalog/movie/a1.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"{"metas": [{"id": "tt1", "type": "movie", "name": "A1"}]}"#,
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/a/catalog/movie/a2.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"{"metas": [{"id": "tt2", "type": "movie", "name": "A2"}]}"#,
+                ),
+            )
+            .mount(&server)
+            .await;
+        // addon-b catalogs.
+        Mock::given(method("GET"))
+            .and(path("/b/catalog/movie/b1.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"{"metas": [{"id": "tt3", "type": "movie", "name": "B1"}]}"#,
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/b/catalog/movie/b2.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"{"metas": [{"id": "tt4", "type": "movie", "name": "B2"}]}"#,
+                ),
+            )
+            .mount(&server)
+            .await;
+
+        let db = Db::open_in_memory().await.unwrap();
+        install_catalog_addon(
+            &db,
+            "addon-a",
+            &format!("{}/a/manifest.json", server.uri()),
+            &["movie"],
+            r#"[
+                {"type": "movie", "id": "a1", "name": "A First"},
+                {"type": "movie", "id": "a2", "name": "A Second"}
+            ]"#,
+        )
+        .await;
+        install_catalog_addon(
+            &db,
+            "addon-b",
+            &format!("{}/b/manifest.json", server.uri()),
+            &["movie"],
+            r#"[
+                {"type": "movie", "id": "b1", "name": "B First"},
+                {"type": "movie", "id": "b2", "name": "B Second"}
+            ]"#,
+        )
+        .await;
+
+        let got = list_home_catalogs_uncached(&db, None, &HttpConfig::for_test())
+            .await
+            .unwrap();
+        let order: Vec<(&str, &str)> = got
+            .iter()
+            .map(|c| (c.addon_id.as_str(), c.catalog_id.as_str()))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("addon-a", "a1"),
+                ("addon-a", "a2"),
+                ("addon-b", "b1"),
+                ("addon-b", "b2"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_home_catalogs_skips_disabled_addons() {
+        let server = MockServer::start().await;
+        // No mocks: any request from the disabled addon would 404 and
+        // still produce a HomeCatalog row (404 → fetch error → row dropped),
+        // but the more important invariant is that the disabled addon's
+        // catalog mock is NEVER hit. We pin that with expect(0).
+        let mock = Mock::given(method("GET"))
+            .and(path("/catalog/movie/top.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"metas": [{"id": "tt1", "type": "movie", "name": "M"}]}"#),
+            )
+            .expect(0);
+        mock.mount(&server).await;
+
+        let db = Db::open_in_memory().await.unwrap();
+        let manifest_url = format!("{}/manifest.json", server.uri());
+        install_catalog_addon(
+            &db,
+            "disabled",
+            &manifest_url,
+            &["movie"],
+            r#"[{"type": "movie", "id": "top", "name": "Popular"}]"#,
+        )
+        .await;
+        db.addons_set_enabled("disabled", false).await.unwrap();
+
+        let got = list_home_catalogs_uncached(&db, None, &HttpConfig::for_test())
+            .await
+            .unwrap();
+        assert!(got.is_empty(), "disabled addons must not be consulted");
+    }
+
+    #[tokio::test]
+    async fn list_home_catalogs_skips_catalog_endpoint_addons_without_catalog_resource() {
+        // An addon that declares `catalogs` but doesn't list `catalog`
+        // in `resources` is malformed; rather than 404, skip it so we
+        // don't spam the addon with calls it isn't equipped to answer.
+        let server = MockServer::start().await;
+        let mock = Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"metas": []}"#))
+            .expect(0);
+        mock.mount(&server).await;
+
+        let db = Db::open_in_memory().await.unwrap();
+        let manifest_url = format!("{}/manifest.json", server.uri());
+        db.addons_insert(&AddonInsert {
+            id: "stream-only".into(),
+            manifest_url,
+            manifest_json: serde_json::json!({
+                "id": "stream-only",
+                "version": "1",
+                "name": "Stream Only",
+                "types": ["movie"],
+                "resources": ["stream"],
+                "catalogs": [{"type": "movie", "id": "top", "name": "X"}]
+            }),
+            display_order: None,
+        })
+        .await
+        .unwrap();
+
+        let got = list_home_catalogs_uncached(&db, None, &HttpConfig::for_test())
+            .await
+            .unwrap();
+        assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_home_catalogs_tolerates_per_catalog_fetch_failure() {
+        // One catalog 200s, one 500s. The successful one must still
+        // surface; the failing one is dropped with a log.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalog/movie/ok.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"{"metas": [{"id": "tt1", "type": "movie", "name": "OK"}]}"#,
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/catalog/movie/broken.json"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let db = Db::open_in_memory().await.unwrap();
+        let manifest_url = format!("{}/manifest.json", server.uri());
+        install_catalog_addon(
+            &db,
+            "mixed",
+            &manifest_url,
+            &["movie"],
+            r#"[
+                {"type": "movie", "id": "ok", "name": "OK Row"},
+                {"type": "movie", "id": "broken", "name": "Broken Row"}
+            ]"#,
+        )
+        .await;
+
+        let got = list_home_catalogs_uncached(&db, None, &HttpConfig::for_test())
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].catalog_id, "ok");
+    }
+
+    #[tokio::test]
+    async fn list_home_catalogs_falls_back_to_id_when_catalog_name_missing() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/catalog/movie/top.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"metas": [{"id": "tt1", "type": "movie", "name": "M"}]}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let db = Db::open_in_memory().await.unwrap();
+        let manifest_url = format!("{}/manifest.json", server.uri());
+        install_catalog_addon(
+            &db,
+            "noname",
+            &manifest_url,
+            &["movie"],
+            // catalog descriptor with no name field
+            r#"[{"type": "movie", "id": "top"}]"#,
+        )
+        .await;
+
+        let got = list_home_catalogs_uncached(&db, None, &HttpConfig::for_test())
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        // Fallback shape: "{addon_name} — {catalog_id}".
+        assert_eq!(got[0].catalog_name, "noname — top");
+    }
+
+    #[test]
+    fn coerce_catalog_id_prefixes_imdb_style_ids() {
+        assert_eq!(coerce_catalog_id("tt0133093"), "imdb:tt0133093");
+        // Already-prefixed → passthrough.
+        assert_eq!(coerce_catalog_id("tmdb:603"), "tmdb:603");
+        assert_eq!(coerce_catalog_id("tvdb:12345"), "tvdb:12345");
+        // Non-standard prefix (anime addon) → passthrough.
+        assert_eq!(coerce_catalog_id("kitsu:1"), "kitsu:1");
+        // Bare "tt" alone is not an IMDb id → passthrough.
+        assert_eq!(coerce_catalog_id("tt"), "tt");
+        // "tt" followed by non-digits → passthrough (would be a malformed
+        // imdb id; let it surface to the resolver as-is).
+        assert_eq!(coerce_catalog_id("ttabc"), "ttabc");
+    }
+
+    #[test]
+    fn parse_release_year_handles_stremio_shapes() {
+        assert_eq!(parse_release_year("1999"), Some(1999));
+        assert_eq!(parse_release_year("2024-"), Some(2024));
+        assert_eq!(parse_release_year("2014-2019"), Some(2014));
+        assert_eq!(parse_release_year("1994-01-15"), Some(1994));
+        assert_eq!(parse_release_year(""), None);
+        assert_eq!(parse_release_year("N/A"), None);
+        // 3-digit prefix → reject (matches the TMDB year parser's
+        // strictness).
+        assert_eq!(parse_release_year("999"), None);
     }
 
     #[tokio::test]

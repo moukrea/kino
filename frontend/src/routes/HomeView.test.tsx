@@ -23,6 +23,7 @@ import { _resetForTests as _resetFocus } from "../input/focus";
 import { _resetForTests as _resetProfile } from "../input/profile";
 import type {
   ContinueWatching,
+  HomeCatalog,
   TitleKind,
   TitleSummary,
   TrendingPools,
@@ -36,6 +37,7 @@ vi.mock("../lib/tauri", async (importOriginal) => {
     cwList: vi.fn(),
     getTrendingPools: vi.fn(),
     getWeeklyTrending: vi.fn(),
+    listHomeCatalogs: vi.fn(),
   };
 });
 
@@ -43,6 +45,7 @@ const tauri = await import("../lib/tauri");
 const mockedCwList = vi.mocked(tauri.cwList);
 const mockedGetTrendingPools = vi.mocked(tauri.getTrendingPools);
 const mockedGetWeeklyTrending = vi.mocked(tauri.getWeeklyTrending);
+const mockedListHomeCatalogs = vi.mocked(tauri.listHomeCatalogs);
 
 function summary(id: string, kind: TitleKind, title: string): TitleSummary {
   return { id, kind, title, year: 2024, poster: null, rating: null };
@@ -65,6 +68,24 @@ function cw(title_id: string, kind: TitleKind): ContinueWatching {
     duration_s: 0,
     last_played_at: 0,
     meta_json: { title: title_id, year: 2024, poster: null },
+  };
+}
+
+function catalog(
+  addonId: string,
+  addonName: string,
+  catalogId: string,
+  catalogKind: TitleKind,
+  catalogName: string,
+  items: TitleSummary[],
+): HomeCatalog {
+  return {
+    addon_id: addonId,
+    addon_name: addonName,
+    catalog_id: catalogId,
+    catalog_kind: catalogKind,
+    catalog_name: catalogName,
+    items,
   };
 }
 
@@ -98,9 +119,11 @@ describe("HomeView (F-009)", () => {
     mockedCwList.mockReset();
     mockedGetTrendingPools.mockReset();
     mockedGetWeeklyTrending.mockReset();
+    mockedListHomeCatalogs.mockReset();
     mockedCwList.mockResolvedValue([]);
     mockedGetTrendingPools.mockResolvedValue(pools([]));
     mockedGetWeeklyTrending.mockResolvedValue([]);
+    mockedListHomeCatalogs.mockResolvedValue([]);
   });
 
   afterEach(() => {
@@ -247,6 +270,122 @@ describe("HomeView (F-009)", () => {
     );
     expect(cwTiles.length).toBe(1);
     expect(cwTiles[0]?.dataset.kind).toBe("movie");
+  });
+});
+
+describe("HomeView addon catalog rows (F-008 row 5)", () => {
+  let host: HTMLDivElement | null = null;
+  let dispose: (() => void) | null = null;
+
+  beforeEach(() => {
+    _resetFocus();
+    _resetProfile();
+    mockedCwList.mockReset();
+    mockedGetTrendingPools.mockReset();
+    mockedGetWeeklyTrending.mockReset();
+    mockedListHomeCatalogs.mockReset();
+    mockedCwList.mockResolvedValue([]);
+    mockedGetTrendingPools.mockResolvedValue(pools([]));
+    mockedGetWeeklyTrending.mockResolvedValue([]);
+    mockedListHomeCatalogs.mockResolvedValue([]);
+  });
+
+  afterEach(() => {
+    dispose?.();
+    host?.remove();
+    host = null;
+    dispose = null;
+  });
+
+  it("renders one Row per HomeCatalog returned by listHomeCatalogs", async () => {
+    mockedListHomeCatalogs.mockResolvedValue([
+      catalog("cinemeta", "Cinemeta", "top", "movie", "Popular", [
+        summary("imdb:tt1", "movie", "Matrix"),
+        summary("imdb:tt2", "movie", "Heat"),
+      ]),
+      catalog("torrentio", "Torrentio", "trending", "movie", "Trending", [
+        summary("imdb:tt3", "movie", "Inception"),
+      ]),
+    ]);
+
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    dispose = mount(host, null);
+    await flushAsync();
+
+    const cinemetaRow = host.querySelector(
+      '[data-testid="row-cat-cinemeta-top"]',
+    );
+    const torrentioRow = host.querySelector(
+      '[data-testid="row-cat-torrentio-trending"]',
+    );
+    expect(cinemetaRow).not.toBeNull();
+    expect(torrentioRow).not.toBeNull();
+    // The label is the catalog name (not "From Your Addons").
+    expect(cinemetaRow?.textContent).toContain("Popular");
+    expect(torrentioRow?.textContent).toContain("Trending");
+  });
+
+  it("preserves the listHomeCatalogs ordering in the DOM", async () => {
+    mockedListHomeCatalogs.mockResolvedValue([
+      catalog("addon-a", "A", "a1", "movie", "A1", [
+        summary("imdb:tt1", "movie", "M1"),
+      ]),
+      catalog("addon-a", "A", "a2", "movie", "A2", [
+        summary("imdb:tt2", "movie", "M2"),
+      ]),
+      catalog("addon-b", "B", "b1", "movie", "B1", [
+        summary("imdb:tt3", "movie", "M3"),
+      ]),
+    ]);
+
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    dispose = mount(host, null);
+    await flushAsync();
+
+    const ids = Array.from(
+      host.querySelectorAll<HTMLElement>('[data-testid^="row-cat-"]'),
+    ).map((el) => el.dataset.testid);
+    expect(ids).toEqual([
+      "row-cat-addon-a-a1",
+      "row-cat-addon-a-a2",
+      "row-cat-addon-b-b1",
+    ]);
+  });
+
+  it("forwards the active kind filter to listHomeCatalogs", async () => {
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    dispose = mount(host, "series");
+    await flushAsync();
+
+    const kinds = mockedListHomeCatalogs.mock.calls.map((c) => c[0]);
+    expect(kinds).toEqual(["series"]);
+  });
+
+  it("passes kind=null to listHomeCatalogs from the unfiltered Home", async () => {
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    dispose = mount(host, null);
+    await flushAsync();
+
+    const kinds = mockedListHomeCatalogs.mock.calls.map((c) => c[0]);
+    expect(kinds).toEqual([null]);
+  });
+
+  it("renders no addon-catalog row when the resource resolves empty", async () => {
+    mockedListHomeCatalogs.mockResolvedValue([]);
+
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    dispose = mount(host, null);
+    await flushAsync();
+
+    const catRows = host.querySelectorAll<HTMLElement>(
+      '[data-testid^="row-cat-"]',
+    );
+    expect(catRows.length).toBe(0);
   });
 });
 

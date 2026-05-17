@@ -56,6 +56,21 @@ export type Artwork = {
 };
 
 /**
+ * One PRD §F-008 row 5 catalog row served by an installed addon. Each
+ * row maps 1:1 to a [`Row`](../components/Row) on the home screen,
+ * rendered under the four locked rows in addon `display_order` then
+ * catalog order within each addon.
+ */
+export type HomeCatalog = {
+  addon_id: string;
+  addon_name: string;
+  catalog_id: string;
+  catalog_kind: TitleKind | string;
+  catalog_name: string;
+  items: TitleSummary[];
+};
+
+/**
  * Detect whether the Tauri IPC bridge is reachable. Used by routes to
  * decide between live data and an in-browser placeholder when the
  * frontend bundle is opened in a plain `vite dev` without the Tauri
@@ -97,4 +112,20 @@ export async function resolveArtwork(
     kind,
     langPref,
   });
+}
+
+/**
+ * `list_home_catalogs(kind, locale)` — PRD §F-008 row 5 + §F-009 filter.
+ *
+ * Returns the dynamic addon-catalog rows that appear under the four
+ * locked rows on the home screen. Pass `kind = null` for the unfiltered
+ * Home (every catalog of every enabled addon) or `"movie"` / `"series"`
+ * for the sub-home filtered variants. Catalogs that fail to fetch or
+ * return zero items are filtered out by the backend.
+ */
+export async function listHomeCatalogs(
+  kind: TitleKind | null,
+  locale: string,
+): Promise<HomeCatalog[]> {
+  return invoke<HomeCatalog[]>("list_home_catalogs", { kind, locale });
 }

@@ -19,9 +19,7 @@
     "continueWatching": "Continue Watching",
     "trendingNow": "Trending Now",
     "hiddenGems": "Hidden Gems",
-    "trendingThisWeek": "Trending This Week",
-    "fromAddons": "From Your Addons",
-    "addonsComingSoon": "Catalog rows from your installed addons will appear here."
+    "trendingThisWeek": "Trending This Week"
   },
   "search": {
     "comingSoon": "Search is coming soon."
