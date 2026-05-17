@@ -91,6 +91,61 @@ pub fn aggregate(
     summaries
 }
 
+/// Top-trending and hidden-gems pools as separate ordered lists.
+///
+/// Used by the F-008 Home screen which renders **Trending Now** and
+/// **Hidden Gems** as two distinct rows rather than the alternated
+/// 50-item list [`aggregate`] returns.
+///
+/// Both pools are produced by the same locked F-004 steps 1-5
+/// ([`merge_by_id`] + [`split_pools`]); each is then daily-shuffled
+/// independently with the same per-day PRNG seed so two same-UTC-day
+/// invocations return identical orderings on both rows. Two installs
+/// with different `install_id`s see different orderings the same day.
+///
+/// Pool sizes follow the PRD-locked quartile / hidden-gems eligibility
+/// rules — no fill-from-other-pool cross-bleed (that is an
+/// [`aggregate`]-only concern). Either pool may be empty when the
+/// upstream catalog is too small to satisfy the rules.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrendingPools {
+    pub top_trending: Vec<TitleSummary>,
+    pub hidden_gems: Vec<TitleSummary>,
+}
+
+/// Run F-004 steps 1-5 against the per-provider trending inputs and
+/// return the two pools as separate daily-shuffled lists.
+///
+/// Distinct from [`aggregate`] which alternates the pools per the
+/// locked `[T, T, T, G, G]` pattern; the home screen needs them split.
+#[must_use]
+#[allow(clippy::similar_names)] // PRD-locked provider names.
+pub fn aggregate_pools(
+    tmdb: Vec<ProviderItem>,
+    trakt: Vec<ProviderItem>,
+    tvdb: Vec<ProviderItem>,
+    install_id: &str,
+    today_utc: &str,
+) -> TrendingPools {
+    let merged = merge_by_id(tmdb, trakt, tvdb);
+    let (top, gems) = split_pools(&merged);
+    let mut top: Vec<TitleSummary> = top.into_iter().map(|m| m.summary).collect();
+    let mut gems: Vec<TitleSummary> = gems.into_iter().map(|m| m.summary).collect();
+    let seed = seed_for_day(today_utc, install_id);
+    // Each pool gets its own RNG instance so the per-pool ordering is
+    // independent of the other pool's length; otherwise a same-seed
+    // shared `rng.shuffle` consumes randomness from `top` before
+    // `gems` and the gems ordering becomes a function of `top.len()`.
+    let mut rng_top = ChaCha20Rng::from_seed(seed);
+    let mut rng_gems = ChaCha20Rng::from_seed(seed);
+    top.shuffle(&mut rng_top);
+    gems.shuffle(&mut rng_gems);
+    TrendingPools {
+        top_trending: top,
+        hidden_gems: gems,
+    }
+}
+
 /// `SHA256` of `"{date} {install_id}"` truncated to 32 bytes for
 /// `ChaCha20`. `SHA256` already produces exactly 32 bytes, so the array
 /// conversion is infallible.
@@ -647,6 +702,82 @@ mod tests {
         let a = aggregate(make_inputs(), vec![], vec![], "install-A", "2025-04-01");
         let b = aggregate(make_inputs(), vec![], vec![], "install-B", "2025-04-01");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn aggregate_pools_returns_pools_separately() {
+        // Build inputs that produce both a top quartile AND a hidden-gems
+        // entry (mirrors split_pools_finds_gems_with_high_rating tests).
+        let mut tmdb = Vec::new();
+        for i in 0..8 {
+            tmdb.push(item(
+                &format!("tt{i}"),
+                i,
+                #[allow(clippy::cast_precision_loss)]
+                Some(100.0 - i as f64),
+                Some(if i == 2 || i == 3 { 8.0 } else { 5.0 }),
+            ));
+        }
+        let pools = aggregate_pools(tmdb, vec![], vec![], "install-x", "2025-04-01");
+        // Top quartile of 8 = 2 items (tt0, tt1).
+        assert_eq!(pools.top_trending.len(), 2);
+        let top_ids: Vec<_> = pools.top_trending.iter().map(|s| s.id.clone()).collect();
+        assert!(top_ids.contains(&"tt0".into()));
+        assert!(top_ids.contains(&"tt1".into()));
+        // Gems: tt2 + tt3 (rating > 7.5, pop_rank < median 3.5).
+        let gem_ids: Vec<_> = pools.hidden_gems.iter().map(|s| s.id.clone()).collect();
+        assert!(gem_ids.contains(&"tt2".into()), "gems = {gem_ids:?}");
+        assert!(gem_ids.contains(&"tt3".into()), "gems = {gem_ids:?}");
+        // Pools don't overlap.
+        for id in &top_ids {
+            assert!(!gem_ids.contains(id), "id {id} in both pools");
+        }
+    }
+
+    #[test]
+    fn aggregate_pools_same_day_same_install_is_identical() {
+        let make_inputs = || {
+            let mut v = Vec::new();
+            for i in 0..40 {
+                v.push(item(
+                    &format!("tt{i}"),
+                    i,
+                    #[allow(clippy::cast_precision_loss)]
+                    Some(100.0 - i as f64),
+                    Some(if i % 2 == 0 { 8.0 } else { 5.0 }),
+                ));
+            }
+            v
+        };
+        let a = aggregate_pools(make_inputs(), vec![], vec![], "install-x", "2025-04-01");
+        let b = aggregate_pools(make_inputs(), vec![], vec![], "install-x", "2025-04-01");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn aggregate_pools_different_install_ids_differ_on_same_day() {
+        // Inputs need at least 2 items in one of the pools for the shuffle
+        // to actually permute (a single-item pool only has one permutation).
+        let make_inputs = || {
+            let mut v = Vec::new();
+            for i in 0..40 {
+                v.push(item(
+                    &format!("tt{i}"),
+                    i,
+                    #[allow(clippy::cast_precision_loss)]
+                    Some(100.0 - i as f64),
+                    Some(7.0),
+                ));
+            }
+            v
+        };
+        let a = aggregate_pools(make_inputs(), vec![], vec![], "install-A", "2025-04-01");
+        let b = aggregate_pools(make_inputs(), vec![], vec![], "install-B", "2025-04-01");
+        // Either pool must differ for the two installs to be distinguishable.
+        assert!(
+            a.top_trending != b.top_trending || a.hidden_gems != b.hidden_gems,
+            "expected different orderings between installs on the same day"
+        );
     }
 
     /// Kendall tau between two orderings of the same id set, where we compare

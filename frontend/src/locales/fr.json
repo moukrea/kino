@@ -4,6 +4,31 @@
     "placeholderHome": "kino",
     "placeholderTagline": "Le streaming, à votre façon."
   },
+  "nav": {
+    "label": "Navigation principale",
+    "home": "Accueil",
+    "movies": "Films",
+    "series": "Séries",
+    "search": "Recherche",
+    "settings": "Paramètres"
+  },
+  "home": {
+    "title": "Accueil",
+    "titleMovies": "Films",
+    "titleSeries": "Séries",
+    "continueWatching": "Reprendre",
+    "trendingNow": "Tendances",
+    "hiddenGems": "Pépites cachées",
+    "trendingThisWeek": "Tendances de la semaine",
+    "fromAddons": "Depuis vos extensions",
+    "addonsComingSoon": "Les catalogues de vos extensions apparaîtront ici."
+  },
+  "search": {
+    "comingSoon": "La recherche arrive bientôt."
+  },
+  "settings": {
+    "comingSoon": "Les paramètres arrivent bientôt."
+  },
   "input": {
     "profileLabel": "Profil d’entrée",
     "profileTouch": "Tactile",

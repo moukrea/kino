@@ -303,6 +303,128 @@ fn next_utc_midnight_unix(today: &str) -> Option<i64> {
     Some(Utc.from_utc_datetime(&midnight).timestamp())
 }
 
+// ---- F-008: home-screen feeds ------------------------------------------
+//
+// `get_trending_pools` and `get_weekly_trending` feed the locked Home
+// screen row order (PRD §F-008): Continue Watching, Trending Now,
+// Hidden Gems, Trending This Week, addon catalogs. The CW row is fed
+// by the existing `cw_list` command; addon catalogs are deferred to a
+// follow-up. The two pool-rows reuse the F-004 provider fetchers; the
+// weekly row is TMDB-only by PRD §F-008's "TMDB `/trending/{type}/week`
+// only, distinct from merged trending" wording.
+
+/// `get_trending_pools(kind, locale)` (PRD §F-008 rows 2 + 3).
+///
+/// Runs the F-004 aggregator's steps 1-5 (fetch, dedup, score, split)
+/// against the configured providers and returns the two pools as
+/// separately-shuffled lists. Each pool is daily-shuffled with the same
+/// per-UTC-day PRNG seed so the home rows are stable within a day and
+/// permute across consecutive days — the same invariant `get_trending`
+/// upholds for the alternated list.
+///
+/// Cache key is distinct from `get_trending` so the two outputs can
+/// coexist (a future F-009 sub-home may render the alternated list
+/// while the home renders the split pools).
+#[tauri::command]
+#[allow(clippy::similar_names)] // PRD-locked provider names (tmdb / tvdb).
+pub async fn get_trending_pools(
+    db: State<'_, Db>,
+    kind: TitleKind,
+    locale: String,
+) -> Result<kino_metadata::TrendingPools, String> {
+    let today = today_utc_string();
+    let cache_key = format!("trending_pools:{}:{today}", kind.as_str());
+
+    if let Some(cached) = db.cache_get(&cache_key).await.map_err(ipc)? {
+        if let Ok(parsed) = serde_json::from_str::<kino_metadata::TrendingPools>(&cached) {
+            return Ok(parsed);
+        }
+        tracing::warn!(key = %cache_key, "discarding malformed cached trending-pools payload");
+    }
+
+    let install_id = db.install_id().await.map_err(ipc)?;
+    let tmdb_key = db.kv_get(TMDB_API_KEY).await.map_err(ipc)?;
+    let trakt_key = db.kv_get(TRAKT_API_KEY).await.map_err(ipc)?;
+    let tvdb_key = db.kv_get(TVDB_API_KEY).await.map_err(ipc)?;
+
+    let Some(tmdb_key) = tmdb_key else {
+        return Err(format!(
+            "TMDB API key not configured (settings.{TMDB_API_KEY}) — Home is empty until it's set."
+        ));
+    };
+
+    let (tmdb_items, trakt_items, tvdb_items) = fetch_all_providers(
+        &tmdb_key,
+        trakt_key.as_deref(),
+        tvdb_key.as_deref(),
+        &kind,
+        &locale,
+    )
+    .await?;
+
+    let pools =
+        kino_metadata::aggregate_pools(tmdb_items, trakt_items, tvdb_items, &install_id, &today);
+
+    let expires_at =
+        next_utc_midnight_unix(&today).ok_or_else(|| "internal: invalid UTC date".to_string())?;
+    let payload = serde_json::to_string(&pools).map_err(|e| e.to_string())?;
+    if let Err(e) = db.cache_set(&cache_key, &payload, expires_at).await {
+        tracing::warn!(error = %e, "failed to persist trending-pools cache");
+    }
+
+    Ok(pools)
+}
+
+/// `get_weekly_trending(kind, locale)` (PRD §F-008 row 4).
+///
+/// TMDB `/trending/{type}/week` only — PRD §F-008 calls this row
+/// "distinct from merged trending" so the call is single-provider on
+/// purpose. Returns the items in TMDB's own ranking order (no shuffle,
+/// no merge); the row is intentionally a different view than the merged
+/// `get_trending_pools` rows.
+///
+/// Cached for the rest of the UTC day so the row's content matches what
+/// the merged-trending cache shows. Cache key is distinct.
+#[tauri::command]
+pub async fn get_weekly_trending(
+    db: State<'_, Db>,
+    kind: TitleKind,
+    locale: String,
+) -> Result<Vec<TitleSummary>, String> {
+    let today = today_utc_string();
+    let cache_key = format!("weekly_trending:{}:{today}", kind.as_str());
+
+    if let Some(cached) = db.cache_get(&cache_key).await.map_err(ipc)? {
+        if let Ok(parsed) = serde_json::from_str::<Vec<TitleSummary>>(&cached) {
+            return Ok(parsed);
+        }
+        tracing::warn!(key = %cache_key, "discarding malformed cached weekly-trending payload");
+    }
+
+    let tmdb_key = db.kv_get(TMDB_API_KEY).await.map_err(ipc)?;
+    let Some(tmdb_key) = tmdb_key else {
+        return Err(format!(
+            "TMDB API key not configured (settings.{TMDB_API_KEY}) — Home is empty until it's set."
+        ));
+    };
+
+    let client = TmdbClient::new(tmdb_key).map_err(ipc)?;
+    let items: Vec<ProviderItem> = match kind {
+        TitleKind::Movie => client.trending_movies(&locale).await.map_err(ipc)?,
+        TitleKind::Series => client.trending_shows(&locale).await.map_err(ipc)?,
+    };
+    let summaries: Vec<TitleSummary> = items.into_iter().map(|i| i.summary).collect();
+
+    let expires_at =
+        next_utc_midnight_unix(&today).ok_or_else(|| "internal: invalid UTC date".to_string())?;
+    let payload = serde_json::to_string(&summaries).map_err(|e| e.to_string())?;
+    if let Err(e) = db.cache_set(&cache_key, &payload, expires_at).await {
+        tracing::warn!(error = %e, "failed to persist weekly-trending cache");
+    }
+
+    Ok(summaries)
+}
+
 // ---- F-005: image & logo resolution -----------------------------------
 //
 // `resolve_artwork(title_id, kind, lang_pref)` builds the F-005 cascade

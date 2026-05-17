@@ -1,141 +1,65 @@
+// App shell. PRD §F-008 establishes the nav-rail / route layout
+// (Home, Movies, Series, Search, Settings); this module wires the
+// SolidJS router on top of the F-017 input subsystem so D-pad / arrow
+// / gamepad input still routes through the focus manager across route
+// changes.
+//
+// The shell is intentionally thin: the nav rail lives on the left,
+// the routed content on the right. Each route module (`routes/*.tsx`)
+// owns its own layout. Initial focus inside the routed content is set
+// by the route via `setInitialFocus` on mount (see `Home.tsx`).
+//
+// The Tauri host installs the database + addon machinery in `setup`;
+// the frontend assumes commands are callable. When the bundle is run
+// outside Tauri (vite dev / vitest jsdom) the `lib/tauri.ts` wrappers
+// fall back to empty data so the UI still renders.
+
 import {
-  createSignal,
   onCleanup,
   onMount,
   type Component,
+  type JSX,
 } from "solid-js";
+import { Router, Route } from "@solidjs/router";
 
-import { Focusable } from "./components/Focusable";
-import {
-  installInputSubsystem,
-  onAction,
-  profile,
-  type Action,
-  type InputSource,
-} from "./input";
-import { t } from "./i18n";
+import { NavRail } from "./components/NavRail";
+import { installInputSubsystem } from "./input";
+import { Home } from "./routes/Home";
+import { Movies } from "./routes/Movies";
+import { Series } from "./routes/Series";
+import { Search } from "./routes/Search";
+import { Settings } from "./routes/Settings";
 
 /**
- * Placeholder shell. PRD §F-001 acceptance is still "App launches and
- * shows a placeholder home screen with the text 'kino'"; that
- * promise is preserved by rendering the kino title at the top. The
- * lower half of the page is the F-017 input demonstrator the
- * acceptance test "UI responds correctly to mocked input events"
- * binds against. The real 10-foot UI (F-008) replaces this view
- * end-to-end.
+ * Layout shared by every route: a fixed-width nav rail on the left,
+ * the routed view to its right. Both stretch to the full viewport
+ * height so the route can own its own scroll behavior.
  */
-const App: Component = () => {
-  const [lastAction, setLastAction] = createSignal<
-    { action: Action; source: InputSource } | null
-  >(null);
-
+const Shell: Component<{ children?: JSX.Element }> = (props) => {
   onMount(() => {
-    const uninstallInput = installInputSubsystem();
-    const unsubscribe = onAction((action, source) => {
-      setLastAction({ action, source });
-    });
-    onCleanup(() => {
-      unsubscribe();
-      uninstallInput();
-    });
+    const uninstall = installInputSubsystem();
+    onCleanup(uninstall);
   });
 
-  const profileLabel = () => {
-    switch (profile()) {
-      case "touch":
-        return t("input.profileTouch");
-      case "dpad":
-        return t("input.profileDpad");
-      case "kbm":
-        return t("input.profileKbm");
-      case "gamepad":
-        return t("input.profileGamepad");
-    }
-  };
-
   return (
-    <main
-      class="flex h-full w-full flex-col items-center justify-center gap-6 bg-neutral-950 p-8 text-neutral-50"
-      role="main"
+    <div
+      class="flex h-screen w-screen bg-neutral-950 text-neutral-50"
+      data-testid="app-shell"
     >
-      <h1 class="text-7xl font-bold tracking-tight" data-testid="home-title">
-        {t("app.placeholderHome")}
-      </h1>
-      <p class="text-lg text-neutral-400" data-testid="home-tagline">
-        {t("app.placeholderTagline")}
-      </p>
-      <section
-        class="mt-6 flex flex-col items-center gap-3 rounded-md border border-neutral-800 p-4 text-sm"
-        data-testid="input-demo"
-      >
-        <div data-testid="input-profile">
-          <span class="text-neutral-400">{t("input.profileLabel")}: </span>
-          <span class="font-medium">{profileLabel()}</span>
-        </div>
-        <div data-testid="input-last-action">
-          <span class="text-neutral-400">{t("input.lastActionLabel")}: </span>
-          <span class="font-mono">
-            {lastAction()
-              ? `${lastAction()!.action} (${lastAction()!.source})`
-              : t("input.lastActionNone")}
-          </span>
-        </div>
-        <p class="max-w-md text-center text-neutral-500">
-          {t("input.demoHint")}
-        </p>
-        <div class="flex gap-2">
-          <Focusable id="demo-tile-1">
-            {({ ref, showRing, onClick }) => (
-              <button
-                ref={ref as (el: HTMLButtonElement) => void}
-                onClick={onClick}
-                data-testid="demo-tile-1"
-                class={`rounded-md px-4 py-2 transition-transform duration-150 ease-out ${
-                  showRing()
-                    ? "scale-105 bg-neutral-800 ring-2 ring-sky-400"
-                    : "bg-neutral-800"
-                }`}
-              >
-                tile 1
-              </button>
-            )}
-          </Focusable>
-          <Focusable id="demo-tile-2">
-            {({ ref, showRing, onClick }) => (
-              <button
-                ref={ref as (el: HTMLButtonElement) => void}
-                onClick={onClick}
-                data-testid="demo-tile-2"
-                class={`rounded-md px-4 py-2 transition-transform duration-150 ease-out ${
-                  showRing()
-                    ? "scale-105 bg-neutral-800 ring-2 ring-sky-400"
-                    : "bg-neutral-800"
-                }`}
-              >
-                tile 2
-              </button>
-            )}
-          </Focusable>
-          <Focusable id="demo-tile-3">
-            {({ ref, showRing, onClick }) => (
-              <button
-                ref={ref as (el: HTMLButtonElement) => void}
-                onClick={onClick}
-                data-testid="demo-tile-3"
-                class={`rounded-md px-4 py-2 transition-transform duration-150 ease-out ${
-                  showRing()
-                    ? "scale-105 bg-neutral-800 ring-2 ring-sky-400"
-                    : "bg-neutral-800"
-                }`}
-              >
-                tile 3
-              </button>
-            )}
-          </Focusable>
-        </div>
-      </section>
-    </main>
+      <NavRail />
+      <main class="relative flex-1 overflow-hidden">{props.children}</main>
+    </div>
   );
 };
+
+const App: Component = () => (
+  <Router root={Shell}>
+    <Route path="/" component={Home} />
+    <Route path="/movies" component={Movies} />
+    <Route path="/series" component={Series} />
+    <Route path="/search" component={Search} />
+    <Route path="/settings" component={Settings} />
+  </Router>
+);
 
 export default App;

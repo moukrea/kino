@@ -4,6 +4,31 @@
     "placeholderHome": "kino",
     "placeholderTagline": "Streaming, your way."
   },
+  "nav": {
+    "label": "Main navigation",
+    "home": "Home",
+    "movies": "Movies",
+    "series": "Series",
+    "search": "Search",
+    "settings": "Settings"
+  },
+  "home": {
+    "title": "Home",
+    "titleMovies": "Movies",
+    "titleSeries": "Series",
+    "continueWatching": "Continue Watching",
+    "trendingNow": "Trending Now",
+    "hiddenGems": "Hidden Gems",
+    "trendingThisWeek": "Trending This Week",
+    "fromAddons": "From Your Addons",
+    "addonsComingSoon": "Catalog rows from your installed addons will appear here."
+  },
+  "search": {
+    "comingSoon": "Search is coming soon."
+  },
+  "settings": {
+    "comingSoon": "Settings are coming soon."
+  },
   "input": {
     "profileLabel": "Input profile",
     "profileTouch": "Touch",

@@ -35,7 +35,7 @@ pub use fanart::FanartClient;
 pub use kino_core::http::{HttpConfig, USER_AGENT};
 pub use tmdb::TmdbClient;
 pub use trakt::TraktClient;
-pub use trending::{aggregate, ProviderItem};
+pub use trending::{aggregate, aggregate_pools, ProviderItem, TrendingPools};
 pub use tvdb::TvdbClient;
 
 /// `settings.key` storing the TMDB API key (PRD §F-003).
