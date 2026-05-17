@@ -1964,6 +1964,7 @@ dependencies = [
 name = "kino-app"
 version = "0.0.0"
 dependencies = [
+ "chrono",
  "dirs 5.0.1",
  "kino-core",
  "kino-metadata",
@@ -1972,6 +1973,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "thiserror 1.0.69",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1995,10 +1997,14 @@ dependencies = [
 name = "kino-metadata"
 version = "0.0.0"
 dependencies = [
+ "chrono",
  "kino-core",
+ "rand 0.8.6",
+ "rand_chacha 0.3.1",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

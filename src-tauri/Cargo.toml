@@ -43,6 +43,11 @@ kino-metadata = { path = "../crates/kino-metadata" }
 # Tauri AppHandle path resolver.
 dirs = "5"
 
+# F-004: trending aggregator + day-boundary cache key need UTC date math and
+# concurrent provider fetches.
+chrono = { workspace = true }
+tokio = { workspace = true }
+
 [lints.rust]
 unsafe_code = "forbid"
 
