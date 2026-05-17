@@ -3,5 +3,15 @@
     "name": "kino",
     "placeholderHome": "kino",
     "placeholderTagline": "Streaming, your way."
+  },
+  "input": {
+    "profileLabel": "Input profile",
+    "profileTouch": "Touch",
+    "profileDpad": "D-pad",
+    "profileKbm": "Keyboard + mouse",
+    "profileGamepad": "Gamepad",
+    "lastActionLabel": "Last action",
+    "lastActionNone": "(none)",
+    "demoHint": "Press arrow keys, Enter, Esc, F10, /, or Space — or connect a gamepad."
   }
 }

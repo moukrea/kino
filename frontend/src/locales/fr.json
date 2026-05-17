@@ -3,5 +3,15 @@
     "name": "kino",
     "placeholderHome": "kino",
     "placeholderTagline": "Le streaming, à votre façon."
+  },
+  "input": {
+    "profileLabel": "Profil d’entrée",
+    "profileTouch": "Tactile",
+    "profileDpad": "Pavé directionnel",
+    "profileKbm": "Clavier et souris",
+    "profileGamepad": "Manette",
+    "lastActionLabel": "Dernière action",
+    "lastActionNone": "(aucune)",
+    "demoHint": "Utilisez les flèches, Entrée, Échap, F10, /, Espace — ou branchez une manette."
   }
 }

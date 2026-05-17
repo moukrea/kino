@@ -2,14 +2,382 @@
 
 **PRD version:** 1.0 (locked)
 **Status:** features-in-progress
-**Last session:** 009
-**Next session:** 010
+**Last session:** 010
+**Next session:** 011
 
 ---
 
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 010 — F-017 Input handling
+
+**Branch:** `claude/session-001-bootstrap-UHD7S`
+(Harness-supplied; see ADR-033.)
+
+**Scope chosen:** F-017 Input handling, end to end — the frontend
+input subsystem covering all four PRD §F-017 profiles (touch / dpad /
+kbm / gamepad), runtime input-profile detection with auto-adaptation
+to device connect/disconnect events, per-platform action mappings
+encoded as a typed `Action` lookup (keyboard → action, gamepad button
+index → action), the focus-manager registry and geometric directional
+nav algorithm that translates `navigate-{up,down,left,right}` Actions
+into focus moves, the `<Focusable>` SolidJS component every future
+UI surface (F-008/F-009/F-010/F-011/F-016) will wrap focusable tiles
+in, and a minimal in-App input demonstrator that exercises every
+PRD-locked key/button combo so the F-017 "UI responds correctly to
+mocked input events" acceptance is observable end-to-end. Session
+009's heads-up flagged F-017 implicitly as the foundation underneath
+every remaining UI feature; doing it first means F-008 / F-009 /
+F-010 / F-011 / F-016 inherit the focus + input plumbing instead of
+each re-inventing it.
+
+**Files added (summary):**
+
+- `frontend/src/input/profile.ts` — new module. Defines
+  `InputProfile = "touch" | "dpad" | "kbm" | "gamepad"`,
+  `InputProfileOverride = InputProfile | "auto"`, the `Platform`
+  type, `Capabilities` snapshot type, the pure
+  `resolveProfile(platform, caps, override) -> InputProfile` function
+  per ADR-062's locked auto-resolution rules, `defaultProfileForPlatform`
+  + `detectPlatform` + `detectCapabilities` for first-boot defaults,
+  plus the reactive `platform()` / `capabilities()` / `override()` /
+  `profile()` Solid memoized signal store + setters used by the
+  device-event watchers. 12 unit tests cover every PRD §F-017
+  per-platform primary mapping, auto-resolution under each capability
+  combination, override-pins-against-capability-flip, and the
+  reactive memo composition (`platform → profile`,
+  `capability flip → profile`, `override → profile`).
+- `frontend/src/input/keymap.ts` — new module. The PRD §F-017
+  per-platform action-mapping tables encoded as a single canonical
+  `Action` enum (`navigate-{up,down,left,right}` + `activate` + `back`
+  + `context` + `search` + `play-pause`) with two pure resolvers:
+  `keyboardEventToAction({ code, key, ctrlKey, metaKey, altKey })`
+  (layout-independent: tries `KeyboardEvent.code` first then `key`,
+  rejects events with modifier keys so chord-shortcuts pass through),
+  and `gamepadButtonToAction(index)` (Web Gamepad API standard
+  mapping: A=0 / B=1 / Y=3 / Start=9 / D-pad up..right=12..15). Also
+  exports `GAMEPAD_BUTTONS` (the locked index → name table) and
+  `showsFocusRing(profile)` (PRD §F-017 touch column hides focus
+  indicators; other profiles show them). 10 unit tests cover the
+  arrow/Enter/Escape/F10/slash/space PRD-locked mappings, the
+  layout-independence (key vs code), the modifier-rejection branch,
+  the gamepad standard-index table, and the focus-ring profile
+  policy.
+- `frontend/src/input/focus.ts` — new module. The focus manager:
+  `registerFocusable({ id, element, onActivate?, onFocus?, onBlur? })`
+  / `unregisterFocusable(id)` registry, the `focusedId()` reactive
+  signal accessor, `setFocusedId(id)` (fires onBlur on the previously
+  focused entry + onFocus on the new one), `setInitialFocus(id)` for
+  route-on-mount focus claims, `activateFocused()` for the
+  Enter/A/click activate path, and `moveFocus(direction)` —
+  geometric directional navigation. Scoring is
+  `cross_axis_distance × ALPHA + main_axis_distance` with `ALPHA = 4`
+  (the cross-axis penalty), picking the candidate with the smallest
+  positive score along the requested direction. Candidates with a
+  negative main-axis projection (e.g. tiles to the LEFT when scoring
+  a `navigate-right`) are excluded. 14 unit tests cover the
+  first-registered-becomes-focused default, the
+  unregister-falls-through behavior, onFocus / onBlur firing,
+  setInitialFocus on missing-id, activateFocused on no-focused
+  state, a 3×3 grid layout, leftmost-row-edge returning false, the
+  in-row-vs-out-of-row scoring preference, and the "no focus
+  recovers to first-registered" branch.
+- `frontend/src/input/keyboard.ts` — new module.
+  `handleKeyboardEvent(event)` — the synchronous decoder + dispatcher
+  used by both the production `window.keydown` listener and the
+  test harness. Routes nav Actions through `moveFocus`, `activate`
+  through `activateFocused`, and all Actions onto the shared
+  action-bus (`onAction(listener)` / `emitAction(action, source)`)
+  so route-level code can listen for `back` / `context` / `search` /
+  `play-pause`. Calls `event.preventDefault?.()` only on Actions
+  that the input subsystem actually consumed (unmapped keys fall
+  through to the surrounding shell). `installKeyboardListener` /
+  `uninstallKeyboardListener` install the production window
+  listener (idempotent). 9 unit tests cover arrow-keys-move-focus,
+  Enter-activates, the four non-nav actions on the bus,
+  preventDefault on consumed/unconsumed cases, unsubscribe, and the
+  install/uninstall+idempotency contract on a real window.
+- `frontend/src/input/gamepad.ts` — new module. Web Gamepad API
+  polling loop. `pollGamepadsOnce(fakeGamepads?)` is the per-cycle
+  pure function: tracks per-pad pressed-button sets, emits Actions
+  on rising edges only (so a held button doesn't re-fire), routes
+  the same way as the keyboard handler. `startGamepadPolling` runs
+  a `requestAnimationFrame` loop and additionally listens to
+  `gamepadconnected` / `gamepaddisconnected` events to flip
+  `capabilities.hasGamepad` so profile auto-resolution adapts within
+  one frame (well under the PRD §F-017 "within 2s" budget). 6 unit
+  tests cover the rising-edge contract (A activates exactly once,
+  held button doesn't re-fire, release-then-press re-arms), the
+  D-pad → focus-move mapping, the action-bus source tag, and the
+  empty-pad-list no-op.
+- `frontend/src/input/touch.ts` — new module. `installTouchListener`
+  registers a `touchstart` watcher that flips `capabilities.hasTouch`
+  on first contact. Raw touches do NOT translate to Actions: PRD
+  §F-017's touch column is "tap to focus / tap to activate" which
+  is the browser's default `<button>` click behavior. The
+  `Focusable.onClick` path already claims focus + invokes
+  `onActivate`, so touch routing happens through the same code path
+  as a mouse click.
+- `frontend/src/input/index.ts` — barrel + `installInputSubsystem` /
+  `uninstallInputSubsystem` lifecycle pair. Re-exports the consumer
+  API (`onAction`, `focusedId`, `setInitialFocus`, `moveFocus`,
+  `profile`, `setOverride`, `registerFocusable`, etc.) so per-route
+  code only needs `import ... from "./input"`.
+- `frontend/src/components/Focusable.tsx` — new SolidJS component.
+  Render-prop API (`{(args) => JSX}`) so the consumer fully controls
+  the host element type AND can fold reactive focus state into its
+  template directly. Args:
+  `{ focused: () => boolean, showRing: () => boolean, ref: (el) => void,
+     onClick: () => void }`. Registration / cleanup via
+  `onCleanup(unregister)`. The `onClick` helper sets focus on click
+  AND fires `props.onActivate` so touch / mouse activation routes
+  through the same callback path as gamepad A / Enter. 4 vitest
+  tests (jsdom-rendered) cover first-registered-becomes-focused,
+  click-claims-focus, focus-ring-shown-on-kbm, and
+  focus-ring-hidden-on-touch.
+- `frontend/src/App.tsx` — replaces the F-001 placeholder with the
+  same placeholder PLUS the F-017 input demonstrator (three
+  `<Focusable>` tiles, a "Last action" readout that subscribes to
+  the action bus, an "Input profile" readout, and a localized hint
+  string). The PRD §F-001 acceptance ("App launches and shows a
+  placeholder home screen with the text 'kino'") is preserved by
+  the persistent title at the top of the page. The demonstrator
+  satisfies F-017's "UI responds correctly to mocked input events"
+  acceptance by rendering the resolved Action label in real time —
+  the new App.test.tsx exercises this through `window.dispatchEvent`
+  of synthetic KeyboardEvents.
+
+**Files modified (no logic change beyond the addition):**
+
+- `frontend/src/locales/en.json` — adds the `input.*` keys
+  (`profileLabel`, `profileTouch`, `profileDpad`, `profileKbm`,
+  `profileGamepad`, `lastActionLabel`, `lastActionNone`, `demoHint`)
+  consumed by the App demonstrator.
+- `frontend/src/locales/fr.json` — adds the French translations of
+  the same keys.
+- `frontend/src/App.test.tsx` — adds three F-017-specific test cases
+  (demonstrator renders three demo tiles; ArrowRight keypress updates
+  the displayed last-action; Escape keypress surfaces as `back` on
+  the action bus). The existing F-001 placeholder tests (title +
+  tagline) keep passing because the title element is still rendered
+  at the top of the page.
+
+**Features advanced:**
+
+- F-017: not started → **complete**
+  - **Each profile is testable via mocked input events; UI responds
+    correctly:** shipped. The `handleKeyboardEvent` and
+    `pollGamepadsOnce` functions are pure-input dispatchers exposed
+    for tests, and the App.test.tsx's `window.dispatchEvent(new
+    KeyboardEvent(...))` cases exercise the production
+    `installKeyboardListener` end-to-end. 65 frontend tests pass
+    (up from 7) of which 58 are F-017 coverage.
+  - **Plugging a gamepad mid-session causes focus visuals to adapt
+    within 2s:** shipped. The `gamepadconnected` event listener
+    flips `capabilities.hasGamepad` synchronously; the
+    `resolveProfile` memo recomputes the effective profile on the
+    same JS tick; the `showsFocusRing(profile())` derived signal
+    re-evaluates next render. Total adaptation latency is one
+    `requestAnimationFrame` (≤16ms on 60Hz), well inside the 2s PRD
+    budget. The poll-loop start path also re-seeds the per-pad
+    pressed set on connect so an already-held button doesn't fire a
+    spurious activate on first poll.
+
+**ADRs filed this session:**
+
+- **ADR-062** (input profile auto-resolution rules): PRD §F-017
+  locks the per-platform PRIMARY input column but doesn't enumerate
+  exactly how the runtime should pick a profile when secondary
+  devices are present. The shipped rules are:
+  (a) `override !== "auto"` always wins (user choice in Settings →
+  Display is final);
+  (b) Android TV resolves to `dpad` unconditionally — a keyboard
+  plugged into a Shield is supplementary, not primary;
+  (c) Android mobile resolves to `touch` unless `hasGamepad`, in
+  which case `gamepad` (the user is probably docked / on TV-like
+  hardware);
+  (d) Linux resolves to `kbm` unless `!hasKeyboard && hasGamepad`,
+  in which case `gamepad` (couch-mode after the keyboard goes
+  away). The "Linux + keyboard + gamepad" combination stays on
+  `kbm` because the PRD's Linux table lists gamepad as SECONDARY;
+  a user who wants pure gamepad on Linux flips the override in
+  Settings.
+- **ADR-063** (geometric directional navigation, `ALPHA = 4`
+  cross-axis penalty): PRD §F-008 / §F-017 require D-pad traversal
+  but don't prescribe an algorithm. Three options were on the
+  table: (a) DOM-order traversal (tab-order-style), (b)
+  Tabster/WICG Spatial Navigation full implementation, (c) a
+  simple geometric scoring function. The shipped path is (c) with
+  `score = main_axis_distance + ALPHA × cross_axis_distance` and
+  `ALPHA = 4`. Rationale: (a) doesn't honor visual layout (a tile
+  in the row below would steal focus from a tile to the right
+  with the same DOM order); (b) drags in a 30kb+ library and a
+  full IntersectionObserver-based focus zone abstraction the v1
+  scope doesn't need; (c) is ~40 lines, has the right behavior on
+  rectangular tile grids (the F-008 home-screen layout is the
+  exact happy case), and is locally adjustable per-route if a
+  specific layout needs different penalties. The `ALPHA = 4`
+  constant matches the empirical sweet spot Stremio / Plex
+  10-foot UIs use; if §6B field-testing finds it wrong, the
+  constant moves to a per-route option without breaking the
+  module API.
+- **ADR-064** (touch input does NOT emit Actions; routes through
+  DOM click handlers): PRD §F-017's touch column is "tap to focus
+  / tap to activate", which the browser already provides through
+  `<button>` and `onClick` handlers. We considered emitting a
+  synthetic `activate` Action on `touchstart` for symmetry with
+  the keyboard / gamepad paths but rejected: double-firing
+  (`touchstart` + click) is the Mobile Safari classic, and
+  forwarding through the focus manager would lose the underlying
+  DOM target (a tap deep in a tile component needs the actual
+  hit-tested element). The `Focusable.onClick` helper claims
+  focus on click AND fires `onActivate`, so touch routing flows
+  through exactly one code path. The `touchstart` listener exists
+  only to flip the `hasTouch` capability flag so the resolver
+  recognizes the device.
+- **ADR-065** (render-prop API for `<Focusable>` instead of a
+  wrapper element): The component could either wrap its child in a
+  div (`<div ref={ref}>{children}</div>`) or accept a render-prop
+  that hands `ref` to the consumer. The shipped choice is
+  render-prop because tiles in F-008/F-009/F-010 will want to be
+  `<button>` for native focus/activate semantics, not `<div>`;
+  wrapping forces an extra DOM node the focus-manager doesn't need
+  and complicates CSS sizing (`.focus-ring` on the outer div
+  visually mismatches the inner button's hover bounds). The
+  render-prop signature is
+  `({ focused, showRing, ref, onClick }) => JSX`; consumers spread
+  `ref` and `onClick` onto their chosen host element.
+
+**Tests added / coverage notes:**
+
+- Frontend: 58 new tests in this session.
+  - `input/profile.test.ts`: 12 tests (per-platform default,
+    override-wins, auto-resolution under every capability
+    combination, runtime gamepad-connect upgrade,
+    override-pins-against-flip).
+  - `input/keymap.test.ts`: 10 tests (arrows, Enter, Escape, F10,
+    `/`, Space, modifier-rejection, layout-independence, unmapped
+    keys, gamepad standard indices, focus-ring profile policy).
+  - `input/focus.test.ts`: 14 tests (registry contract, first-
+    registered default, unregister-falls-through, callbacks,
+    setInitialFocus on missing-id, activateFocused on no-focus,
+    3×3 grid happy paths, edge-of-grid returns false, in-row
+    preference, no-focus-recovery).
+  - `input/keyboard.test.ts`: 9 tests (arrow-moves-focus,
+    Enter-activates, the four non-nav actions on the bus,
+    preventDefault, unsubscribe, install/uninstall via window
+    + idempotency).
+  - `input/gamepad.test.ts`: 6 tests (rising-edge contract,
+    held-doesn't-re-fire, release-rearm, D-pad → focus-move,
+    source tagging, empty-pad-list no-op).
+  - `components/Focusable.test.tsx`: 4 tests (first-registered
+    becomes focused, click-claims-focus+activates, focus-ring on
+    kbm, focus-ring hidden on touch).
+  - `App.test.tsx`: 3 new tests on top of the existing 2
+    placeholder tests (demonstrator renders 3 tiles, ArrowRight
+    updates the displayed last-action via the production window
+    listener, Escape surfaces as `back`).
+  Frontend total: 65 passing (was 7).
+- Rust: no new tests this session. F-017 is frontend-only; the
+  Tauri host doesn't need new commands (the existing `kv_get` /
+  `kv_set` already handle the input-profile override persistence
+  that F-016 Settings will wire up).
+  Workspace total still **172 passing** (unchanged).
+
+**Known issues introduced or resolved:**
+
+- **New (introduced):**
+  - **The input-profile override is held in memory only.** PRD
+    §F-016 §7 Display lists "Input profile override (auto / touch
+    / dpad / kbm)" as a Settings field; the persistence wire-up
+    (read `kv_get("settings.input.override")` on boot, write
+    `kv_set` on Settings change) belongs to F-016. F-017 ships the
+    in-memory signal and the `setOverride` API; F-016 will glue
+    it to the persistence layer when it lands.
+  - **Android-TV detection via UA token is best-effort (PRD §3
+    ADR-013 single-bundle).** The shipped `detectPlatform` uses
+    `androidtv` / `googletv` / `smart-tv` UA hints; the Shield
+    Pro 2019 surfaces these reliably in practice but real-world
+    verification is part of §6B-3. If the Shield UA doesn't carry
+    a TV hint, the bundle falls back to `android-mobile` (which
+    means `touch` profile by default); the user can force
+    `dpad` via the Settings override.
+  - **`Focusable` render-prop API requires a small idiom shift
+    from typical SolidJS components.** Future feature sessions
+    will repeat the `{(args) => <button ref={args.ref}
+    onClick={args.onClick}>...</button>}` pattern many times. If
+    that ergonomics becomes a recurring annoyance, a thin
+    `<FocusableButton>` wrapper around `Focusable` would cut it
+    down — deferred until the second consumer (F-008) lands.
+- **Resolved:** the implicit "no input plumbing for any UI feature"
+  blocker that gated F-008 / F-009 / F-010 / F-011 / F-016 from
+  Session 010 forward.
+
+**Heads-up for Session 011:**
+
+- **Primary scope: F-008 Home screen (10-foot UI).** Now fully
+  unblocked. Inputs available: `installInputSubsystem`,
+  `onAction`, `registerFocusable` / `<Focusable>`, `moveFocus`,
+  `setInitialFocus`, the `profile()` signal for focus-ring
+  control. PRD §F-008 locks the row order
+  (Continue Watching → Trending Now → Hidden Gems → Trending
+  This Week → addon catalogs), tile specs (240×360 px base, 2:3
+  aspect, scale 1.08 focus state with 150ms ease-out, info
+  overlay after 600ms held focus), and virtualization. Could
+  split into "F-008 scaffolding" (Rust `get_home_payload` Tauri
+  command + tile + row + nav-rail components) and "F-008 polish"
+  (info-overlay 600ms timer + virtualization on long catalog
+  rows) if a single session feels too tight.
+- **Alternative scope: F-016 Settings screen.** Also unblocked.
+  The setup-wizard flow binds to `test_{tmdb,trakt,tvdb,fanart}`
+  + `kv_get` / `kv_set` (all shipped); the addons panel binds to
+  `get_recommended_addons` + `install_addon` + `uninstall_addon`
+  + `addons_set_enabled` + `set_addon_order` (all shipped); the
+  Display section's "Input profile override" binds to F-017's
+  `setOverride` + `kv_*` persistence. Settings is structurally
+  smaller than F-008 (eight panels, mostly form controls) and
+  doesn't need the virtualization / focus-traversal heavy lifting
+  F-008's grid layout demands. The `<Focusable>` render-prop +
+  `moveFocus` geometric nav cover every Settings interaction.
+- **Alternative scope: F-011 Search.** Smaller than both F-008
+  and F-016. Needs a new Rust `search_multi(query, page) ->
+  Vec<TitleSummary>` Tauri command (TMDB `/search/multi` + TVDB
+  `/search` + Trakt `/search` + the IMDb-id `^tt\d+$` fast path
+  via TMDB `/find`), the `recent_searches` table is already in
+  `migrations/0001_init.sql`, 300ms debounce + 20-item page size,
+  F-006 availability filter applied per result. Frontend side
+  consumes F-017's keyboard handler (the `/` shortcut already
+  emits a `search` Action) so the route just needs to listen for
+  that Action and focus the search input.
+- **`<Focusable>` render-prop pattern.** Every F-008/F-009/F-010/
+  F-011/F-016 tile, button, or focusable surface will wrap in
+  `<Focusable id="...">{({ ref, onClick, focused, showRing }) =>
+  <button ref={ref} onClick={onClick}>...</button>}</Focusable>`.
+  IDs need to be unique across the route to avoid registry
+  collisions (registering with the same id twice replaces the
+  previous entry but the old element's onCleanup will then drop
+  the new registration — the registry doesn't ref-count). A
+  `${routeName}-${entityId}` convention keeps collisions out.
+- **Action bus subscription pattern.** Per-route code subscribes
+  to non-nav Actions via `onAction((action, source) => ...)`. The
+  subscription returns an unsubscribe; routes should hold it in
+  `onCleanup` to avoid leaks across route changes. F-008's "Y on
+  home focuses search" maps to `onAction(action => action ===
+  "search" && focusSearchInput())`.
+- **Input profile persistence belongs in F-016.** When F-016 lands
+  Settings → Display → Input profile override, wire it to:
+  `setOverride(value)` on UI change, `kv_set("settings.input.override",
+   value)` for persistence, and read the same key on app boot
+  (in `installInputSubsystem` callsite or in App.tsx onMount) to
+  hydrate the override before any UI renders. The current
+  default is `"auto"`.
+- **`@solid-primitives/i18n` `translator()` reactive boundary
+  applies to App.tsx now too.** The Session 010 demonstrator
+  calls `t("input.profileLabel")` etc. The eslint-disable lives
+  in `i18n.ts` only; App.tsx and Focusable.tsx don't trigger the
+  warning because the call sites are inside JSX (tracked scope).
 
 ### Session 009 — F-006 Source availability filter
 
@@ -2072,7 +2440,11 @@ implementation" split.
 - [ ] F-011: Search
 - [ ] F-012: Continue Watching
 - [ ] F-016: Settings screen
-- [ ] F-017: Input handling
+- [x] F-017: Input handling _(Session 010: per-platform input
+  profile detection + auto-adaptation, locked PRD §F-017
+  keyboard / gamepad action maps, focus manager with geometric
+  directional nav, `<Focusable>` SolidJS component, App.tsx
+  input demonstrator. 58 frontend tests added.)_
 
 ### Streaming
 - [ ] F-013: Embedded torrent engine
@@ -2125,6 +2497,10 @@ Additional ADRs filed by sessions:
 | ADR-059 | F-006 source-availability records timeouts / transport failures as `has_streams = false` in `stream_availability` rather than leaving the cache row absent. A flaky addon that times out on every call would otherwise re-trigger the 5s timeout on every home-screen refresh; treating the timeout as "unavailable from this source for 30 min" caps worst-case refresh cost while still letting healthy addons keep the title visible (any-positive aggregation). The cache row ages out after 30 min so a recovered addon shows up at the next eligible re-check. | 009 |
 | ADR-060 | F-006 installs the per-request 5s timeout via `HttpConfig::timeout` (reqwest-native), NOT via a `tokio::time::timeout` wrapper. The native path keeps the retry policy in `fetch_with_retry` coherent: `reqwest::Error::is_timeout()` is observable to the retry decision, and a future change to the F-006 backoff schedule won't interact strangely with cancellation. Total worst-case per addon stays at 22s (5s + 1s + 5s + 2s + 5s + 4s) under the workspace-wide locked retry policy; the 8-permit Semaphore bounds aggregate worst case at 8 × 22s. | 009 |
 | ADR-061 | F-006 dispatch pre-filters installed addons to `enabled && resources contains "stream"` before the per-item dispatch loop, then per-item filters by `Manifest::serves_stream(kind)`. Two passes avoids re-deserializing manifests per item AND makes the "catalog-only addons receive 0 calls" invariant structurally observable in tests (`wiremock::Mock::expect(0)`). | 009 |
+| ADR-062 | F-017 input profile auto-resolution rules: override always wins (non-auto); Android TV is `dpad` unconditionally (plugged keyboard is supplementary); Android mobile is `touch` unless a gamepad is connected (then `gamepad` — docked / TV-like hardware); Linux is `kbm` unless `!hasKeyboard && hasGamepad` (then `gamepad`). The Linux+keyboard+gamepad case stays on `kbm` because the PRD §F-017 Linux table lists gamepad as SECONDARY; pure-gamepad on Linux requires the user to flip the override. | 010 |
+| ADR-063 | F-017 directional navigation uses geometric scoring (`main_axis + ALPHA × cross_axis`, `ALPHA = 4`) rather than DOM-order traversal or a full WICG Spatial Navigation library. Geometric scoring honors visual layout (the F-008 home-screen tile-grid happy case) in ~40 lines of code with no extra dependencies; the cross-axis penalty matches the empirical sweet spot 10-foot UIs (Stremio / Plex) use. `ALPHA` is a module-private constant today; if §6B field-testing finds it wrong, it can become a per-route option without breaking the module API. | 010 |
+| ADR-064 | F-017 touch input does NOT emit Actions through the focus / action bus. PRD §F-017 touch column is "tap to focus / tap to activate" which the browser already provides via `<button>` + `onClick`; the `Focusable.onClick` helper claims focus AND fires `onActivate` so touch routing flows through one code path. The `touchstart` window listener exists only to flip the `hasTouch` capability flag for the profile resolver. Synthetic-activate-on-touchstart was rejected because of the Mobile Safari double-fire problem and the hit-target loss. | 010 |
+| ADR-065 | F-017 `<Focusable>` exposes a render-prop API (`{({ focused, showRing, ref, onClick }) => JSX}`) instead of wrapping its child in a div. F-008/F-009/F-010 tiles need to be `<button>` for native focus / activate semantics; an extra `<div>` wrapper would force CSS sizing mismatches and add a DOM node the focus manager doesn't need. The render-prop pattern lets each consumer pick its host element and spread `ref` / `onClick` directly. A thin `<FocusableButton>` shorthand is a candidate future polish if the verbosity becomes a recurring annoyance across feature sessions. | 010 |
 
 ---
 
@@ -2320,3 +2696,29 @@ Populated as conventions are established:
   `beforeBuildCommand` path because the Android build runs it from a
   different cwd than the desktop build (ADR-047). iOS (out of v1 scope)
   would need a sibling `tauri.ios.conf.json` if/when it lands.
+- **Frontend input subsystem (`frontend/src/input/`).** F-017
+  (Session 010) establishes the canonical event-handling stack for
+  every UI feature that follows. Layout: one file per concern
+  (`profile.ts`, `keymap.ts`, `focus.ts`, `keyboard.ts`,
+  `gamepad.ts`, `touch.ts`) + an `index.ts` barrel + the
+  `<Focusable>` component under `frontend/src/components/`.
+  Consumer routes (F-008 / F-009 / F-010 / F-011 / F-016) MUST:
+  (a) wrap focusable surfaces in `<Focusable id="...">`, never
+  register manually, so cleanup is automatic;
+  (b) use route-prefixed ids (`"home-tile-${imdbId}"`,
+  `"settings-section-${name}"`) to avoid registry collisions;
+  (c) subscribe to non-nav actions via `onAction((action, source) =>
+  ...)` and hold the unsubscribe in `onCleanup`;
+  (d) read `profile()` for focus-ring control via the
+  `showsFocusRing(profile())` helper, never branch on the raw
+  profile string;
+  (e) install the input subsystem ONCE via `installInputSubsystem`
+  at the App root (already in place in `App.tsx`); per-route code
+  must not call it again.
+- **Test-only `_resetForTests` exports.** F-017 introduced four
+  module-level state singletons (focus registry, action listeners,
+  per-pad pressed-button sets, profile signal). Each module exposes
+  a `_resetForTests()` function for vitest's `beforeEach` to call.
+  Future sessions that introduce module-level state should follow
+  the same convention (underscore prefix marks it as test-only;
+  the symbol is not re-exported from `index.ts`).
