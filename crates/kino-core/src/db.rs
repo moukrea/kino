@@ -23,6 +23,7 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::addon::{Addon, AddonInsert};
+use crate::availability::AvailabilityRow;
 use crate::cw::ContinueWatching;
 use crate::title::TitleKind;
 
@@ -362,6 +363,88 @@ impl Db {
         .bind(expires_at)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    // ---- stream_availability (F-006) ----------------------------------
+    //
+    // Per PRD §F-006 the table records, for each (title_id, kind, source_id)
+    // triple, whether the addon returned a non-empty stream list at
+    // `checked_at`. Rows are valid for `STREAM_AVAILABILITY_TTL_S` (30 min);
+    // reads filter by `checked_at` rather than relying on an explicit expiry
+    // column so the same table can absorb future TTL revisions without a
+    // migration.
+
+    /// Return a fresh availability check for the given triple, or `None` if
+    /// no row is present or the row is older than `fresh_after_unix_s` (an
+    /// absolute Unix timestamp — typically `now - STREAM_AVAILABILITY_TTL_S`).
+    pub async fn availability_get_fresh(
+        &self,
+        title_id: &str,
+        kind: TitleKind,
+        source_id: &str,
+        fresh_after_unix_s: i64,
+    ) -> Result<Option<bool>, DbError> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT has_streams FROM stream_availability \
+             WHERE title_id = ? AND type = ? AND source_id = ? \
+             AND checked_at > ?",
+        )
+        .bind(title_id)
+        .bind(kind.as_str())
+        .bind(source_id)
+        .bind(fresh_after_unix_s)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(v,)| v != 0))
+    }
+
+    /// Return every fresh availability check for the given title, regardless
+    /// of source addon. Used by F-006 to aggregate per-title availability
+    /// from already-cached per-source rows.
+    pub async fn availability_list_fresh(
+        &self,
+        title_id: &str,
+        kind: TitleKind,
+        fresh_after_unix_s: i64,
+    ) -> Result<Vec<(String, bool)>, DbError> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT source_id, has_streams FROM stream_availability \
+             WHERE title_id = ? AND type = ? AND checked_at > ?",
+        )
+        .bind(title_id)
+        .bind(kind.as_str())
+        .bind(fresh_after_unix_s)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(s, v)| (s, v != 0)).collect())
+    }
+
+    /// Upsert a batch of availability rows in a single transaction. Empty
+    /// inputs are a no-op.
+    pub async fn availability_upsert_many(&self, rows: &[AvailabilityRow]) -> Result<(), DbError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+        for row in rows {
+            sqlx::query(
+                "INSERT INTO stream_availability \
+                  (title_id, type, source_id, has_streams, checked_at) \
+                 VALUES (?, ?, ?, ?, ?) \
+                 ON CONFLICT(title_id, type, source_id) DO UPDATE SET \
+                   has_streams = excluded.has_streams, \
+                   checked_at = excluded.checked_at",
+            )
+            .bind(&row.title_id)
+            .bind(row.kind.as_str())
+            .bind(&row.source_id)
+            .bind(i64::from(row.has_streams))
+            .bind(row.checked_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 }
@@ -734,5 +817,117 @@ mod tests {
         db.cache_set("k", "second", t).await.unwrap();
         let got = db.cache_get("k").await.unwrap();
         assert_eq!(got.as_deref(), Some("second"));
+    }
+
+    fn avail_row(title: &str, source: &str, has_streams: bool, t: i64) -> AvailabilityRow {
+        AvailabilityRow {
+            title_id: title.into(),
+            kind: TitleKind::Movie,
+            source_id: source.into(),
+            has_streams,
+            checked_at: t,
+        }
+    }
+
+    #[tokio::test]
+    async fn availability_upsert_and_get_fresh_round_trip() {
+        let db = Db::open_in_memory().await.unwrap();
+        let now = now_unix();
+        db.availability_upsert_many(&[avail_row("tt1", "addon-a", true, now)])
+            .await
+            .unwrap();
+        // Reading with a fresh_after BEFORE the check returns the row.
+        let v = db
+            .availability_get_fresh("tt1", TitleKind::Movie, "addon-a", now - 60)
+            .await
+            .unwrap();
+        assert_eq!(v, Some(true));
+        // Reading with fresh_after AT or AFTER the check excludes it.
+        let v = db
+            .availability_get_fresh("tt1", TitleKind::Movie, "addon-a", now)
+            .await
+            .unwrap();
+        assert!(
+            v.is_none(),
+            "row at checked_at must be excluded by strict >"
+        );
+    }
+
+    #[tokio::test]
+    async fn availability_get_fresh_returns_none_when_absent() {
+        let db = Db::open_in_memory().await.unwrap();
+        let v = db
+            .availability_get_fresh("tt404", TitleKind::Movie, "addon", 0)
+            .await
+            .unwrap();
+        assert!(v.is_none());
+    }
+
+    #[tokio::test]
+    async fn availability_upsert_replaces_existing_row() {
+        let db = Db::open_in_memory().await.unwrap();
+        let t = now_unix();
+        db.availability_upsert_many(&[avail_row("tt1", "addon-a", false, t - 100)])
+            .await
+            .unwrap();
+        db.availability_upsert_many(&[avail_row("tt1", "addon-a", true, t)])
+            .await
+            .unwrap();
+        // The fresh row wins; row count stays at 1 (no duplicate-key blowup).
+        let v = db
+            .availability_get_fresh("tt1", TitleKind::Movie, "addon-a", t - 60)
+            .await
+            .unwrap();
+        assert_eq!(v, Some(true));
+    }
+
+    #[tokio::test]
+    async fn availability_list_fresh_groups_by_title() {
+        let db = Db::open_in_memory().await.unwrap();
+        let now = now_unix();
+        db.availability_upsert_many(&[
+            avail_row("tt1", "addon-a", true, now),
+            avail_row("tt1", "addon-b", false, now),
+            avail_row("tt2", "addon-a", true, now),
+            // Stale row — excluded.
+            avail_row("tt1", "addon-stale", true, now - 7200),
+        ])
+        .await
+        .unwrap();
+        let mut got = db
+            .availability_list_fresh("tt1", TitleKind::Movie, now - 60)
+            .await
+            .unwrap();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            got,
+            vec![
+                ("addon-a".to_string(), true),
+                ("addon-b".to_string(), false)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn availability_upsert_many_handles_batch_atomically() {
+        let db = Db::open_in_memory().await.unwrap();
+        let now = now_unix();
+        let rows: Vec<_> = (0..10)
+            .map(|i| avail_row(&format!("tt{i}"), "addon-a", i % 2 == 0, now))
+            .collect();
+        db.availability_upsert_many(&rows).await.unwrap();
+        for i in 0..10 {
+            let v = db
+                .availability_get_fresh(&format!("tt{i}"), TitleKind::Movie, "addon-a", now - 60)
+                .await
+                .unwrap();
+            assert_eq!(v, Some(i % 2 == 0));
+        }
+    }
+
+    #[tokio::test]
+    async fn availability_upsert_many_empty_input_is_noop() {
+        let db = Db::open_in_memory().await.unwrap();
+        db.availability_upsert_many(&[]).await.unwrap();
     }
 }

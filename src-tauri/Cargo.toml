@@ -51,6 +51,10 @@ dirs = "5"
 chrono = { workspace = true }
 tokio = { workspace = true }
 
+[dev-dependencies]
+# F-006 unit tests stand up mock Stremio stream endpoints.
+wiremock = { workspace = true }
+
 [lints.rust]
 unsafe_code = "forbid"
 
