@@ -2,8 +2,8 @@
 
 **PRD version:** 1.0 (locked)
 **Status:** features-in-progress
-**Last session:** 014
-**Next session:** 015
+**Last session:** 015
+**Next session:** 016
 
 ---
 
@@ -68,6 +68,222 @@ a hard requirement.
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 015 — F-011 Search
+
+**Branch:** `claude/session-001-bootstrap-kuijU`
+(Harness-supplied; see ADR-033.)
+
+**Scope chosen:** F-011 Search end-to-end. New per-provider search
+methods on `TmdbClient`/`TraktClient`/`TvdbClient`, four new Tauri
+commands (`search`, `recent_searches_list`, `recent_searches_upsert`,
+`recent_searches_clear`), three new `Db` methods on the persisted
+`recent_searches` table (scaffolded by migration `0001_init.sql` in
+Session 003 but not yet wired), a complete Search route replacing the
+"coming soon" placeholder, and a global `/`/Y action handler in the
+App shell that routes from any page to `/search` and re-focuses the
+input.
+
+All four PRD §F-011 §6A code-acceptance criteria are honored:
+
+1. **First visible result within 500ms after the user stops typing on
+   broadband.** Live search is debounced at PRD §8
+   `SEARCH_DEBOUNCE_MS = 300ms` (frontend constant
+   `SEARCH_DEBOUNCE_MS` exported from `routes/Search.tsx`), with the
+   backend dispatching TMDB / Trakt / TVDB search calls in parallel
+   via `tokio::join!`. Pinned by the frontend tests
+   `debounces input by 300ms before firing the search backend` and
+   `rapid typing only fires one search call (debounce drops
+   intermediate values)`.
+2. **Pasting `tt1234567` opens the corresponding title detail
+   directly.** The `search` Tauri command runs the `^tt\d+$` regex
+   first; when the query matches AND TMDB has a `/find` mapping for
+   the IMDb id, the response's `direct: {id, kind}` field is set and
+   the frontend navigates to `/title/imdb:tt...?kind=movie|series`
+   immediately, bypassing the result-list path. Pinned by the Rust
+   tests `search_imdb_shortcut_resolves_movie_via_tmdb_find` /
+   `search_imdb_shortcut_falls_back_to_series_when_movie_misses` /
+   `search_imdb_shortcut_falls_through_when_no_tmdb_key` and the
+   frontend test `navigates directly to /title/:id when the response
+   carries a direct match`.
+3. **Recent searches persist across app restarts.** Each successful
+   search calls `recent_searches_upsert(query, RECENT_SEARCHES_MAX)`
+   on the F-002 persistence layer (sqlite `recent_searches` table,
+   PRIMARY KEY `query`, indexed by `searched_at`). The
+   `recent_searches_list` Tauri command surfaces the last
+   `RECENT_SEARCHES_MAX = 10` rows newest-first. Pinned by Rust tests
+   `recent_searches_*` (in both `kino-core::db` and
+   `src-tauri::commands`) and the frontend test
+   `renders recent-search entries when the query is empty`.
+4. **Voice search button NOT present in v1.** Negative assertion
+   pinned by the frontend test `does NOT render a voice search button
+   (PRD §F-011 v1 acceptance)`.
+
+**Files changed (summary):**
+
+- `crates/kino-core/src/db.rs` — three new public methods on `Db`:
+  `recent_searches_list(limit)`, `recent_searches_upsert(query,
+  limit)`, `recent_searches_clear()`. `upsert` trims whitespace, skips
+  empty queries, refreshes `searched_at` on duplicates, and prunes the
+  table past `limit` (using a `DELETE WHERE searched_at < (subselect
+  MIN of the top-N rows)` strategy) so long-running installs don't
+  bloat the table. 7 new unit tests covering empty-table reads, the
+  whitespace/empty filter, the duplicate-refresh path, the prune path,
+  the limit parameter, and `clear()`.
+- `crates/kino-metadata/src/tmdb.rs` — new
+  `TmdbClient::search_multi(query, locale, page) -> Vec<TitleSummary>`.
+  Calls `/3/search/multi?query=...&language=...&page=...&include_adult=false`,
+  filters `media_type = "person"` rows out, accepts both
+  movie (`title` + `release_date`) and tv (`name` + `first_air_date`)
+  payload shapes, coerces `page = 0` to `1`. Internal types
+  `SearchMultiResponse` / `SearchMultiResult`. 4 new wiremock tests
+  pinning movie+tv mixed response, page forwarding, zero-page
+  coercion, and empty-title row dropping.
+- `crates/kino-metadata/src/trakt.rs` — new
+  `TraktClient::search(query, page, limit) -> Vec<TitleSummary>`.
+  Calls `/search/movie,show?query=...&page=...&limit=...` with the
+  Trakt v2 `trakt-api-version: 2` + `trakt-api-key` headers. Internal
+  `SearchEntry` type discriminates on the `type` discriminator
+  (`movie` / `show`); rows without a durable id (no IMDb AND no TMDB
+  id) are dropped at the boundary so downstream `parse_title_id` can
+  always succeed. 4 new wiremock tests.
+- `crates/kino-metadata/src/tvdb.rs` — new
+  `TvdbClient::search(query, limit) -> Vec<TitleSummary>`. Reuses the
+  cached-token `login()` helper from the trending fetchers, calls
+  `/v4/search?query=...&limit=...` with the bearer token. Internal
+  `SearchEnvelope` / `SearchEntry` / `RemoteIdEntry` types parse the
+  TVDB v4 `data: [...]` envelope, prefer IMDb from `remote_ids` (the
+  TVDB v4 array of `{id, sourceName}` mappings) over the
+  `tvdb_id`-prefixed shape. Person / company / episode rows are
+  dropped at the type boundary. 3 new wiremock tests.
+- `src-tauri/src/commands.rs` — new F-011 block:
+  - Tauri commands `search(query, page, locale)`,
+    `recent_searches_list()`, `recent_searches_upsert(query)`,
+    `recent_searches_clear()`.
+  - Response types `SearchResponse { direct, results, has_more }`
+    and `SearchDirectMatch { id, kind }`.
+  - Orchestrator `search_with_config(db, query, page, locale,
+    http_config, urls)` — empty-query short-circuit, IMDb-id
+    shortcut via `is_imdb_id_query` + `resolve_imdb_shortcut`
+    (movie-then-series TMDB `/find` walk), parallel
+    `fetch_search_providers` fan-out across TMDB/Trakt/TVDB,
+    `dedup_search_results` (canonicalizes to
+    `kind:imdb:tt...` keys when the IMDb id is detectable so
+    cross-provider duplicates collapse), `apply_availability_filter`
+    (delegates to `check_availability_with_config`; short-circuits
+    when no stream-serving addon is installed so a fresh install's
+    search stays usable), and the 2×page_size head + tail-pad
+    strategy for keeping a full 20-item page within a 40-item
+    availability budget. Successful non-empty result lists trigger
+    `recent_searches_upsert` so repeat-search keeps the recents row
+    fresh. Direct matches and empty results don't persist.
+  - Helper struct `SearchProviderUrls { tmdb, trakt, tvdb }` so unit
+    tests can swap wiremock URIs without touching production. The
+    `Default` impl returns the locked PRD §F-003 endpoints; the
+    Tauri-command entrypoint always constructs `Default::default()`.
+  - 13 new unit tests covering: `is_imdb_id_query` accepts/rejects,
+    `dedup_search_results` cross-provider collapse + kind-disjoint
+    preservation, empty query short-circuit, IMDb shortcut for both
+    kinds + the no-tmdb-key fall-through, multi-provider aggregation
+    with order locked TMDB→Trakt→TVDB, cross-provider IMDb-dedup,
+    `recent_searches` persistence-on-success (and non-persistence on
+    empty), availability-filter drop + short-circuit when no addons,
+    `has_more = true` when more than one page returned, and a
+    round-trip through the three recent-searches Tauri commands.
+- `src-tauri/src/lib.rs` — registers the four new Tauri commands.
+- `frontend/src/lib/tauri.ts` — typed wrappers
+  `search(query, page, locale)`, `recentSearchesList()`,
+  `recentSearchesUpsert(query)`, `recentSearchesClear()` plus types
+  `SearchDirectMatch` and `SearchResponse`.
+- `frontend/src/routes/Search.tsx` — full route, ~430 lines. Sticky
+  header with the search input + hint text; recent-searches panel
+  for empty queries (with a "Clear history" focusable button);
+  results panel with a flex-wrap tile grid, a "Load more" button
+  driven by the backend's `has_more`, a "Searching…" indicator while
+  loading, and a "No matching titles." empty state. Input is
+  autofocused on mount; the F-017 focus-manager id is
+  `SEARCH_INPUT_FOCUS_ID = "search-input"` so the global `/` / Y
+  shortcut in `App.tsx` can re-claim it. Tile activation pushes the
+  current focused id onto the F-010 return-focus stack via
+  `pushReturnFocus(focusedId())` so back-nav from the detail returns
+  to the originating tile. The result-fetch effect uses
+  `createEffect(on([activeQuery, locale], ...))` so locale changes
+  (F-016) re-fire searches automatically. Per-call seq counter
+  invalidates in-flight responses if a newer search starts (rapid
+  typing / "Load more" click cascade).
+- `frontend/src/routes/Search.test.tsx` — new file. 13 tests covering
+  input autofocus, recent-searches surface, 300ms debounce + the
+  rapid-typing single-fire invariant, result-tile rendering, IMDb-id
+  direct navigation, whitespace-query non-firing, empty results,
+  "Load more" pagination, recent-entry re-activation, "Clear
+  history" + refetch, the voice-button negative assertion, and the
+  "empty input restores recents" round-trip.
+- `frontend/src/App.tsx` — adds the global `onAction("search", ...)`
+  handler at the Shell layer. Navigates to `/search` from any other
+  route; re-focuses the input via the
+  `[data-testid="search-input"]` selector when already on `/search`
+  (so the shortcut still snaps focus back if the user has navigated
+  to a result tile). Imports `useNavigate` + `useLocation` from
+  `@solidjs/router` and the route's `SEARCH_INPUT_TEST_ID` constant.
+- `frontend/src/App.test.tsx` — new test pinning the global `/`
+  shortcut routes from `/` to `/search` and switches the rendered
+  route's title.
+- `frontend/src/locales/{en,fr}.json` — replaces the "Search is
+  coming soon." placeholder with eight real strings (`title`,
+  `placeholder`, `recentTitle`, `recentClear`, `loading`, `empty`,
+  `loadMore`, `hint`); the legacy `comingSoon` string stays in case
+  any other route references it.
+
+**Tests added:**
+
+- Rust: +7 (kino-core::db `recent_searches_*`), +4 (kino-metadata
+  TMDB search), +4 (kino-metadata Trakt search), +3 (kino-metadata
+  TVDB search), +13 (src-tauri command-level — IMDb shortcut, dedup,
+  multi-provider aggregation, availability filter, recents
+  persistence). Total: **+31 Rust tests**.
+- Frontend: +13 (Search route) + 1 (App `/` shortcut). Total:
+  **+14 frontend tests**.
+- Workspace test count after this session: **62 + 70 + 37 + 80 = 249
+  Rust unit tests, 132 frontend tests.**
+
+**ADRs filed:** ADR-084, ADR-085, ADR-086, ADR-087, ADR-088, ADR-089.
+
+**F-XXX status transitions:** F-011 not started → complete.
+
+**Known issues introduced:**
+
+- None new. The F-011 IMDb-id shortcut requires a TMDB API key to
+  work; without one, `resolve_imdb_shortcut` returns `None` and the
+  user gets the regular multi-provider search result list. This is
+  the documented PRD §F-003 dependency, not a defect.
+- The TVDB `/v4/search` endpoint doesn't accept a `page` parameter,
+  so pages > 1 return TMDB+Trakt-only results from this provider.
+  ADR-085 documents this; it's a degradation, not a defect.
+- Server-side availability filter applies a 2×page_size window cap
+  (40 items max checked per search call) to bound dispatch cost.
+  ADR-088 explains the trade-off.
+
+**What the next session needs to know:**
+
+- F-011 is fully shipped. Remaining v1 features:
+  F-012 (Continue Watching wire-up — partial: schema + commands
+  shipped in F-002/F-010, the player-driven position-save loop is
+  pending F-015), F-013 (Embedded torrent engine — biggest open
+  scope), F-014 (Adaptive buffer), F-015 (Native player integration),
+  F-016 (Settings screen), F-018 (Build, packaging, distribution).
+- Recent-searches is now visible on the empty search input. If F-016
+  ships a "Privacy → clear search history" action, it can call the
+  existing `recent_searches_clear` Tauri command directly without
+  additions.
+- The `SearchProviderUrls` pattern (default constants + test
+  override) works well for swapping wiremock URIs. Future
+  multi-provider commands (eg. F-013 tracker probing) can reuse
+  this shape.
+- F-016 Settings is a likely next-session candidate: smaller scope
+  than F-013, builds on infrastructure already in place
+  (settings/KV layer, locale switching, addons CRUD, F-017 input),
+  and unblocks user-supplied API keys which currently have to be
+  hand-injected via the DB.
 
 ### Session 014 — F-010 Title detail view
 
@@ -3702,7 +3918,15 @@ implementation" split.
   focus to the originating tile" is satisfied. `TmdbClient::title_details`
   + `TmdbClient::credits` + `TraktClient::title_rating` added.
   31 new Rust tests + 17 new frontend tests.)_
-- [ ] F-011: Search
+- [x] F-011: Search _(Session 015: `search(query, page, locale)` Tauri
+  command with TMDB / Trakt / TVDB parallel fetch + `IMDb`-id shortcut
+  via TMDB `/find`, cross-provider dedup, F-006 availability filter,
+  page-size 20 with `has_more`; three `Db` methods on the existing
+  `recent_searches` table; full Search route with 300ms debounce,
+  recent-searches surface, "Load more" pagination, "Clear history"
+  action; global `/` / Y shortcut wired into the App shell so the
+  search box is reachable from any route. 31 new Rust tests + 14
+  new frontend tests.)_
 - [ ] F-012: Continue Watching
 - [ ] F-016: Settings screen
 - [x] F-017: Input handling _(Session 010: per-platform input
@@ -3784,6 +4008,12 @@ Additional ADRs filed by sessions:
 | ADR-081 | F-010 Stremio stream-id resolution reuses F-005's `resolve_title_ids` helper for the IMDb-id resolution step, then formats the addon path as bare IMDb id for movies (`tt0133093`) or `imdb:S:E` for series episodes (`tt0944947:1:1`). When the kino id is TMDB-prefixed and no TMDB API key is configured, the helper returns `Ok(None)` and the detail view shows the "No streams available" empty state. Future polish: surface a "configure TMDB key to unlock streams" hint in the UI. | 014 |
 | ADR-082 | F-010 stream sort is locked at `quality DESC, seeders DESC, size DESC` per PRD §F-010, implemented via `quality_rank(Option<Quality>) -> u8` (4K=4, 1080p=3, 720p=2, SD=1, None=0) followed by `seeders.unwrap_or(0)` and `size_bytes.unwrap_or(0)` tuple compares. Unknown seeders / unknown size bias to the bottom of their quality bucket; known values are strictly more useful than unknown ones for the user's pick. | 014 |
 | ADR-083 | F-010 Play / Resume button click does NOT yet pipe through to a player (F-015 hasn't shipped). Resume click writes a fresh CW row with existing position/duration so the home-screen "Continue Watching" row reflects the user touch; Play is a no-op visually. Mark Watched DOES write a CW row at duration position (so F-012's CW auto-removal sweep can age it out after 24h). Once F-015 lands, both click handlers dispatch to the player; the CW-write side effects become no-ops (the player owns the CW position-poll loop). This avoids shipping the Play button as a dead-end UI element while exposing the PRD-locked action bar in its intended position. | 014 |
+| ADR-084 | F-011 `search` command treats TMDB as non-mandatory (unlike F-004 `get_trending`). When TMDB fails (or has no key) the multi-provider fan-out logs + skips it and surfaces Trakt + TVDB results. PRD §F-011 doesn't make TMDB strictly required (unlike trending, where TMDB's weight is 0.45 and absence breaks the merge math); rather than reject the whole search, we degrade. The IMDb-id shortcut DOES depend on TMDB (`/find` is TMDB-only) so it falls through to the regular search list when TMDB isn't reachable — the user still gets a useful response. | 015 |
+| ADR-085 | F-011 TVDB v4 search only fires on page 1. TVDB v4's `/v4/search` endpoint doesn't accept a `page` query parameter; subsequent pages would re-yield the same items and pollute the dedup pass. TMDB and Trakt both honor `page` and carry the deeper pages. Trade-off: pages > 1 are TMDB + Trakt only. ADR-048's TVDB v1-acceptance framing (lowest provider weight, sort-by-score approximation) extends here — TVDB is the lowest-confidence search signal anyway. | 015 |
+| ADR-086 | F-011 IMDb-id shortcut tries `kind = movie` first then `kind = series`. PRD §F-011 doesn't specify the resolution order; TMDB's `/find` returns both arrays in a single response BUT we issue two calls so the bare boolean "did TMDB resolve this id" is unambiguous per kind. Two round-trips on the cold path is fine for an IMDb-id shortcut that's a rare (1 in N searches) UX. A future polish pass could consolidate to one call + read both arrays. | 015 |
+| ADR-087 | F-011 cross-provider dedup canonicalizes on `kind:imdb:tt...` keys (when an IMDb-id shape is detectable in the kino id). Trakt's IMDb-first id surface (`tt0133093`) collapses with TVDB's `remote_ids`-IMDb resolution (also `tt0133093`); TMDB-only rows (no IMDb mapping at search-result granularity) stay distinct. The dedup pass DOES NOT do server-side IMDb enrichment — that would 25-50x the per-search call cost. The order is locked TMDB → Trakt → TVDB so when a duplicate IS detected the higher-metadata row (TMDB) survives. Matches the F-004 trending dedup philosophy (ADR-049). | 015 |
+| ADR-088 | F-011 availability filter is applied server-side over the FIRST `2 × SEARCH_PAGE_SIZE = 40` deduped candidates, with the rest of the list kept as an unchecked "tail" used to top up the page when availability dropped too many head items. Caps worst-case availability dispatch at 40 items per search call (≤ 8 parallel × ≤ 5 addons × 5s timeout = 25s wall-clock if every cache row is cold). The PRD's "F-006 availability filter applied" wording is honored; the tail-pad fallback prevents a flaky-addon scenario from gutting the page. ADR-059's any-positive aggregation principle is intact: tail items surface unfiltered AND can still be re-checked from F-006's standard `check_availability` IPC if the UI cares. | 015 |
+| ADR-089 | F-011 frontend uses `createEffect(on([activeQuery, locale], ...))` to drive the fetch (not `createResource`) because the resource API conflates loading state, debouncing, and append vs replace semantics in ways that fight Solid's reactivity. The custom effect carries a per-call `pendingSearchSeq` counter so a stale response from a cancelled-but-still-in-flight RPC doesn't overwrite the active page (rapid-typing race). Recent-search re-activation cycles `activeQuery` through `""` to force the effect to re-fire even when the new query equals the old. | 015 |
 
 ---
 

@@ -133,6 +133,47 @@ impl TraktClient {
         Ok(body.rating.filter(|n| *n > 0.0))
     }
 
+    /// Search Trakt movies AND shows for the F-011 search aggregation.
+    ///
+    /// Calls `/search/movie,show?query=...&limit=...&page=...`. The
+    /// response is a mixed list of typed entries; each row is converted
+    /// to a kino [`TitleSummary`] preferring the `IMDb` id, falling back
+    /// through TMDB / TVDB / Trakt-numeric so cross-provider dedup
+    /// (PRD §F-011) has the best signal available.
+    pub async fn search(
+        &self,
+        query: &str,
+        page: u32,
+        limit: u32,
+    ) -> Result<Vec<TitleSummary>, Error> {
+        let url = format!("{}/search/movie,show", self.base_url);
+        let page_str = page.max(1).to_string();
+        let limit_str = limit.max(1).to_string();
+        let response = fetch_with_retry(
+            || {
+                self.client
+                    .get(&url)
+                    .header("trakt-api-version", "2")
+                    .header("trakt-api-key", self.key.as_str())
+                    .query(&[
+                        ("query", query),
+                        ("page", page_str.as_str()),
+                        ("limit", limit_str.as_str()),
+                    ])
+            },
+            &self.config,
+        )
+        .await?;
+        let entries: Vec<SearchEntry> = response
+            .json()
+            .await
+            .map_err(|e| Error::Decode(format!("trakt search: {e}")))?;
+        Ok(entries
+            .into_iter()
+            .filter_map(SearchEntry::into_summary)
+            .collect())
+    }
+
     async fn fetch_trending<T: for<'de> Deserialize<'de>>(&self, url: &str) -> Result<T, Error> {
         let response = fetch_with_retry(
             || {
@@ -186,6 +227,50 @@ struct TitleIds {
 struct TraktRatings {
     #[serde(default)]
     rating: Option<f64>,
+}
+
+/// `/search/movie,show` response entry. Trakt returns a `type` discriminator
+/// plus EITHER a `movie` or `show` payload depending on the row's kind.
+#[derive(Debug, Deserialize)]
+struct SearchEntry {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    movie: Option<TitleEntry>,
+    #[serde(default)]
+    show: Option<TitleEntry>,
+}
+
+impl SearchEntry {
+    fn into_summary(self) -> Option<TitleSummary> {
+        let (kind, entry) = match self.kind.as_str() {
+            "movie" => (TitleKind::Movie, self.movie?),
+            "show" => (TitleKind::Series, self.show?),
+            _ => return None,
+        };
+        if entry.title.is_empty() {
+            return None;
+        }
+        // Mirror the trending fetcher: prefer IMDb so the F-011 dedup
+        // surface can collapse cross-provider duplicates by IMDb id.
+        let id = if let Some(imdb) = entry.ids.imdb.clone() {
+            imdb
+        } else if let Some(tmdb) = entry.ids.tmdb {
+            format!("tmdb:{tmdb}")
+        } else {
+            // No durable id available; skip rather than emit a synthesized
+            // row that can't be navigated to.
+            return None;
+        };
+        Some(TitleSummary {
+            id,
+            kind,
+            title: entry.title,
+            year: entry.year,
+            poster: None,
+            rating: None,
+        })
+    }
 }
 
 impl TitleEntry {
@@ -411,5 +496,109 @@ mod tests {
             Error::Http { status, .. } => assert_eq!(status, 401),
             other => panic!("expected Http(401), got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn search_returns_movie_and_show_rows() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search/movie,show"))
+            .and(header("trakt-api-version", "2"))
+            .and(header("trakt-api-key", "test-key"))
+            .and(query_param("query", "matrix"))
+            .and(query_param("page", "1"))
+            .and(query_param("limit", "20"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {
+                    "type": "movie",
+                    "movie": {
+                        "title": "The Matrix",
+                        "year": 1999,
+                        "ids": { "imdb": "tt0133093", "tmdb": 603 }
+                    }
+                },
+                {
+                    "type": "show",
+                    "show": {
+                        "title": "The Matrix Resurrections",
+                        "year": 2021,
+                        "ids": { "imdb": null, "tmdb": 624_860 }
+                    }
+                }
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TraktClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let items = client.search("matrix", 1, 20).await.unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].id, "tt0133093");
+        assert_eq!(items[0].kind, TitleKind::Movie);
+        assert_eq!(items[0].title, "The Matrix");
+        assert_eq!(items[0].year, Some(1999));
+        assert_eq!(items[1].id, "tmdb:624860");
+        assert_eq!(items[1].kind, TitleKind::Series);
+    }
+
+    #[tokio::test]
+    async fn search_drops_rows_with_no_durable_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search/movie,show"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {
+                    "type": "movie",
+                    "movie": {
+                        "title": "Lost Movie",
+                        "year": 1990,
+                        "ids": {}
+                    }
+                }
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TraktClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let items = client.search("lost", 1, 20).await.unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_drops_rows_with_unknown_type() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search/movie,show"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {
+                    "type": "episode",
+                    "episode": { "title": "Pilot", "ids": { "imdb": "tt0000000" } }
+                }
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TraktClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let items = client.search("pilot", 1, 20).await.unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_coerces_zero_page_and_limit_to_one() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search/movie,show"))
+            .and(query_param("page", "1"))
+            .and(query_param("limit", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TraktClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let items = client.search("q", 0, 0).await.unwrap();
+        assert!(items.is_empty());
     }
 }

@@ -375,6 +375,50 @@ impl TmdbClient {
             .collect())
     }
 
+    /// Multi-search across movies and TV shows (PRD §F-011).
+    ///
+    /// Calls `/3/search/multi?query=...&language=...&page=...`. TMDB returns
+    /// at most 20 items per page; F-011 ships infinite scroll at the same
+    /// 20-per-page granularity so the caller can forward `page` directly
+    /// from the UI. People-results (TMDB also serves person rows on this
+    /// endpoint) are filtered out so the home-screen / search UI only sees
+    /// movies and series.
+    ///
+    /// `locale` is the BCP-47 language tag forwarded to TMDB's `language`
+    /// parameter so titles come back localized when possible. Pass
+    /// `"en-US"` for the default.
+    pub async fn search_multi(
+        &self,
+        query: &str,
+        locale: &str,
+        page: u32,
+    ) -> Result<Vec<TitleSummary>, Error> {
+        let url = format!("{}/3/search/multi", self.base_url);
+        let page_str = page.max(1).to_string();
+        let response = fetch_with_retry(
+            || {
+                self.client.get(&url).query(&[
+                    ("api_key", self.key.as_str()),
+                    ("query", query),
+                    ("language", locale),
+                    ("page", page_str.as_str()),
+                    ("include_adult", "false"),
+                ])
+            },
+            &self.config,
+        )
+        .await?;
+        let body: SearchMultiResponse = response
+            .json()
+            .await
+            .map_err(|e| Error::Decode(format!("tmdb search multi: {e}")))?;
+        Ok(body
+            .results
+            .into_iter()
+            .filter_map(SearchMultiResult::into_summary)
+            .collect())
+    }
+
     async fn fetch_trending(
         &self,
         media_type: &'static str,
@@ -652,6 +696,62 @@ fn pick_us_certification_show(entries: &[ContentRatingEntry]) -> Option<String> 
         .iter()
         .find(|e| e.iso_3166_1.eq_ignore_ascii_case("US") && !e.rating.is_empty())
         .map(|e| e.rating.clone())
+}
+
+/// Shape of `/3/search/multi`. TMDB returns the union of movie / tv / person
+/// rows; `media_type` is the discriminator. Person rows lack a `kind` we can
+/// surface so [`SearchMultiResult::into_summary`] drops them.
+#[derive(Debug, Deserialize)]
+struct SearchMultiResponse {
+    #[serde(default)]
+    results: Vec<SearchMultiResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchMultiResult {
+    id: u64,
+    #[serde(default)]
+    media_type: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    release_date: Option<String>,
+    #[serde(default)]
+    first_air_date: Option<String>,
+    #[serde(default)]
+    poster_path: Option<String>,
+    #[serde(default)]
+    vote_average: Option<f64>,
+}
+
+impl SearchMultiResult {
+    fn into_summary(self) -> Option<TitleSummary> {
+        let kind = match self.media_type.as_deref()? {
+            "movie" => TitleKind::Movie,
+            "tv" => TitleKind::Series,
+            _ => return None,
+        };
+        let title = self.title.or(self.name)?;
+        if title.is_empty() {
+            return None;
+        }
+        let year = self
+            .release_date
+            .as_deref()
+            .or(self.first_air_date.as_deref())
+            .and_then(parse_year);
+        let poster = self.poster_path.as_deref().map(tmdb_poster_url);
+        Some(TitleSummary {
+            id: format!("tmdb:{}", self.id),
+            kind,
+            title,
+            year,
+            poster,
+            rating: self.vote_average,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1264,5 +1364,119 @@ mod tests {
             TmdbClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
         let cast = client.credits(603, TitleKind::Movie).await.unwrap();
         assert!(cast.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_multi_returns_movie_and_tv_rows_drops_people() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/3/search/multi"))
+            .and(query_param("api_key", "test-key"))
+            .and(query_param("query", "matrix"))
+            .and(query_param("language", "en-US"))
+            .and(query_param("page", "1"))
+            .and(query_param("include_adult", "false"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [
+                    {
+                        "id": 603,
+                        "media_type": "movie",
+                        "title": "The Matrix",
+                        "release_date": "1999-03-31",
+                        "poster_path": "/p.jpg",
+                        "vote_average": 8.2
+                    },
+                    {
+                        "id": 1399,
+                        "media_type": "tv",
+                        "name": "Game of Thrones",
+                        "first_air_date": "2011-04-17",
+                        "poster_path": "/g.jpg",
+                        "vote_average": 8.4
+                    },
+                    {
+                        "id": 999,
+                        "media_type": "person",
+                        "name": "Keanu Reeves"
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TmdbClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let items = client.search_multi("matrix", "en-US", 1).await.unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].id, "tmdb:603");
+        assert_eq!(items[0].kind, TitleKind::Movie);
+        assert_eq!(items[0].title, "The Matrix");
+        assert_eq!(items[0].year, Some(1999));
+        assert_eq!(
+            items[0].poster.as_deref(),
+            Some("https://image.tmdb.org/t/p/w500/p.jpg")
+        );
+        assert_eq!(items[1].id, "tmdb:1399");
+        assert_eq!(items[1].kind, TitleKind::Series);
+        assert_eq!(items[1].title, "Game of Thrones");
+        assert_eq!(items[1].year, Some(2011));
+    }
+
+    #[tokio::test]
+    async fn search_multi_forwards_page_number_to_query() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/3/search/multi"))
+            .and(query_param("page", "3"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TmdbClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let items = client.search_multi("zzz", "en", 3).await.unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_multi_coerces_zero_page_to_one() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/3/search/multi"))
+            .and(query_param("page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TmdbClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let items = client.search_multi("zzz", "en", 0).await.unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_multi_drops_rows_with_empty_title() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/3/search/multi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [
+                    { "id": 1, "media_type": "movie", "title": "", "release_date": "2020" },
+                    { "id": 2, "media_type": "movie", "title": "Real", "release_date": "" }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TmdbClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let items = client.search_multi("q", "en", 1).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "Real");
+        assert!(items[0].year.is_none());
     }
 }

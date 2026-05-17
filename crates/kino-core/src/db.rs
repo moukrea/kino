@@ -447,6 +447,79 @@ impl Db {
         tx.commit().await?;
         Ok(())
     }
+
+    // ---- recent_searches (F-011) --------------------------------------
+    //
+    // PRD §F-011 surfaces the last N recent search queries when the
+    // search input is empty. The table primary key is the (normalized)
+    // query string itself; re-searching the same term refreshes its
+    // `searched_at` rather than duplicating the row. `recent_searches_list`
+    // returns rows most-recent first; `recent_searches_upsert` writes a
+    // single row AND trims the tail past [`RECENT_SEARCHES_MAX`] so the
+    // table doesn't grow unbounded across long-running installs.
+
+    /// Return the most recently performed searches, newest first, up to
+    /// `limit` rows. Pass [`crate::constants::RECENT_SEARCHES_MAX`] for
+    /// the PRD §F-011 default.
+    pub async fn recent_searches_list(&self, limit: usize) -> Result<Vec<String>, DbError> {
+        let cap = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT query FROM recent_searches \
+             ORDER BY searched_at DESC LIMIT ?",
+        )
+        .bind(cap)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(q,)| q).collect())
+    }
+
+    /// Record a freshly executed search. Trailing whitespace is trimmed and
+    /// empty queries are ignored. After the upsert, rows older than the
+    /// `limit`-th most recent are pruned so the table is bounded.
+    pub async fn recent_searches_upsert(&self, query: &str, limit: usize) -> Result<(), DbError> {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        let now = now_unix();
+        let cap = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO recent_searches (query, searched_at) VALUES (?, ?) \
+             ON CONFLICT(query) DO UPDATE SET searched_at = excluded.searched_at",
+        )
+        .bind(trimmed)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        // Prune tail. Sub-query picks the cap-th most-recent row's
+        // timestamp and deletes anything strictly older. Ties on
+        // `searched_at` (unlikely but possible with a 1-second clock
+        // resolution) keep both rows; the next prune resolves them on
+        // its own tick.
+        sqlx::query(
+            "DELETE FROM recent_searches WHERE searched_at < (\
+               SELECT MIN(searched_at) FROM (\
+                 SELECT searched_at FROM recent_searches \
+                 ORDER BY searched_at DESC LIMIT ?\
+               )\
+             )",
+        )
+        .bind(cap)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Remove every row from `recent_searches`. Surfaced so the Settings
+    /// screen (F-016) can offer a "Clear search history" action.
+    pub async fn recent_searches_clear(&self) -> Result<u64, DbError> {
+        let res = sqlx::query("DELETE FROM recent_searches")
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
 }
 
 fn now_unix() -> i64 {
@@ -929,5 +1002,102 @@ mod tests {
     async fn availability_upsert_many_empty_input_is_noop() {
         let db = Db::open_in_memory().await.unwrap();
         db.availability_upsert_many(&[]).await.unwrap();
+    }
+
+    // ---- F-011 recent_searches ----------------------------------------
+
+    #[tokio::test]
+    async fn recent_searches_list_empty_table_returns_empty_vec() {
+        let db = Db::open_in_memory().await.unwrap();
+        assert!(db.recent_searches_list(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn recent_searches_upsert_then_list_returns_query() {
+        let db = Db::open_in_memory().await.unwrap();
+        db.recent_searches_upsert("the matrix", 10).await.unwrap();
+        let got = db.recent_searches_list(10).await.unwrap();
+        assert_eq!(got, vec!["the matrix".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn recent_searches_upsert_trims_whitespace_and_skips_empty() {
+        let db = Db::open_in_memory().await.unwrap();
+        db.recent_searches_upsert("  inception  ", 10)
+            .await
+            .unwrap();
+        db.recent_searches_upsert("   ", 10).await.unwrap();
+        db.recent_searches_upsert("", 10).await.unwrap();
+        let got = db.recent_searches_list(10).await.unwrap();
+        assert_eq!(got, vec!["inception".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn recent_searches_upsert_refreshes_timestamp_for_duplicate() {
+        let db = Db::open_in_memory().await.unwrap();
+        db.recent_searches_upsert("alpha", 10).await.unwrap();
+        // Insert another query so the duplicate test has something to leapfrog.
+        // Sleep one second so timestamps differ deterministically — sqlite
+        // stores seconds and `now_unix()` truncates to seconds.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        db.recent_searches_upsert("beta", 10).await.unwrap();
+        // beta is most recent at this point.
+        assert_eq!(
+            db.recent_searches_list(10).await.unwrap(),
+            vec!["beta".to_string(), "alpha".to_string()]
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        // Re-search alpha → its timestamp is refreshed, jumping it to the
+        // front of the list AND keeping the row count at 2.
+        db.recent_searches_upsert("alpha", 10).await.unwrap();
+        let got = db.recent_searches_list(10).await.unwrap();
+        assert_eq!(got, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn recent_searches_upsert_prunes_past_limit() {
+        let db = Db::open_in_memory().await.unwrap();
+        // Insert 5 queries strictly in the past, ascending, so the
+        // production-path upsert of "f" at `now_unix()` lands as the
+        // newest entry.
+        let now = now_unix();
+        for (i, q) in ["a", "b", "c", "d", "e"].iter().enumerate() {
+            sqlx::query("INSERT INTO recent_searches (query, searched_at) VALUES (?, ?)")
+                .bind(*q)
+                .bind(now - 10 + i64::try_from(i).unwrap())
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        // limit = 3 → only the three newest survive after the next upsert.
+        db.recent_searches_upsert("f", 3).await.unwrap();
+        let got = db.recent_searches_list(10).await.unwrap();
+        assert_eq!(got, vec!["f".to_string(), "e".to_string(), "d".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn recent_searches_list_respects_limit_parameter() {
+        let db = Db::open_in_memory().await.unwrap();
+        let now = now_unix();
+        for (i, q) in ["a", "b", "c", "d", "e"].iter().enumerate() {
+            sqlx::query("INSERT INTO recent_searches (query, searched_at) VALUES (?, ?)")
+                .bind(*q)
+                .bind(now + i64::try_from(i).unwrap())
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        let got = db.recent_searches_list(2).await.unwrap();
+        assert_eq!(got, vec!["e".to_string(), "d".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn recent_searches_clear_removes_every_row() {
+        let db = Db::open_in_memory().await.unwrap();
+        db.recent_searches_upsert("one", 10).await.unwrap();
+        db.recent_searches_upsert("two", 10).await.unwrap();
+        let removed = db.recent_searches_clear().await.unwrap();
+        assert_eq!(removed, 2);
+        assert!(db.recent_searches_list(10).await.unwrap().is_empty());
     }
 }

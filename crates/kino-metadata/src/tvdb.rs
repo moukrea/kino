@@ -232,6 +232,38 @@ impl TvdbClient {
         }))
     }
 
+    /// Search TVDB for movies AND series (PRD §F-011).
+    ///
+    /// Calls `/v4/search?query=...&limit=...`. TVDB returns mixed
+    /// `movie` / `series` entries (plus people / companies which we drop);
+    /// each row is converted to a [`TitleSummary`] preferring the `IMDb` id
+    /// when TVDB carries one (the `remote_ids` array), falling back to
+    /// the `tvdb:N` prefix.
+    pub async fn search(&self, query: &str, limit: u32) -> Result<Vec<TitleSummary>, Error> {
+        let url = format!("{}/v4/search", self.base_url);
+        let token = self.login().await?;
+        let limit_str = limit.max(1).to_string();
+        let response = fetch_with_retry(
+            || {
+                self.client
+                    .get(&url)
+                    .bearer_auth(&token)
+                    .query(&[("query", query), ("limit", limit_str.as_str())])
+            },
+            &self.config,
+        )
+        .await?;
+        let envelope: SearchEnvelope = response
+            .json()
+            .await
+            .map_err(|e| Error::Decode(format!("tvdb search: {e}")))?;
+        Ok(envelope
+            .data
+            .into_iter()
+            .filter_map(SearchEntry::into_summary)
+            .collect())
+    }
+
     /// Issue a TVDB v4 filter request, deserializing the standard
     /// `{ status, data }` envelope. The endpoint requires three mandatory
     /// query parameters (`country`, `lang`, `sort`). We default to
@@ -363,6 +395,86 @@ impl FilterEntry {
             popularity: None,
             rating: self.score,
         }
+    }
+}
+
+/// `/v4/search` envelope.
+#[derive(Debug, Deserialize)]
+struct SearchEnvelope {
+    #[serde(default)]
+    data: Vec<SearchEntry>,
+}
+
+/// One `/v4/search` row. TVDB returns a heterogeneous list with `type`
+/// in `{"movie", "series", "person", "company", "episode"}`. We narrow to
+/// the two kinds the F-011 search surface accepts.
+#[derive(Debug, Deserialize)]
+struct SearchEntry {
+    /// String form of the TVDB id (TVDB inconsistently returns it as a
+    /// JSON string in `/search`, vs an integer in `/filter`).
+    #[serde(default)]
+    tvdb_id: Option<String>,
+    #[serde(default)]
+    name: String,
+    /// `movie` / `series` / `person` / etc.
+    #[serde(default, rename = "type")]
+    kind: String,
+    /// Sometimes called `image_url` in the docs, returned bare here.
+    #[serde(default)]
+    image_url: Option<String>,
+    #[serde(default)]
+    year: Option<String>,
+    /// `remote_ids` carries the `IMDb` / TMDB mapping when TVDB knows it.
+    #[serde(default)]
+    remote_ids: Vec<RemoteIdEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoteIdEntry {
+    #[serde(default)]
+    id: String,
+    /// E.g. `"IMDB"`, `"TheMovieDB.com"`, `"Trakt"`.
+    #[serde(default, rename = "sourceName")]
+    source_name: String,
+}
+
+impl SearchEntry {
+    fn into_summary(self) -> Option<TitleSummary> {
+        let kind = match self.kind.as_str() {
+            "movie" => TitleKind::Movie,
+            "series" => TitleKind::Series,
+            _ => return None,
+        };
+        if self.name.is_empty() {
+            return None;
+        }
+        // Prefer IMDb from remote_ids for cross-provider dedup.
+        let imdb = self.remote_ids.iter().find_map(|r| {
+            if r.source_name.eq_ignore_ascii_case("IMDB") && !r.id.is_empty() {
+                Some(r.id.clone())
+            } else {
+                None
+            }
+        });
+        let id = if let Some(imdb) = imdb {
+            imdb
+        } else if let Some(tvdb) = self.tvdb_id {
+            if tvdb.is_empty() {
+                return None;
+            }
+            format!("tvdb:{tvdb}")
+        } else {
+            return None;
+        };
+        let year = self.year.as_deref().and_then(|y| y.parse::<u16>().ok());
+        Some(TitleSummary {
+            id,
+            kind,
+            title: self.name,
+            year,
+            poster: self.image_url,
+            rating: None,
+        })
     }
 }
 
@@ -598,5 +710,121 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn search_returns_movies_and_series_preferring_imdb_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v4/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status":"success","data":{"token":"tok"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v4/search"))
+            .and(header("Authorization", "Bearer tok"))
+            .and(query_param("query", "matrix"))
+            .and(query_param("limit", "20"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status": "success",
+                "data": [
+                    {
+                        "tvdb_id": "169",
+                        "name": "The Matrix",
+                        "type": "movie",
+                        "year": "1999",
+                        "image_url": "https://artworks.thetvdb.com/p1.jpg",
+                        "remote_ids": [
+                            {"id": "tt0133093", "sourceName": "IMDB"},
+                            {"id": "603", "sourceName": "TheMovieDB.com"}
+                        ]
+                    },
+                    {
+                        "tvdb_id": "271124",
+                        "name": "Matrix",
+                        "type": "series",
+                        "year": "1993",
+                        "image_url": null,
+                        "remote_ids": []
+                    },
+                    {
+                        "tvdb_id": "999",
+                        "name": "Carrie-Anne Moss",
+                        "type": "person",
+                        "remote_ids": []
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TvdbClient::with_options("test-key", HttpConfig::for_test(), server.uri()).unwrap();
+        let items = client.search("matrix", 20).await.unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].id, "tt0133093");
+        assert_eq!(items[0].kind, TitleKind::Movie);
+        assert_eq!(items[0].title, "The Matrix");
+        assert_eq!(items[0].year, Some(1999));
+        assert_eq!(
+            items[0].poster.as_deref(),
+            Some("https://artworks.thetvdb.com/p1.jpg")
+        );
+        assert_eq!(items[1].id, "tvdb:271124");
+        assert_eq!(items[1].kind, TitleKind::Series);
+    }
+
+    #[tokio::test]
+    async fn search_drops_entries_with_no_id_at_all() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v4/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status":"success","data":{"token":"tok"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v4/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    { "name": "Orphan", "type": "movie" }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TvdbClient::with_options("test-key", HttpConfig::for_test(), server.uri()).unwrap();
+        let items = client.search("orphan", 20).await.unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_coerces_zero_limit_to_one() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v4/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status":"success","data":{"token":"tok"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v4/search"))
+            .and(query_param("limit", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": []})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TvdbClient::with_options("test-key", HttpConfig::for_test(), server.uri()).unwrap();
+        let items = client.search("q", 0).await.unwrap();
+        assert!(items.is_empty());
     }
 }

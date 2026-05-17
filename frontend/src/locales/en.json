@@ -43,6 +43,14 @@
     "error": "Could not load this title."
   },
   "search": {
+    "title": "Search",
+    "placeholder": "Search movies and series…",
+    "recentTitle": "Recent searches",
+    "recentClear": "Clear history",
+    "loading": "Searching…",
+    "empty": "No matching titles.",
+    "loadMore": "Load more",
+    "hint": "Press / to focus the search box, or paste an IMDb id (tt1234567).",
     "comingSoon": "Search is coming soon."
   },
   "settings": {
