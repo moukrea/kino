@@ -72,6 +72,7 @@ pub fn run() {
             commands::test_fanart,
             commands::get_trending,
             commands::resolve_artwork,
+            commands::check_availability,
             commands::get_recommended_addons,
             commands::install_addon,
             commands::uninstall_addon,

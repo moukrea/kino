@@ -10,6 +10,7 @@
 //! - The crate-level error type [`Error`].
 
 pub mod addon;
+pub mod availability;
 pub mod constants;
 pub mod cw;
 pub mod db;

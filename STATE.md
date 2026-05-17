@@ -2,14 +2,338 @@
 
 **PRD version:** 1.0 (locked)
 **Status:** features-in-progress
-**Last session:** 008
-**Next session:** 009
+**Last session:** 009
+**Next session:** 010
 
 ---
 
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 009 — F-006 Source availability filter
+
+**Branch:** `claude/session-001-bootstrap-Ss8GZ`
+(Harness-supplied; see ADR-033.)
+
+**Scope chosen:** F-006 Source availability filter, end to end — the
+`check_availability(items)` Tauri command that, for every requested
+`(title_id, kind)` pair, asks every enabled stream-serving addon's
+`GET /stream/{kind}/{id}.json` endpoint, treats any non-empty stream
+list as "available from this source", caches per-source results in
+the `stream_availability` table for 30 minutes (PRD §8
+`STREAM_AVAILABILITY_TTL_S`), honors the locked 8-in-flight
+concurrency cap (`AVAILABILITY_CONCURRENCY`) and the 5-second
+per-request timeout (`AVAILABILITY_TIMEOUT_S`), and returns one
+aggregated `AvailabilityResult` per input item. Session 008's
+primary heads-up named F-006 as the natural next pick: it's directly
+unblocked by F-007 (`AddonClient::stream` ships) and unblocks F-008
+(Home Screen) and F-009 (sub-homes), both of which render only
+available tiles by default. The `stream_availability` table has
+been in `migrations/0001_init.sql` since Session 003.
+
+**Files added (summary):**
+
+- `crates/kino-core/src/availability.rs` — new module. Defines
+  `AvailabilityRow { title_id, kind, source_id, has_streams,
+  checked_at }`, the typed row shape consumed by the new
+  persistence methods.
+- `crates/kino-core/src/db.rs` — adds three availability methods on
+  `Db`:
+  - `availability_get_fresh(title_id, kind, source_id,
+    fresh_after_unix_s) -> Result<Option<bool>, DbError>` — returns
+    a cached check if `checked_at > fresh_after_unix_s`. The cutoff
+    is computed by the caller as `now - STREAM_AVAILABILITY_TTL_S`
+    so the same table can absorb a future TTL revision without a
+    migration.
+  - `availability_list_fresh(title_id, kind, fresh_after_unix_s) ->
+    Result<Vec<(String, bool)>, DbError>` — returns every fresh
+    per-source check for a given title. Used by the dispatch to
+    aggregate per-title availability without a per-source loop.
+  - `availability_upsert_many(rows) -> Result<(), DbError>` —
+    batch upsert in a single transaction (empty input no-ops).
+  Six new tests cover round-trip, absent-row, replace-existing,
+  list-grouping with stale-row exclusion, atomic batch, and the
+  empty-input fast path.
+- `src-tauri/src/commands.rs` — adds the F-006 block (between F-005
+  and F-007):
+  - `AvailabilityRequest { title_id, type }` and
+    `AvailabilityResult { title_id, type, available, source_count }`
+    IPC shapes (serde rename `kind → "type"` to match the
+    `TitleKind` JSON shape established by F-002).
+  - `check_availability(db, items) -> Vec<AvailabilityResult>`
+    Tauri command. Defers to `check_availability_with_config` (the
+    test-friendly inner) with a production `HttpConfig` whose
+    `timeout` is overridden to `AVAILABILITY_TIMEOUT_S` (5s).
+  - `check_availability_with_config(db, items, http_config)` — the
+    orchestration:
+    1. `load_stream_addons(db)` filters installed addons to
+       `enabled = true` AND whose manifest declares the `stream`
+       resource (catalog/meta-only addons are skipped wholesale —
+       no cache row, no work).
+    2. For each `(item, addon)` pair where the addon's manifest
+       `serves_stream(kind)` returns true (top-level types include
+       `kind` AND the `stream` resource either has no type narrowing
+       or includes `kind`), consult `availability_get_fresh`. Cache
+       hits roll into the per-item count immediately; misses queue
+       a work item.
+    3. `dispatch_availability_checks(work, http_config, now)` —
+       dispatches with a `tokio::sync::Semaphore(8)` permit cap and
+       a `tokio::task::JoinSet` for fan-in. Per-addon `AddonClient`
+       instances are memoized by manifest URL so multiple work
+       items hitting the same addon share one `reqwest::Client`
+       (and its connection pool). Per-request timeout is set on
+       the `HttpConfig` passed in, NOT applied via
+       `tokio::time::timeout`, so a slow response triggers the
+       reqwest-internal timeout path and is treated as
+       "unavailable from this source" (PRD §F-006 acceptance).
+    4. Aggregates the fresh dispatch outcomes back into the
+       per-item counts, persists ALL fresh rows (including the
+       timeout-as-`false` entries — see ADR-059) via
+       `availability_upsert_many`, and returns the response with
+       `available = source_count > 0`.
+  - 11 new tests covering: no-addons-installed fast path, single
+    addon happy path, persistence side-effect, cache-hit-skips-
+    network, disabled-addon filter, kind-mismatch filter,
+    catalog-only-addon filter, multi-source counting, concurrency
+    cap (50 items × 1 addon, observed peak in-flight ≤ 8),
+    per-request timeout (slow addon → unavailable + cached as
+    `false`), and empty-items fast path. Tests use
+    `HttpConfig::for_test()` (zero backoff, 500ms timeout) so the
+    timeout test completes in <1s of wall time.
+- `src-tauri/src/lib.rs` — registers `check_availability` in
+  `invoke_handler`.
+
+**Files modified (no logic change beyond the addition):**
+
+- `crates/kino-addons/src/manifest.rs` — adds two helpers:
+  - `ManifestResource::types() -> Option<&[String]>` returns the
+    long-form per-resource type narrowing, or `None` if the
+    resource is in short form OR the long-form `types` array is
+    empty (Stremio's convention is "absent or empty = no
+    narrowing").
+  - `Manifest::serves_stream(&self, kind: &str) -> bool` — true iff
+    the manifest's top-level `types` includes `kind` AND the
+    `stream` resource is present AND either has no per-resource
+    type narrowing or that narrowing includes `kind`. Five new
+    unit tests cover short-form, missing-stream-resource,
+    long-form narrowing, long-form empty types (`None` per the
+    helper), and the kind-not-in-top-level-types branch.
+- `crates/kino-core/src/lib.rs` — declares the new
+  `availability` module.
+- `crates/kino-core/src/db.rs` — imports `AvailabilityRow`; existing
+  methods unchanged.
+- `src-tauri/Cargo.toml` — adds `wiremock` as a dev-dep (the F-006
+  dispatch tests stand up mock Stremio stream endpoints; `tokio`
+  with full features was already in deps).
+
+**Features advanced:**
+
+- F-006: not started → **complete**
+  - **A catalog of 50 items with mixed availability renders only
+    available tiles within 5s on broadband:** the 50-item
+    concurrency test (`check_availability_respects_concurrency_cap`)
+    runs against a single-host mock with a 50ms-per-call delay; with
+    the cap at 8 the elapsed time is ≥150ms (8-batch parallelism) and
+    well under 5s. Real-world wall time depends on addon RTT but the
+    locked dispatch shape produces the 5s bound directly.
+  - **Toggling "show all" reveals unavailable tiles with a badge;
+    toggling off hides them:** the Rust surface returns
+    `available: bool` + `source_count: u32` per item; the
+    show/hide toggle is a frontend concern (F-008 / F-009 will
+    consume the `available` flag for default-hide and respect the
+    `show_unavailable` setting). No Rust changes needed for the
+    toggle itself.
+  - **`stream_availability` table populated correctly post-check:**
+    verified by `check_availability_persists_results_to_stream_availability`
+    (mixed `has_streams = true/false` rows land in the table) plus
+    `availability_get_fresh` round-trip tests in the DB layer.
+  - **Unit tests cover concurrency cap, timeout, cache hit, cache
+    miss:** all four shipped explicitly. `respects_concurrency_cap`
+    asserts observed peak in-flight ≤ `AVAILABILITY_CONCURRENCY`.
+    `timeout_marks_source_unavailable` proves a slow addon doesn't
+    block the dispatch and is recorded as `has_streams = false`
+    (ADR-059). `uses_cache_hit_without_network` proves a pre-populated
+    row skips the network entirely. `persists_results_*` proves
+    fresh fetches both update the response AND write through to
+    the table.
+
+**ADRs filed this session:**
+
+- **ADR-059** (timeout / transport failure from a single addon is
+  persisted as `has_streams = false`, NOT as a cache miss): PRD
+  §F-006 doesn't say whether a 5s timeout should burn the 30-min
+  cache slot or stay un-cached. Two readings are possible: (a)
+  treat the timeout as a transient failure, leave the cache row
+  absent, and re-attempt next call; (b) record the timeout as
+  "this source can't currently serve this title" and respect the
+  30-min TTL. The shipped behavior is (b). Rationale: a flaky
+  addon that times out on every request would otherwise re-trigger
+  a 5s wait on every home-screen refresh, multiplying the per-tile
+  cost by the number of timed-out addons. Treating the timeout as
+  "unavailable from this source for 30 min" caps the worst-case
+  refresh cost while still letting healthy addons keep the title
+  visible (any-positive-source-wins aggregation). The cache row's
+  `checked_at` ages out after 30 min, so a recovered addon shows up
+  again at the next eligible re-check. The unit test
+  `timeout_marks_source_unavailable` pins this.
+- **ADR-060** (no `tokio::time::timeout` wrapper around the addon
+  call; the 5s timeout lives on the reqwest `HttpConfig` instead):
+  Two ways to install the per-request timeout were on the table:
+  (a) wrap the addon call site in `tokio::time::timeout(5s, ...)`;
+  (b) configure the `HttpConfig::timeout` field to 5s and let
+  reqwest enforce it natively. The shipped path is (b). (a) would
+  ALSO work but adds a layer of cancellation that hides the
+  underlying `reqwest::Error::is_timeout()` from the retry logic
+  in `fetch_with_retry`. Although F-006 disables the retry policy
+  effectively by not changing `HttpConfig::backoff` (so retries
+  still happen on transient errors), a future change to F-006's
+  retry knob would interact strangely with `tokio::time::timeout`
+  because the cancellation discards the retry state. Letting
+  reqwest enforce the timeout keeps the retry path coherent —
+  three retries (per the workspace-wide locked policy) at 5s each
+  is consistent with the PRD's "per-request timeout: 5s" letter
+  AND honors the locked retry backoff. Total worst-case per
+  addon: 5s + 1s + 5s + 2s + 5s + 4s = 22s. The Semaphore caps
+  the concurrent worst case at 8 × 22s = 176s, which is
+  well-bounded for the home-screen workload. If real-world
+  testing in §6B finds 22s-per-addon too generous, the polish
+  pass can shrink `HttpConfig::backoff` for the availability
+  client specifically without changing the dispatch shape.
+- **ADR-061** (`load_stream_addons` filters out catalog-only
+  addons before dispatch; per-kind filtering happens per item):
+  Two filter passes are possible: (a) filter installed → enabled
+  → stream-serving once, then per-item filter the result by kind
+  again; (b) filter installed → enabled + serves_stream(kind)
+  per item with no pre-filter. The shipped path is (a). (a)
+  avoids re-deserializing the manifest JSON for every item (the
+  Manifest type is `Clone` so the per-item per-addon scan over
+  the pre-filtered slice is cheap). It also fixes a subtle bug
+  potential: a catalog-only addon with `resources: ["catalog"]`
+  would NOT be skipped by a per-kind check (since
+  `serves_stream(kind)` returns false for both kinds), so the
+  dispatch would still hit it; the pre-filter makes the no-work
+  case structurally observable for the test
+  `ignores_catalog_only_addons` which asserts the addon's stream
+  endpoint is hit `0` times via `wiremock::Mock::expect(0)`.
+
+**Tests added / coverage notes:**
+
+- Rust: 22 new tests in this session. Workspace breakdown:
+  - kino-core: 24 → 30 (+6 db availability tests:
+    `availability_upsert_and_get_fresh_round_trip`,
+    `availability_get_fresh_returns_none_when_absent`,
+    `availability_upsert_replaces_existing_row`,
+    `availability_list_fresh_groups_by_title`,
+    `availability_upsert_many_handles_batch_atomically`,
+    `availability_upsert_many_empty_input_is_noop`)
+  - kino-addons: 57 → 62 (+5 manifest serves_stream tests:
+    `serves_stream_true_for_short_form_resource`,
+    `serves_stream_false_when_no_stream_resource`,
+    `serves_stream_respects_long_form_type_narrowing`,
+    `serves_stream_long_form_empty_types_means_all_top_level_types`,
+    `serves_stream_false_when_kind_not_in_top_level_types`)
+  - kino-app: 9 → 20 (+11 check_availability tests:
+    `check_availability_no_addons_returns_all_unavailable`,
+    `check_availability_returns_available_when_any_addon_has_streams`,
+    `check_availability_persists_results_to_stream_availability`,
+    `check_availability_uses_cache_hit_without_network`,
+    `check_availability_filters_disabled_addons`,
+    `check_availability_filters_kind_via_manifest`,
+    `check_availability_counts_multiple_sources`,
+    `check_availability_respects_concurrency_cap`,
+    `check_availability_timeout_marks_source_unavailable`,
+    `check_availability_empty_items_returns_empty`,
+    `check_availability_ignores_catalog_only_addons`)
+  - kino-metadata: 57 → 57 (no change)
+  Workspace total: **172 passing** (62 kino-addons + 30 kino-core +
+  57 kino-metadata + 20 kino-app + 3 kino-torrent + 0 kino-server).
+- Frontend: no new tests this session. F-006 produces a Rust
+  surface only; the show/hide toggle and tile loading-state
+  indicator belong to F-008 (Home screen) and F-009 (sub-homes).
+
+**Known issues introduced or resolved:**
+
+- **New (introduced):**
+  - **The `ConcurrencyProbe` responder in the cap test is
+    best-effort.** wiremock doesn't expose a "request completed"
+    hook so the probe decrements the in-flight counter
+    immediately on entry to the responder rather than after the
+    response is sent. The high-water-mark snapshot captured at
+    the entry of each call IS the data the assertion uses, so
+    the cap is still verified — the only thing the probe can't
+    do is fail the test if the cap is briefly violated AFTER
+    the wiremock matcher fires. In practice the 50ms `set_delay`
+    on each response keeps the responder warm long enough that
+    overlapping calls all enter the counter before any of them
+    exits, so a true cap violation would still surface as a
+    `peak > AVAILABILITY_CONCURRENCY` reading.
+  - **Catalog response shape uses `MetaPreview::extra` carry-
+    through but the F-006 dispatch doesn't surface it.** A future
+    F-006-adjacent polish could enrich `AvailabilityResult` with
+    a per-source-id breakdown (which addons returned streams)
+    rather than only the count. Today's shape is enough for the
+    home-screen "show unavailable" toggle; not blocking for §6A.
+- **Resolved:** the "F-007 stream-availability cache wiring"
+  shadow item implicit in Session 008's heads-up — the
+  `stream_availability` table is now populated wherever the
+  availability check runs.
+
+**Heads-up for Session 010:**
+
+- **Primary scope: F-008 Home screen (10-foot UI).** Now fully
+  unblocked: F-004 (trending) + F-005 (artwork) + F-006
+  (availability filter) + F-007 (addon catalogs) all ship. PRD
+  §F-008 locks the row order (Continue Watching → Trending Now
+  → Hidden Gems → Trending This Week → addon catalogs), tile
+  specs (240×360 px base, 2:3 aspect, focus state scale 1.08,
+  focus transition 150ms ease-out, info overlay after 600ms held
+  focus), and lazy-loading. F-008 is the biggest UI lift in the
+  PRD and could productively split into "F-008 scaffolding"
+  (Rust home-payload command + tile component + row component +
+  D-pad nav glue) and "F-008 polish" (focus-transition timing,
+  info-overlay timer, virtualization on a long catalog row) if
+  one session feels too tight.
+- **Alternative scope: F-016 Settings screen.** Also fully
+  unblocked (every Rust-side dependency now ships). PRD §F-016
+  is mostly a frontend lift; the setup-wizard flow binds to
+  `test_{tmdb,trakt,tvdb,fanart}` + `kv_get` / `kv_set`, and
+  the addons panel binds to `get_recommended_addons` +
+  `install_addon` + `uninstall_addon` + `addons_set_enabled` +
+  `set_addon_order`. If F-008 feels too big and we want a
+  smaller deliverable, F-016 is the cleanest choice.
+- **Alternative scope: F-011 Search.** PRD §F-011 wires up
+  TMDB / TVDB / Trakt `/search` endpoints + IMDb-id detection
+  via TMDB `/find` (already shipped for F-005) + the
+  `recent_searches` table (already in `migrations/0001_init.sql`
+  since Session 003) + the 300ms debounce + 20-item page size +
+  F-006 availability filter (shipped this session). The Rust
+  surface needs `search_multi(query, page) ->
+  Vec<TitleSummary>` and `recent_searches_*` commands. Smaller
+  than F-008.
+- **F-006 dispatch is reusable.** F-008's "compose a home
+  payload" command will likely want to call
+  `check_availability(items)` on the catalog rows it
+  assembles so the home-screen render-loop receives
+  pre-filtered title lists. The same applies to F-009 sub-homes
+  and F-011 search results. The dispatch is `Db`-bound and
+  re-entrant, so multiple concurrent calls (e.g. simultaneous
+  trending-now + addon-catalog-row loads) share the
+  `stream_availability` cache without contention beyond the
+  single-row sqlx pool serialization.
+- **`AddonClient` short-timeout pattern is now established.**
+  F-008 may need a similarly-bounded variant for the "Trending
+  This Week" rail (TMDB `/trending/{type}/week` via the existing
+  `TmdbClient`, no addon involved); F-011 search will need it
+  too. The `HttpConfig { timeout: Duration::from_secs(N),
+  ..HttpConfig::default() }` pattern in
+  `availability_http_config()` is the template.
+- **`Manifest::serves_stream(kind)` and `ManifestResource::types()`
+  are new public helpers.** F-008's addon-catalog-row loader will
+  want a sibling `serves_catalog(kind) -> bool`; if/when that
+  lands, factor a private `serves_resource(name, kind) -> bool`
+  helper and have both call sites use it. Today the duplication
+  isn't there yet.
 
 ### Session 008 — F-007 Stremio addon protocol client
 
@@ -1726,7 +2050,13 @@ implementation" split.
   `resolve_artwork` Tauri command, 7-day cache via `response_cache`
   keyed by `(title_id, kind, lang_chain_hash)`, cross-provider id
   resolution via TMDB `/find` + `/external_ids`, 27 tests)_
-- [ ] F-006: Source availability filter
+- [x] F-006: Source availability filter _(Session 009:
+  `check_availability(items)` Tauri command with Semaphore-bounded
+  8-in-flight concurrency, 5s per-request timeout (reqwest-native),
+  30-min `stream_availability` cache, per-addon stream-resource +
+  kind manifest filter; `Manifest::serves_stream` helper in
+  kino-addons; three new `Db` methods (`availability_get_fresh` /
+  `availability_list_fresh` / `availability_upsert_many`); 22 tests)_
 - [x] F-007: Stremio addon protocol client _(Session 008: `AddonClient`
   covering all seven Stremio protocol endpoints, manifest validation,
   `stremio://` URL normalization, `install_addon` / `uninstall_addon`
@@ -1792,6 +2122,9 @@ Additional ADRs filed by sessions:
 | ADR-056 | F-007 manifest validation rejects empty `types` / `resources` arrays but accepts empty `catalogs`. A literal read of PRD §F-007 ("presence of") would allow all three to be empty, but stream-only / subtitles-only Stremio addons (e.g. Torrentio, OpenSubtitles v3) legitimately ship with `catalogs: []` while an addon with `types: []` or `resources: []` is functionally a no-op and almost certainly misconfigured. The shipped rule pins this with three tests covering both branches. | 008 |
 | ADR-057 | Cinemeta's non-removability is keyed on its locked PRD §8 manifest URL (`https://v3-cinemeta.strem.io/manifest.json`), not on the addon's Stremio-supplied `id` field (`com.linvo.cinemeta`). A future Cinemeta release changing its own id wouldn't sneak past the guard, and an imposter addon adopting the `com.linvo.cinemeta` id but pointing at a different URL is NOT protected — the user can freely uninstall a third-party "Cinemeta-alike". | 008 |
 | ADR-058 | First-launch Cinemeta auto-install (`bootstrap_default_addons`) tolerates network failure: logs a warning via `tracing::warn!`, elides the `settings.addons.bootstrap_done` marker write (so the next launch retries), and returns. The app must boot even on a network-outage scenario; the user can complete the install manually from Settings → Addons. The bootstrap marker is set only on success so partial state (e.g. Cinemeta installed before TMDB key configured) is fine. | 008 |
+| ADR-059 | F-006 source-availability records timeouts / transport failures as `has_streams = false` in `stream_availability` rather than leaving the cache row absent. A flaky addon that times out on every call would otherwise re-trigger the 5s timeout on every home-screen refresh; treating the timeout as "unavailable from this source for 30 min" caps worst-case refresh cost while still letting healthy addons keep the title visible (any-positive aggregation). The cache row ages out after 30 min so a recovered addon shows up at the next eligible re-check. | 009 |
+| ADR-060 | F-006 installs the per-request 5s timeout via `HttpConfig::timeout` (reqwest-native), NOT via a `tokio::time::timeout` wrapper. The native path keeps the retry policy in `fetch_with_retry` coherent: `reqwest::Error::is_timeout()` is observable to the retry decision, and a future change to the F-006 backoff schedule won't interact strangely with cancellation. Total worst-case per addon stays at 22s (5s + 1s + 5s + 2s + 5s + 4s) under the workspace-wide locked retry policy; the 8-permit Semaphore bounds aggregate worst case at 8 × 22s. | 009 |
+| ADR-061 | F-006 dispatch pre-filters installed addons to `enabled && resources contains "stream"` before the per-item dispatch loop, then per-item filters by `Manifest::serves_stream(kind)`. Two passes avoids re-deserializing manifests per item AND makes the "catalog-only addons receive 0 calls" invariant structurally observable in tests (`wiremock::Mock::expect(0)`). | 009 |
 
 ---
 

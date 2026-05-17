@@ -74,6 +74,47 @@ impl ManifestResource {
             Self::Detailed { name, .. } => name,
         }
     }
+
+    /// Returns the long-form per-resource `types` narrowing, or `None` if the
+    /// resource is in short form (which serves every top-level manifest type).
+    /// An empty per-resource `types` vector also returns `None`: Stremio's
+    /// convention is "absent or empty = no narrowing".
+    pub fn types(&self) -> Option<&[String]> {
+        match self {
+            Self::Name(_) => None,
+            Self::Detailed { types, .. } => {
+                if types.is_empty() {
+                    None
+                } else {
+                    Some(types)
+                }
+            }
+        }
+    }
+}
+
+impl Manifest {
+    /// True iff this addon serves the `stream` resource for the given title
+    /// `kind` (`"movie"` or `"series"`). Used by F-006's source-availability
+    /// dispatch to skip addons that wouldn't return streams for the requested
+    /// type.
+    ///
+    /// The check is conservative: the manifest's top-level `types` must
+    /// include `kind` AND the `stream` resource must be present. If the
+    /// `stream` resource carries an explicit per-resource `types` narrowing,
+    /// `kind` must appear there too.
+    pub fn serves_stream(&self, kind: &str) -> bool {
+        if !self.types.iter().any(|t| t == kind) {
+            return false;
+        }
+        self.resources
+            .iter()
+            .filter(|r| r.name() == "stream")
+            .any(|r| match r.types() {
+                None => true,
+                Some(types) => types.iter().any(|t| t == kind),
+            })
+    }
 }
 
 /// Describes one catalog the addon serves. Stremio's protocol locks the
@@ -365,6 +406,77 @@ mod tests {
     fn rejects_non_object_root() {
         let err = parse_manifest("[]").unwrap_err();
         assert!(matches!(err, ManifestError::Malformed(_)));
+    }
+
+    #[test]
+    fn serves_stream_true_for_short_form_resource() {
+        let body = r#"{
+            "id": "x", "version": "1", "name": "X",
+            "types": ["movie", "series"],
+            "resources": ["catalog", "stream"],
+            "catalogs": []
+        }"#;
+        let m = parse_manifest(body).unwrap();
+        assert!(m.serves_stream("movie"));
+        assert!(m.serves_stream("series"));
+        assert!(!m.serves_stream("podcast"));
+    }
+
+    #[test]
+    fn serves_stream_false_when_no_stream_resource() {
+        let body = r#"{
+            "id": "x", "version": "1", "name": "X",
+            "types": ["movie"],
+            "resources": ["catalog", "meta"],
+            "catalogs": []
+        }"#;
+        let m = parse_manifest(body).unwrap();
+        assert!(!m.serves_stream("movie"));
+    }
+
+    #[test]
+    fn serves_stream_respects_long_form_type_narrowing() {
+        // The `stream` resource explicitly narrows to series only.
+        let body = r#"{
+            "id": "x", "version": "1", "name": "X",
+            "types": ["movie", "series"],
+            "resources": [
+                "catalog",
+                {"name": "stream", "types": ["series"]}
+            ],
+            "catalogs": []
+        }"#;
+        let m = parse_manifest(body).unwrap();
+        assert!(!m.serves_stream("movie"));
+        assert!(m.serves_stream("series"));
+    }
+
+    #[test]
+    fn serves_stream_long_form_empty_types_means_all_top_level_types() {
+        let body = r#"{
+            "id": "x", "version": "1", "name": "X",
+            "types": ["movie", "series"],
+            "resources": [
+                {"name": "stream"}
+            ],
+            "catalogs": []
+        }"#;
+        let m = parse_manifest(body).unwrap();
+        assert!(m.serves_stream("movie"));
+        assert!(m.serves_stream("series"));
+    }
+
+    #[test]
+    fn serves_stream_false_when_kind_not_in_top_level_types() {
+        let body = r#"{
+            "id": "x", "version": "1", "name": "X",
+            "types": ["movie"],
+            "resources": ["stream"],
+            "catalogs": []
+        }"#;
+        let m = parse_manifest(body).unwrap();
+        assert!(m.serves_stream("movie"));
+        assert!(!m.serves_stream("series"));
     }
 
     #[test]
