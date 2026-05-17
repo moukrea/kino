@@ -10,12 +10,13 @@
 
 use chrono::{Datelike, NaiveDate, TimeZone, Utc};
 use kino_core::addon::{Addon, AddonInsert};
+use kino_core::constants::ARTWORK_TTL_S;
 use kino_core::cw::ContinueWatching;
 use kino_core::title::{TitleKind, TitleSummary};
 use kino_core::Db;
 use kino_metadata::{
-    aggregate, FanartClient, ProviderItem, TmdbClient, TraktClient, TvdbClient, FANART_API_KEY,
-    TMDB_API_KEY, TRAKT_API_KEY, TVDB_API_KEY,
+    aggregate, fetch_and_resolve, lang_chain_hash, Artwork, FanartClient, ProviderItem, TitleIds,
+    TmdbClient, TraktClient, TvdbClient, FANART_API_KEY, TMDB_API_KEY, TRAKT_API_KEY, TVDB_API_KEY,
 };
 use tauri::State;
 
@@ -289,6 +290,165 @@ fn next_utc_midnight_unix(today: &str) -> Option<i64> {
     Some(Utc.from_utc_datetime(&midnight).timestamp())
 }
 
+// ---- F-005: image & logo resolution -------------------------------------
+//
+// PRD §F-005 locks the six-tier fallback chain. The aggregator itself lives
+// in `kino-metadata::artwork`; the host command stitches it onto the catalog
+// id parser (so a `tmdb:603` id can drive a Fanart.tv lookup once external
+// ids are resolved) and onto `response_cache` for the 7-day TTL.
+
+/// `resolve_artwork(title_id, kind, lang_pref)` (PRD §F-005).
+///
+/// `title_id` accepts the catalog id forms the F-004 trending aggregator
+/// emits — `imdb:tt...` / `tmdb:N` / `tvdb:N` / bare `tt...`. `kind` is
+/// `Movie` or `Series`. `lang_pref` is the user's primary language plus up
+/// to three fallbacks; an empty slice resolves only via the tier-5 sweep
+/// then placeholders.
+#[tauri::command]
+#[allow(clippy::similar_names)] // PRD-locked provider names (tmdb / tvdb).
+pub async fn resolve_artwork(
+    db: State<'_, Db>,
+    title_id: String,
+    kind: TitleKind,
+    lang_pref: Vec<String>,
+) -> Result<Artwork, String> {
+    let lang_hash = lang_chain_hash(&lang_pref);
+    let cache_key = format!("artwork:{}:{title_id}:{lang_hash}", kind.as_str());
+
+    if let Some(cached) = db.cache_get(&cache_key).await.map_err(ipc)? {
+        if let Ok(parsed) = serde_json::from_str::<Artwork>(&cached) {
+            return Ok(parsed);
+        }
+        tracing::warn!(key = %cache_key, "discarding malformed cached artwork payload");
+    }
+
+    let tmdb_key = db.kv_get(TMDB_API_KEY).await.map_err(ipc)?;
+    let tvdb_key = db.kv_get(TVDB_API_KEY).await.map_err(ipc)?;
+    let fanart_key = db.kv_get(FANART_API_KEY).await.map_err(ipc)?;
+
+    let tmdb = build_optional_client(tmdb_key.as_deref(), TmdbClient::new)?;
+    let tvdb = build_optional_client(tvdb_key.as_deref(), TvdbClient::new)?;
+    let fanart = build_optional_client(fanart_key.as_deref(), FanartClient::new)?;
+
+    let mut ids = parse_title_id(&title_id);
+    // Best-effort cross-id enrichment via TMDB. Failures don't block the
+    // resolve — the chain will simply skip the providers we lack ids for
+    // and fall through to placeholders.
+    if let Some(t) = tmdb.as_ref() {
+        enrich_ids(&mut ids, kind, t).await;
+    }
+
+    let artwork = fetch_and_resolve(
+        &ids,
+        kind,
+        &lang_pref,
+        fanart.as_ref(),
+        tmdb.as_ref(),
+        tvdb.as_ref(),
+    )
+    .await;
+
+    let payload = serde_json::to_string(&artwork).map_err(|e| e.to_string())?;
+    let expires_at = i64::try_from(
+        u64::try_from(now_unix_seconds())
+            .unwrap_or(0)
+            .saturating_add(ARTWORK_TTL_S),
+    )
+    .unwrap_or(i64::MAX);
+    if let Err(e) = db.cache_set(&cache_key, &payload, expires_at).await {
+        tracing::warn!(error = %e, key = %cache_key, "failed to persist artwork cache");
+    }
+
+    Ok(artwork)
+}
+
+fn build_optional_client<T, F>(key: Option<&str>, ctor: F) -> Result<Option<T>, String>
+where
+    F: FnOnce(String) -> Result<T, kino_metadata::Error>,
+{
+    match key {
+        Some(k) if !k.is_empty() => Ok(Some(ctor(k.to_string()).map_err(ipc)?)),
+        _ => Ok(None),
+    }
+}
+
+/// Parse a catalog id of the form `imdb:tt...` / `tmdb:N` / `tvdb:N` or a
+/// bare `tt...` `IMDb` id into a [`TitleIds`] bag. Unknown forms (e.g.
+/// `trakt-rank:N`) yield an empty bag; the resolver will fall through to
+/// placeholders.
+fn parse_title_id(raw: &str) -> TitleIds {
+    let mut ids = TitleIds::default();
+    if let Some(rest) = raw.strip_prefix("imdb:") {
+        ids.imdb = Some(rest.to_string());
+        return ids;
+    }
+    if let Some(rest) = raw.strip_prefix("tmdb:") {
+        if let Ok(n) = rest.parse::<u64>() {
+            ids.tmdb = Some(n);
+        }
+        return ids;
+    }
+    if let Some(rest) = raw.strip_prefix("tvdb:") {
+        if let Ok(n) = rest.parse::<u64>() {
+            ids.tvdb = Some(n);
+        }
+        return ids;
+    }
+    if raw.starts_with("tt") && raw.len() > 2 {
+        ids.imdb = Some(raw.to_string());
+    }
+    ids
+}
+
+/// Fill in the IDs the parsed catalog id did not carry, using TMDB
+/// `/find` (IMDb→TMDB) and `/external_ids` (TMDB→IMDb/TVDB). Best-effort:
+/// each failure is logged at warn level and the field stays `None`.
+async fn enrich_ids(ids: &mut TitleIds, kind: TitleKind, tmdb: &TmdbClient) {
+    // IMDb known but TMDB missing → /find.
+    if ids.tmdb.is_none() {
+        if let Some(imdb) = ids.imdb.clone() {
+            match tmdb.find_by_external_id(kind, "imdb_id", &imdb).await {
+                Ok(Some(n)) => ids.tmdb = Some(n),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(error = %e, imdb, "tmdb /find failed"),
+            }
+        } else if let Some(tvdb_id) = ids.tvdb {
+            match tmdb
+                .find_by_external_id(kind, "tvdb_id", &tvdb_id.to_string())
+                .await
+            {
+                Ok(Some(n)) => ids.tmdb = Some(n),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(error = %e, tvdb_id, "tmdb /find failed"),
+            }
+        }
+    }
+    // TMDB known → /external_ids to fill IMDb / TVDB.
+    if let Some(tmdb_id) = ids.tmdb {
+        if ids.imdb.is_none() || ids.tvdb.is_none() {
+            match tmdb.fetch_external_ids(kind, tmdb_id).await {
+                Ok(external) => {
+                    if ids.imdb.is_none() {
+                        ids.imdb = external.imdb;
+                    }
+                    if ids.tvdb.is_none() {
+                        ids.tvdb = external.tvdb;
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, tmdb_id, "tmdb /external_ids failed"),
+            }
+        }
+    }
+}
+
+fn now_unix_seconds() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,5 +466,41 @@ mod tests {
         assert_eq!(s.len(), 10);
         assert_eq!(&s[4..5], "-");
         assert_eq!(&s[7..8], "-");
+    }
+
+    #[test]
+    fn parse_title_id_handles_each_prefix() {
+        let ids = parse_title_id("imdb:tt0133093");
+        assert_eq!(ids.imdb.as_deref(), Some("tt0133093"));
+        assert_eq!(ids.tmdb, None);
+        assert_eq!(ids.tvdb, None);
+
+        let ids = parse_title_id("tmdb:603");
+        assert_eq!(ids.tmdb, Some(603));
+
+        let ids = parse_title_id("tvdb:78878");
+        assert_eq!(ids.tvdb, Some(78_878));
+
+        // Bare IMDb id.
+        let ids = parse_title_id("tt0944947");
+        assert_eq!(ids.imdb.as_deref(), Some("tt0944947"));
+    }
+
+    #[test]
+    fn parse_title_id_rejects_unknown_prefix() {
+        let ids = parse_title_id("trakt-rank:7");
+        assert_eq!(ids.imdb, None);
+        assert_eq!(ids.tmdb, None);
+        assert_eq!(ids.tvdb, None);
+
+        // `tt` prefix without numbers stays unparsed too.
+        let ids = parse_title_id("tt");
+        assert_eq!(ids.imdb, None);
+    }
+
+    #[test]
+    fn parse_title_id_rejects_non_numeric_tmdb() {
+        let ids = parse_title_id("tmdb:abc");
+        assert_eq!(ids.tmdb, None);
     }
 }

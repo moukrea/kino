@@ -10,6 +10,7 @@
 
 use serde::Deserialize;
 
+use crate::artwork::{LangAsset, LangText, ProviderArtBundle, TitleIds};
 use crate::error::Error;
 use crate::http::{fetch_with_retry, HttpConfig};
 use crate::trending::ProviderItem;
@@ -18,8 +19,26 @@ use kino_core::title::{TitleKind, TitleSummary};
 /// Production TMDB base URL.
 pub const TMDB_BASE_URL: &str = "https://api.themoviedb.org";
 
+/// Production TMDB image CDN base URL. PRD §F-005 image URLs are built by
+/// concatenating this with a `<size>/<path>` suffix.
+pub const TMDB_IMAGE_BASE_URL: &str = "https://image.tmdb.org/t/p";
+
 /// Maximum trending items the F-004 aggregator asks for per provider.
 const TRENDING_LIMIT: usize = 100;
+
+/// TMDB image size used for poster artwork. `w500` is the widely cited
+/// home-screen default; the F-008 tile spec (240×360 reference) sits well
+/// within `w500` so we get one cache-friendly variant for every tile.
+const TMDB_POSTER_SIZE: &str = "w500";
+
+/// TMDB image size used for backdrops. `w1280` covers the title-detail
+/// hero (F-010) and any responsive tile that scales up.
+const TMDB_BACKDROP_SIZE: &str = "w1280";
+
+/// TMDB image size used for logos / clearart. `original` is the safe pick
+/// because logos are PNG with transparency at variable native sizes; TMDB
+/// recommends transforming at render time.
+const TMDB_LOGO_SIZE: &str = "original";
 
 /// TMDB v3 API client.
 #[derive(Debug, Clone)]
@@ -84,6 +103,106 @@ impl TmdbClient {
     /// See [`trending_movies`](Self::trending_movies) for the locale rules.
     pub async fn trending_shows(&self, locale: &str) -> Result<Vec<ProviderItem>, Error> {
         self.fetch_trending("tv", locale, TitleKind::Series).await
+    }
+
+    /// Fetch the F-005 image + summary bundle for one title.
+    ///
+    /// Issues a single `/3/{type}/{id}?append_to_response=images,translations`
+    /// request with `include_image_language=null,*` so the response carries
+    /// every language-tagged image AND the language-agnostic ones in one
+    /// shot, plus a `translations` block with the `overview` text per
+    /// language. The resolver consumes the resulting [`ProviderArtBundle`].
+    pub async fn fetch_art_bundle(
+        &self,
+        kind: TitleKind,
+        id: u64,
+    ) -> Result<ProviderArtBundle, Error> {
+        let media_type = match kind {
+            TitleKind::Movie => "movie",
+            TitleKind::Series => "tv",
+        };
+        let url = format!("{}/3/{media_type}/{id}", self.base_url);
+        let response = fetch_with_retry(
+            || {
+                self.client.get(&url).query(&[
+                    ("api_key", self.key.as_str()),
+                    ("append_to_response", "images,translations"),
+                    ("include_image_language", "null,*"),
+                ])
+            },
+            &self.config,
+        )
+        .await?;
+        let raw: ArtBundleResponse = response
+            .json()
+            .await
+            .map_err(|e| Error::Decode(format!("tmdb {media_type} {id} bundle: {e}")))?;
+        Ok(raw.into_bundle(kind))
+    }
+
+    /// Fetch the external-id bag for a title (PRD §F-005 ID resolution).
+    ///
+    /// Returns whatever subset of `IMDb` / TVDB ids TMDB knows about. Used
+    /// by the host command to enrich a catalog id that arrives with only
+    /// a TMDB id (so Fanart.tv / TVDB lookups can still proceed).
+    pub async fn fetch_external_ids(&self, kind: TitleKind, id: u64) -> Result<TitleIds, Error> {
+        let media_type = match kind {
+            TitleKind::Movie => "movie",
+            TitleKind::Series => "tv",
+        };
+        let url = format!("{}/3/{media_type}/{id}/external_ids", self.base_url);
+        let response = fetch_with_retry(
+            || {
+                self.client
+                    .get(&url)
+                    .query(&[("api_key", self.key.as_str())])
+            },
+            &self.config,
+        )
+        .await?;
+        let raw: ExternalIdsResponse = response
+            .json()
+            .await
+            .map_err(|e| Error::Decode(format!("tmdb {media_type} {id} external_ids: {e}")))?;
+        Ok(TitleIds {
+            imdb: raw.imdb_id.filter(|s| !s.is_empty()),
+            tmdb: Some(id),
+            tvdb: raw.tvdb_id,
+        })
+    }
+
+    /// Resolve a non-TMDB id (`IMDb` or TVDB) into the TMDB equivalent via
+    /// `/3/find/{external_id}?external_source=imdb_id|tvdb_id`.
+    ///
+    /// Returns the first matching TMDB id of the requested kind, or `None`
+    /// if no match exists. PRD §F-004 step 2 explicitly carves space for
+    /// this path: "Items without `IMDb` ID resolved via TMDB /find when
+    /// possible, else dropped."
+    pub async fn find_by_external_id(
+        &self,
+        kind: TitleKind,
+        external_source: &str,
+        external_id: &str,
+    ) -> Result<Option<u64>, Error> {
+        let url = format!("{}/3/find/{external_id}", self.base_url);
+        let response = fetch_with_retry(
+            || {
+                self.client.get(&url).query(&[
+                    ("api_key", self.key.as_str()),
+                    ("external_source", external_source),
+                ])
+            },
+            &self.config,
+        )
+        .await?;
+        let raw: FindResponse = response.json().await.map_err(|e| {
+            Error::Decode(format!("tmdb find {external_source}/{external_id}: {e}"))
+        })?;
+        let pick = match kind {
+            TitleKind::Movie => raw.movie_results,
+            TitleKind::Series => raw.tv_results,
+        };
+        Ok(pick.into_iter().next().map(|m| m.id))
     }
 
     async fn fetch_trending(
@@ -184,13 +303,167 @@ fn parse_year(date: &str) -> Option<u16> {
     year_str.parse::<u16>().ok()
 }
 
-/// Build a TMDB poster URL at the `w500` size. The F-005 image resolver will
-/// replace this with the proper provider-fallback chain; until then the
-/// catalog UI gets a useful poster placeholder straight from the trending
-/// fetch.
+/// Build a TMDB poster URL at the `w500` size. The F-005 image resolver
+/// reuses this via [`build_image_url`] for consistency.
 fn tmdb_poster_url(path: &str) -> String {
+    build_image_url(TMDB_POSTER_SIZE, path)
+}
+
+/// Build a TMDB CDN URL at the requested size for the given image path.
+/// Empty paths return an empty string so the resolver can skip them.
+fn build_image_url(size: &str, path: &str) -> String {
     let trimmed = path.trim_start_matches('/');
-    format!("https://image.tmdb.org/t/p/w500/{trimmed}")
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    format!("{TMDB_IMAGE_BASE_URL}/{size}/{trimmed}")
+}
+
+/// `/3/{type}/{id}?append_to_response=images,translations` envelope.
+/// Trimmed to the fields F-005 needs.
+#[derive(Debug, Deserialize)]
+struct ArtBundleResponse {
+    #[serde(default)]
+    overview: Option<String>,
+    /// TMDB's `original_language` is a 2-letter ISO 639-1 code attached to
+    /// the title in its origin language. Used as the lang tag for the
+    /// `overview` field above (TMDB's per-language `overview` is the
+    /// origin-language summary when no `language=...` query param narrows
+    /// it).
+    #[serde(default)]
+    original_language: Option<String>,
+    #[serde(default)]
+    images: Option<ImageBlock>,
+    #[serde(default)]
+    translations: Option<TranslationsBlock>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ImageBlock {
+    #[serde(default)]
+    posters: Vec<ImageEntry>,
+    #[serde(default)]
+    backdrops: Vec<ImageEntry>,
+    #[serde(default)]
+    logos: Vec<ImageEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImageEntry {
+    file_path: String,
+    #[serde(default)]
+    iso_639_1: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TranslationsBlock {
+    #[serde(default)]
+    translations: Vec<Translation>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Translation {
+    /// 2-letter ISO 639-1 code, occasionally absent.
+    #[serde(default)]
+    iso_639_1: Option<String>,
+    data: TranslationData,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TranslationData {
+    #[serde(default)]
+    overview: Option<String>,
+}
+
+impl ArtBundleResponse {
+    fn into_bundle(self, _kind: TitleKind) -> ProviderArtBundle {
+        let images = self.images.unwrap_or_default();
+        let posters = images
+            .posters
+            .into_iter()
+            .map(|e| into_asset(e, TMDB_POSTER_SIZE))
+            .filter(|a| !a.url.is_empty())
+            .collect();
+        let backdrops = images
+            .backdrops
+            .into_iter()
+            .map(|e| into_asset(e, TMDB_BACKDROP_SIZE))
+            .filter(|a| !a.url.is_empty())
+            .collect();
+        let logos = images
+            .logos
+            .into_iter()
+            .map(|e| into_asset(e, TMDB_LOGO_SIZE))
+            .filter(|a| !a.url.is_empty())
+            .collect();
+        // TMDB does not surface a dedicated "clearart" category; the F-005
+        // chain falls through to TVDB / Fanart for that field.
+        let clearart = Vec::new();
+
+        let mut summaries = Vec::new();
+        // The top-level `overview` is the origin-language overview when no
+        // `language=` param narrowed the response. Tag it with the title's
+        // `original_language` so the resolver can match the user's lang
+        // preference against it.
+        if let Some(text) = self.overview.filter(|t| !t.is_empty()) {
+            summaries.push(LangText {
+                lang: self.original_language.unwrap_or_default(),
+                text,
+            });
+        }
+        if let Some(t) = self.translations {
+            for tr in t.translations {
+                let text = tr.data.overview.unwrap_or_default();
+                if text.is_empty() {
+                    continue;
+                }
+                let lang = tr.iso_639_1.unwrap_or_default();
+                // Skip duplicates of the top-level overview entry.
+                if summaries.iter().any(|s| s.lang == lang && s.text == text) {
+                    continue;
+                }
+                summaries.push(LangText { lang, text });
+            }
+        }
+        ProviderArtBundle {
+            posters,
+            backdrops,
+            logos,
+            clearart,
+            summaries,
+        }
+    }
+}
+
+fn into_asset(e: ImageEntry, size: &str) -> LangAsset {
+    LangAsset {
+        lang: e.iso_639_1.unwrap_or_default(),
+        url: build_image_url(size, &e.file_path),
+    }
+}
+
+/// `/3/{type}/{id}/external_ids` envelope.
+#[derive(Debug, Deserialize)]
+struct ExternalIdsResponse {
+    #[serde(default)]
+    imdb_id: Option<String>,
+    #[serde(default)]
+    tvdb_id: Option<u64>,
+}
+
+/// `/3/find/{external_id}` envelope. TMDB returns parallel buckets per
+/// media kind; we read the one matching the caller's [`TitleKind`].
+#[derive(Debug, Deserialize)]
+struct FindResponse {
+    #[serde(default)]
+    movie_results: Vec<FindHit>,
+    #[serde(default)]
+    tv_results: Vec<FindHit>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FindHit {
+    id: u64,
 }
 
 #[cfg(test)]
@@ -441,5 +714,203 @@ mod tests {
             Error::Http { status, .. } => assert_eq!(status, 401),
             other => panic!("expected Http error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn fetch_art_bundle_parses_images_and_translations_for_movie() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/3/movie/603"))
+            .and(query_param("api_key", "test-key"))
+            .and(query_param("append_to_response", "images,translations"))
+            .and(query_param("include_image_language", "null,*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": 603,
+                "title": "The Matrix",
+                "original_language": "en",
+                "overview": "A hacker discovers the truth.",
+                "images": {
+                    "posters": [
+                        { "file_path": "/p-en.jpg", "iso_639_1": "en" },
+                        { "file_path": "/p-fr.jpg", "iso_639_1": "fr" },
+                        { "file_path": "/p-none.jpg", "iso_639_1": null }
+                    ],
+                    "backdrops": [
+                        { "file_path": "/b.jpg", "iso_639_1": null }
+                    ],
+                    "logos": [
+                        { "file_path": "/logo-en.png", "iso_639_1": "en" }
+                    ]
+                },
+                "translations": {
+                    "translations": [
+                        {
+                            "iso_639_1": "fr",
+                            "data": { "overview": "Un hacker découvre la vérité." }
+                        },
+                        {
+                            "iso_639_1": "de",
+                            "data": { "overview": "" }
+                        }
+                    ]
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client =
+            TmdbClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let bundle = client
+            .fetch_art_bundle(TitleKind::Movie, 603)
+            .await
+            .unwrap();
+        assert_eq!(bundle.posters.len(), 3);
+        assert_eq!(bundle.posters[0].lang, "en");
+        assert_eq!(
+            bundle.posters[0].url,
+            "https://image.tmdb.org/t/p/w500/p-en.jpg"
+        );
+        assert_eq!(bundle.posters[2].lang, "");
+        assert_eq!(bundle.backdrops.len(), 1);
+        assert_eq!(
+            bundle.backdrops[0].url,
+            "https://image.tmdb.org/t/p/w1280/b.jpg"
+        );
+        assert_eq!(bundle.logos.len(), 1);
+        assert_eq!(
+            bundle.logos[0].url,
+            "https://image.tmdb.org/t/p/original/logo-en.png"
+        );
+        assert!(bundle.clearart.is_empty(), "TMDB does not serve clearart");
+
+        // Top-level overview tagged with original_language; French
+        // translation present; empty German translation dropped.
+        assert_eq!(bundle.summaries.len(), 2);
+        let en = bundle.summaries.iter().find(|s| s.lang == "en").unwrap();
+        assert_eq!(en.text, "A hacker discovers the truth.");
+        let fr = bundle.summaries.iter().find(|s| s.lang == "fr").unwrap();
+        assert_eq!(fr.text, "Un hacker découvre la vérité.");
+    }
+
+    #[tokio::test]
+    async fn fetch_art_bundle_uses_tv_endpoint_for_series() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/3/tv/1399"))
+            .and(query_param("append_to_response", "images,translations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": 1399,
+                "name": "Game of Thrones",
+                "original_language": "en",
+                "overview": "Seven noble families.",
+                "images": { "posters": [], "backdrops": [], "logos": [] }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client =
+            TmdbClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let bundle = client
+            .fetch_art_bundle(TitleKind::Series, 1399)
+            .await
+            .unwrap();
+        assert_eq!(bundle.summaries.len(), 1);
+        assert_eq!(bundle.summaries[0].lang, "en");
+    }
+
+    #[tokio::test]
+    async fn fetch_external_ids_returns_imdb_and_tvdb() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/3/movie/603/external_ids"))
+            .and(query_param("api_key", "test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": 603,
+                "imdb_id": "tt0133093",
+                "tvdb_id": 12345
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client =
+            TmdbClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let ids = client
+            .fetch_external_ids(TitleKind::Movie, 603)
+            .await
+            .unwrap();
+        assert_eq!(ids.imdb.as_deref(), Some("tt0133093"));
+        assert_eq!(ids.tmdb, Some(603));
+        assert_eq!(ids.tvdb, Some(12_345));
+    }
+
+    #[tokio::test]
+    async fn fetch_external_ids_handles_missing_fields() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/3/movie/999/external_ids"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": 999,
+                "imdb_id": ""
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client =
+            TmdbClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let ids = client
+            .fetch_external_ids(TitleKind::Movie, 999)
+            .await
+            .unwrap();
+        assert!(ids.imdb.is_none(), "empty imdb_id normalized to None");
+        assert!(ids.tvdb.is_none());
+    }
+
+    #[tokio::test]
+    async fn find_by_external_id_resolves_imdb_to_tmdb() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/3/find/tt0133093"))
+            .and(query_param("external_source", "imdb_id"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "movie_results": [{ "id": 603 }],
+                "tv_results": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client =
+            TmdbClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let id = client
+            .find_by_external_id(TitleKind::Movie, "imdb_id", "tt0133093")
+            .await
+            .unwrap();
+        assert_eq!(id, Some(603));
+    }
+
+    #[tokio::test]
+    async fn find_by_external_id_returns_none_when_kind_mismatches() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/3/find/tt0944947"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "movie_results": [],
+                "tv_results": [{ "id": 1399 }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client =
+            TmdbClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let id = client
+            .find_by_external_id(TitleKind::Movie, "imdb_id", "tt0944947")
+            .await
+            .unwrap();
+        assert_eq!(id, None, "movie kind ignored the tv_results bucket");
     }
 }

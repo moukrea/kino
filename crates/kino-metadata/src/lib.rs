@@ -15,6 +15,7 @@
 //! the missing key when one isn't configured. The setup wizard (F-016) is
 //! responsible for asking the user to fill these in.
 
+pub mod artwork;
 pub mod error;
 pub mod fanart;
 pub mod http;
@@ -23,6 +24,10 @@ pub mod trakt;
 pub mod trending;
 pub mod tvdb;
 
+pub use artwork::{
+    fetch_and_resolve, lang_chain_hash, resolve, ArtField, ArtKind, Artwork, LangAsset, LangText,
+    ProviderArtBundle, SummaryField, TitleIds,
+};
 pub use error::Error;
 pub use fanart::FanartClient;
 pub use http::{HttpConfig, USER_AGENT};
