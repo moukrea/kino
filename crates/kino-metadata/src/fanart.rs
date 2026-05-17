@@ -13,7 +13,7 @@ use serde::Deserialize;
 
 use crate::artwork::{LocalizedAsset, ProviderBundle};
 use crate::error::Error;
-use crate::http::{fetch_with_retry, HttpConfig};
+use kino_core::http::{fetch_with_retry, HttpConfig};
 
 /// Production Fanart.tv v3 base URL.
 pub const FANART_BASE_URL: &str = "https://webservice.fanart.tv";

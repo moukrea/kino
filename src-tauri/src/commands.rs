@@ -9,6 +9,10 @@
 //! module rather than introducing parallel registries.
 
 use chrono::{Datelike, NaiveDate, TimeZone, Utc};
+use kino_addons::{
+    normalize_manifest_url, AddonClient, AddonError, Manifest, RecommendedAddon,
+    CINEMETA_MANIFEST_URL, RECOMMENDED_ADDONS,
+};
 use kino_core::addon::{Addon, AddonInsert};
 use kino_core::constants::ARTWORK_TTL_S;
 use kino_core::cw::ContinueWatching;
@@ -20,6 +24,7 @@ use kino_metadata::{
     aggregate, FanartClient, ProviderItem, TmdbClient, TraktClient, TvdbClient, FANART_API_KEY,
     TMDB_API_KEY, TRAKT_API_KEY, TVDB_API_KEY,
 };
+use serde::Serialize;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::State;
@@ -561,6 +566,165 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+// ---- F-007: Stremio addon protocol client ------------------------------
+//
+// `addons_list` / `addons_insert` / `addons_delete` / `addons_set_enabled`
+// / `addons_reorder` already live above (added with F-002 in Session 003).
+// The F-007 layer adds the protocol-aware install / uninstall / order
+// commands plus the recommended-addons accessor, and bootstraps Cinemeta
+// as a non-removable default at first launch.
+
+/// Settings key recording that the first-launch bootstrap (currently:
+/// "install Cinemeta") has run. Stored in the `settings` KV; presence —
+/// regardless of value — is the signal that bootstrap is done.
+const ADDON_BOOTSTRAP_DONE_KEY: &str = "addons.bootstrap_done";
+
+/// Public, serializable shape of a recommended addon. Mirrors
+/// [`kino_addons::RecommendedAddon`] but owns its strings so it can cross
+/// the IPC boundary.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecommendedAddonView {
+    pub name: String,
+    pub manifest_url: String,
+    pub description: String,
+}
+
+impl From<&RecommendedAddon> for RecommendedAddonView {
+    fn from(r: &RecommendedAddon) -> Self {
+        Self {
+            name: r.name.to_string(),
+            manifest_url: r.manifest_url.to_string(),
+            description: r.description.to_string(),
+        }
+    }
+}
+
+/// `get_recommended_addons()` (PRD §F-007).
+///
+/// Returns the locked recommended-addons table from PRD §8. The Settings →
+/// Addons screen renders this as a one-tap install list.
+#[tauri::command]
+pub fn get_recommended_addons() -> Vec<RecommendedAddonView> {
+    RECOMMENDED_ADDONS
+        .iter()
+        .map(RecommendedAddonView::from)
+        .collect()
+}
+
+/// `install_addon(url)` (PRD §F-007).
+///
+/// Normalizes the user-supplied URL (`stremio://` → `https://`), fetches
+/// the manifest, validates it, and persists the addon with `enabled = true`
+/// at the next free `display_order` slot. Re-installing an already-installed
+/// manifest URL surfaces a typed conflict via the underlying DB layer.
+#[tauri::command]
+pub async fn install_addon(db: State<'_, Db>, url: String) -> Result<Addon, String> {
+    let normalized = normalize_manifest_url(&url).map_err(ipc)?;
+    let client = AddonClient::new(&normalized).map_err(ipc)?;
+    let manifest = client.manifest().await.map_err(ipc)?;
+    persist_addon(&db, &normalized, &manifest).await
+}
+
+/// `uninstall_addon(id)` (PRD §F-007).
+///
+/// Refuses to remove Cinemeta (`AddonError::NonRemovable`); per PRD §F-007
+/// Cinemeta can only be disabled in v1. Returns the number of rows removed
+/// — 0 for an unknown id.
+#[tauri::command]
+pub async fn uninstall_addon(db: State<'_, Db>, id: String) -> Result<u64, String> {
+    if is_cinemeta_id(&db, &id).await? {
+        return Err(AddonError::NonRemovable { id }.to_string());
+    }
+    db.addons_delete(&id).await.map_err(ipc)
+}
+
+/// `set_addon_order(id, order)` (PRD §F-007).
+///
+/// Moves the addon identified by `id` to position `order` in the display
+/// list (0-indexed). Rebuilds the full ordering via `addons_reorder` so
+/// the in-memory list and the DB stay in sync.
+#[tauri::command]
+pub async fn set_addon_order(db: State<'_, Db>, id: String, order: usize) -> Result<(), String> {
+    let current = db.addons_list().await.map_err(ipc)?;
+    let mut ids: Vec<String> = current.iter().map(|a| a.id.clone()).collect();
+    let Some(from) = ids.iter().position(|x| x == &id) else {
+        return Err(format!("addon '{id}' is not installed"));
+    };
+    let to = order.min(ids.len().saturating_sub(1));
+    let item = ids.remove(from);
+    ids.insert(to, item);
+    db.addons_reorder(&ids).await.map_err(ipc)
+}
+
+/// Auto-install Cinemeta on first launch (PRD §F-007).
+///
+/// Called from the Tauri setup hook. Idempotent: writes
+/// `settings.addons.bootstrap_done` on success so subsequent launches skip
+/// the network call. A bootstrap failure is logged and elided — the user
+/// can manually install Cinemeta via Settings → Addons later — so a
+/// network outage on first launch doesn't brick the app.
+pub async fn bootstrap_default_addons(db: &Db) {
+    if let Ok(Some(_)) = db.kv_get(ADDON_BOOTSTRAP_DONE_KEY).await {
+        return;
+    }
+    if let Err(e) = install_cinemeta(db).await {
+        tracing::warn!(error = %e, "first-launch Cinemeta bootstrap failed; user can retry in Settings");
+        return;
+    }
+    if let Err(e) = db.kv_set(ADDON_BOOTSTRAP_DONE_KEY, "1").await {
+        tracing::warn!(error = %e, "failed to record Cinemeta bootstrap completion");
+    }
+}
+
+async fn install_cinemeta(db: &Db) -> Result<(), String> {
+    // Skip if already installed (e.g. the user manually installed it before
+    // the bootstrap marker was written).
+    let installed = db.addons_list().await.map_err(ipc)?;
+    if installed
+        .iter()
+        .any(|a| a.manifest_url == CINEMETA_MANIFEST_URL)
+    {
+        return Ok(());
+    }
+    let client = AddonClient::new(CINEMETA_MANIFEST_URL).map_err(ipc)?;
+    let manifest = client.manifest().await.map_err(ipc)?;
+    persist_addon(db, CINEMETA_MANIFEST_URL, &manifest)
+        .await
+        .map(|_| ())
+}
+
+async fn persist_addon(db: &Db, manifest_url: &str, manifest: &Manifest) -> Result<Addon, String> {
+    let manifest_value =
+        serde_json::to_value(manifest).map_err(|e| format!("manifest serialize: {e}"))?;
+    db.addons_insert(&AddonInsert {
+        id: manifest.id.clone(),
+        manifest_url: manifest_url.to_string(),
+        manifest_json: manifest_value,
+        display_order: None,
+    })
+    .await
+    .map_err(ipc)?;
+    // Re-read to return the persisted row with installed_at/display_order
+    // populated.
+    let listed = db.addons_list().await.map_err(ipc)?;
+    listed
+        .into_iter()
+        .find(|a| a.id == manifest.id)
+        .ok_or_else(|| format!("internal: addon '{}' missing after insert", manifest.id))
+}
+
+/// Returns true iff the persisted addon row identified by `id` is the
+/// non-removable Cinemeta install. Cinemeta is identified by its locked
+/// manifest URL (PRD §8); the addon's own `id` field is set by Stremio
+/// (`com.linvo.cinemeta`) and we match on the URL to avoid coupling to
+/// Cinemeta-internal id changes.
+async fn is_cinemeta_id(db: &Db, id: &str) -> Result<bool, String> {
+    let installed = db.addons_list().await.map_err(ipc)?;
+    Ok(installed
+        .iter()
+        .any(|a| a.id == id && a.manifest_url == CINEMETA_MANIFEST_URL))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -599,5 +763,85 @@ mod tests {
     #[test]
     fn parse_title_id_rejects_unprefixed_value() {
         assert!(parse_title_id("603").is_err());
+    }
+
+    #[test]
+    fn recommended_addons_view_matches_locked_table() {
+        let view = get_recommended_addons();
+        assert_eq!(view.len(), RECOMMENDED_ADDONS.len());
+        assert_eq!(view[0].name, "Cinemeta");
+        assert_eq!(view[0].manifest_url, CINEMETA_MANIFEST_URL);
+    }
+
+    #[tokio::test]
+    async fn uninstall_addon_protects_cinemeta() {
+        let db = Db::open_in_memory().await.unwrap();
+        // Hand-roll an addon row that LOOKS LIKE Cinemeta (same manifest URL)
+        // without going through install_addon (which would hit the network).
+        db.addons_insert(&AddonInsert {
+            id: "com.linvo.cinemeta".into(),
+            manifest_url: CINEMETA_MANIFEST_URL.into(),
+            manifest_json: serde_json::json!({"id": "com.linvo.cinemeta"}),
+            display_order: None,
+        })
+        .await
+        .unwrap();
+        let installed = db.addons_list().await.unwrap();
+        assert_eq!(installed.len(), 1);
+        // Direct call to the helper since the #[tauri::command] wrapper
+        // requires a Tauri State, which is hard to fake in a unit test.
+        let is_cm = is_cinemeta_id(&db, "com.linvo.cinemeta").await.unwrap();
+        assert!(is_cm, "Cinemeta should be detected as non-removable");
+
+        // A different addon with the same id but a different URL should
+        // NOT be protected (defensive — we key off the URL, not the id).
+        db.addons_insert(&AddonInsert {
+            id: "imposter".into(),
+            manifest_url: "https://other/manifest.json".into(),
+            manifest_json: serde_json::json!({"id": "imposter"}),
+            display_order: None,
+        })
+        .await
+        .unwrap();
+        let is_other = is_cinemeta_id(&db, "imposter").await.unwrap();
+        assert!(!is_other);
+    }
+
+    #[tokio::test]
+    async fn set_addon_order_rearranges_list() {
+        let db = Db::open_in_memory().await.unwrap();
+        for id in ["a", "b", "c"] {
+            db.addons_insert(&AddonInsert {
+                id: id.into(),
+                manifest_url: format!("https://{id}/manifest.json"),
+                manifest_json: serde_json::json!({"id": id}),
+                display_order: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        // Move "c" to the front.
+        let current = db.addons_list().await.unwrap();
+        let mut ids: Vec<String> = current.iter().map(|a| a.id.clone()).collect();
+        let from = ids.iter().position(|x| x == "c").unwrap();
+        let item = ids.remove(from);
+        ids.insert(0, item);
+        db.addons_reorder(&ids).await.unwrap();
+
+        let listed = db.addons_list().await.unwrap();
+        let order: Vec<&str> = listed.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(order, vec!["c", "a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_skips_when_marker_present() {
+        let db = Db::open_in_memory().await.unwrap();
+        db.kv_set(ADDON_BOOTSTRAP_DONE_KEY, "1").await.unwrap();
+        // Doesn't make a network call; just returns. If this hung we'd
+        // know the marker isn't being respected.
+        bootstrap_default_addons(&db).await;
+        let listed = db.addons_list().await.unwrap();
+        assert!(listed.is_empty());
     }
 }

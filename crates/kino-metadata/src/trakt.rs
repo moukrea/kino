@@ -7,8 +7,8 @@
 use serde::Deserialize;
 
 use crate::error::Error;
-use crate::http::{fetch_with_retry, HttpConfig};
 use crate::trending::ProviderItem;
+use kino_core::http::{fetch_with_retry, HttpConfig};
 use kino_core::title::{TitleKind, TitleSummary};
 
 /// Production Trakt v2 base URL.

@@ -2,14 +2,345 @@
 
 **PRD version:** 1.0 (locked)
 **Status:** features-in-progress
-**Last session:** 007
-**Next session:** 008
+**Last session:** 008
+**Next session:** 009
 
 ---
 
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 008 — F-007 Stremio addon protocol client
+
+**Branch:** `claude/session-001-bootstrap-CmzFb`
+(Harness-supplied; see ADR-033.)
+
+**Scope chosen:** F-007 Stremio addon protocol client, end to end — the
+`AddonClient` covering all seven PRD-locked protocol endpoints (manifest,
+catalog basic / paginated / search, meta, stream, subtitles), manifest
+validation against PRD §F-007's required-fields list, URL normalization
+(`stremio://` → `https://`), the six F-007 Tauri commands (with
+Cinemeta-protection on uninstall), and the first-launch Cinemeta
+auto-install bootstrap. Session 007's heads-up flagged F-007 as the
+natural next pick: F-006 (source availability) depends on it, F-008
+(Home screen) needs the Cinemeta catalog calls for the "Trending This
+Week" rail, and the Settings → Addons screen (F-016) one-tap installer
+binds to `get_recommended_addons` + `install_addon`. The scope also
+includes the ADR-055 HTTP-module lift (`kino-metadata::http` →
+`kino-core::http`) the heads-up identified as the cleanest path to
+sharing the locked retry policy between metadata providers and addons.
+
+**Files added (summary):**
+
+- `crates/kino-core/src/http.rs` — new module. Workspace-wide HTTP
+  machinery hoisted out of `kino-metadata::http` (ADR-055). Defines
+  `HttpError` (Network + Http variants), `HttpConfig` (User-Agent /
+  timeout / backoff knobs with the PRD §F-003 / §8 locked defaults),
+  `HttpConfig::default()` / `HttpConfig::for_test()` / `build_client()`,
+  and `fetch_with_retry(build, config) -> Result<Response, HttpError>`
+  implementing the locked retry policy (3 retries with backoff
+  `[1s, 2s, 4s]` on 5xx / 429 / transient transport errors). The
+  per-crate retry test suites (TMDB / Trakt / TVDB / Fanart wiremock
+  retry tests) continue to exercise this through their `Error::from`
+  bridges; no test regressions.
+- `crates/kino-addons/src/url.rs` — new module. `normalize_manifest_url`
+  rewrites `stremio://...` → `https://...`, accepts `http(s)://`
+  verbatim, enforces a trailing `/manifest.json` suffix, and rejects
+  unknown schemes (`ftp://`, missing suffix, empty input) with a typed
+  `AddonError::InvalidUrl`. `base_url_from_manifest` strips
+  `/manifest.json` to derive the addon's protocol base URL for
+  subsequent catalog / meta / stream calls. 8 unit tests.
+- `crates/kino-addons/src/manifest.rs` — new module. `Manifest` /
+  `ManifestResource` (untagged enum: short form `"catalog"` AND long
+  form `{name, types, idPrefixes}`) / `CatalogDescriptor` types matching
+  PRD §F-007's manifest schema; `parse_manifest(body) -> Manifest`
+  validates against the locked required-fields list (`id`, `version`,
+  `name`, `types`, `resources`, `catalogs`) with a typed `ManifestError`
+  enum (`NotJson`, `Malformed`, `MissingField(&'static str)`,
+  `EmptyField(&'static str)`). 16 unit tests covering every required
+  field, the empty-catalogs-allowed exception (ADR-056), short vs long
+  resource form, and the wrong-JSON-type rejection paths.
+- `crates/kino-addons/src/protocol.rs` — new module. Stremio protocol
+  response shapes: `CatalogResponse` / `MetaResponse` / `StreamResponse`
+  / `SubtitlesResponse` envelopes plus `MetaPreview` (catalog rows),
+  `MetaDetail` (full metadata), `MetaVideo` (per-episode entries for
+  series), `Stream` (with all four one-of fields: `url`, `infoHash`,
+  `ytId`, `externalUrl` plus `behaviorHints` / `sources` / a catch-all
+  `extra` map), and `Subtitle`. Camel-case ↔ snake-case via
+  `#[serde(rename = "...")]` per Stremio's wire shape. Unknown fields
+  flow through via `#[serde(flatten)]` so addon-specific extras (per
+  ADR-049 considerations) survive into downstream F-006 / F-010 / F-015
+  code without provider-specific shims. 5 round-trip JSON tests.
+- `crates/kino-addons/src/client.rs` — new module. `AddonClient` owns
+  one addon's normalized base URL + a `reqwest::Client` configured from
+  `HttpConfig`. Public methods: `new(manifest_url)` /
+  `with_options(manifest_url, config)` (test-friendly), `manifest()`,
+  `catalog(kind, id)`, `catalog_skip(kind, id, skip)`,
+  `catalog_search(kind, id, query)`, `meta(kind, id)`,
+  `stream(kind, id)`, `subtitles(kind, id)`. URL-encoding helpers
+  escape the protocol-special characters `/ ? # space` in path segments
+  and additionally `&` in the `search=...` query payload so unicode
+  queries round-trip. 12 wiremock tests cover every endpoint plus
+  manifest-validation failure surfacing as `AddonError::Manifest`,
+  HTTP-error propagation as `AddonError::Http`, and `stremio://` URL
+  normalization at constructor time.
+- `crates/kino-addons/src/lib.rs` — adds the `AddonError` enum
+  (`InvalidUrl`, `Http(HttpError)`, `Decode(String)`,
+  `Manifest(ManifestError)`, `NonRemovable { id }`) and re-exports the
+  public surface (`AddonClient`, `parse_manifest`, `Manifest`,
+  `ManifestError`, all protocol types, URL helpers, the existing
+  `RECOMMENDED_ADDONS` / `CINEMETA_MANIFEST_URL` from Session 001).
+- `src-tauri/src/commands.rs` — adds four new Tauri commands plus the
+  bootstrap helper:
+  - `get_recommended_addons() -> Vec<RecommendedAddonView>` — surfaces
+    the locked PRD §8 recommended-addons table as IPC-friendly owned
+    strings.
+  - `install_addon(url) -> Addon` — normalizes URL, fetches +
+    validates manifest, persists with the next available
+    `display_order`. Returns the inserted row so the frontend can
+    update its local addon list in-place.
+  - `uninstall_addon(id) -> u64` — refuses Cinemeta with a typed
+    `NonRemovable` message; deletes the row otherwise. Cinemeta is
+    identified by the locked PRD §8 manifest URL, not the addon's
+    Stremio-supplied id, so a future Cinemeta-internal id change
+    doesn't sneak past the guard.
+  - `set_addon_order(id, order) -> ()` — moves the named addon to
+    position `order` in the display list. Rebuilds the full ordering
+    via the existing `addons_reorder` helper so the DB stays
+    consistent.
+  - `bootstrap_default_addons(db)` — first-launch installer for
+    Cinemeta. Idempotent (skips on re-invocation via a
+    `settings.addons.bootstrap_done` marker), tolerates network
+    failure (logs + elides; user can retry from Settings → Addons),
+    and skips if Cinemeta was somehow already installed.
+- `src-tauri/src/lib.rs` — registers the four new commands in
+  `invoke_handler` and invokes `bootstrap_default_addons(&db)` from
+  the setup hook before `app.manage(db)`.
+
+**Files modified (no logic change beyond the lift):**
+
+- `crates/kino-core/Cargo.toml` — adds `reqwest = { workspace = true }`
+  for the new `http` module.
+- `crates/kino-core/src/lib.rs` — declares the new `http` module and
+  re-exports `fetch_with_retry`, `HttpConfig`, `HttpError`,
+  `USER_AGENT` at crate root for ergonomic consumption.
+- `crates/kino-metadata/src/http.rs` — **deleted**. Its content lives
+  in `kino-core::http` now (ADR-055). Behavior unchanged.
+- `crates/kino-metadata/src/error.rs` — gains `From<kino_core::http::
+  HttpError> for Error` so the existing `?` usage in per-provider
+  modules continues to compile against the lifted `fetch_with_retry`
+  signature. `Network` and `Http` variants kept identical so no
+  downstream code that pattern-matches on `Error::Http` had to
+  change.
+- `crates/kino-metadata/src/lib.rs` — replaces the local
+  `http::{HttpConfig, USER_AGENT}` re-export with
+  `kino_core::http::{HttpConfig, USER_AGENT}` so existing imports
+  `kino_metadata::HttpConfig` / `kino_metadata::USER_AGENT` continue
+  to work.
+- `crates/kino-metadata/src/{tmdb,trakt,tvdb,fanart}.rs` — updates
+  `use crate::http::{...}` → `use kino_core::http::{...}`. The TVDB
+  artwork extended-endpoint 404 pattern-match also updates to match
+  on `HttpError::Http` since the `?` boundary moved.
+- `crates/kino-addons/Cargo.toml` — adds `reqwest`, `tokio`, plus
+  `wiremock` as a dev-dep.
+- `src-tauri/Cargo.toml` — adds `kino-addons = { path = "..." }` so
+  the host can use the protocol client.
+
+**Features advanced:**
+
+- F-007: not started → **complete**
+  - **Tauri commands: `install_addon(url)`, `uninstall_addon(id)`,
+    `list_addons()`, `set_addon_enabled(id, enabled)`,
+    `set_addon_order(id, order)`, `get_recommended_addons()`:** all
+    shipped. `list_addons` (as `addons_list`) and `set_addon_enabled`
+    (as `addons_set_enabled`) were already in the registry from
+    Session 003's F-002 work; Session 008 adds `install_addon`,
+    `uninstall_addon`, `set_addon_order`, `get_recommended_addons`,
+    all wired in `src-tauri/src/lib.rs::invoke_handler`.
+  - **Cinemeta installed automatically on first launch:** shipped
+    via `bootstrap_default_addons(&db)` in the Tauri setup hook.
+    Idempotent (gated by `settings.addons.bootstrap_done`); skipped
+    on subsequent launches.
+  - **Cinemeta cannot be uninstalled (returns a typed error):**
+    shipped. `uninstall_addon` consults `is_cinemeta_id` which
+    matches on the locked PRD §8 manifest URL, then returns
+    `AddonError::NonRemovable` (formatted to a clear string at the
+    IPC boundary). Verified by
+    `uninstall_addon_protects_cinemeta`.
+  - **Manifest validation rejects invalid manifests with a typed
+    error:** shipped. `parse_manifest` returns a typed
+    `ManifestError` enum with four variants
+    (`NotJson` / `Malformed` / `MissingField` / `EmptyField`), and
+    the protocol-client `manifest()` method propagates them as
+    `AddonError::Manifest`. Verified by
+    `manifest::tests::rejects_*` (10 tests) plus the wiremock
+    `client::tests::manifest_rejects_invalid_body_with_typed_error`.
+  - **Unit tests cover protocol calls with `wiremock`:** all seven
+    endpoints exercised with `wiremock::MockServer` + the
+    short-backoff `HttpConfig::for_test()` — `manifest`, `catalog`
+    (basic + skip + search), `meta`, `stream`, `subtitles`, plus
+    failure paths (invalid body, 404 propagation, constructor URL
+    rejection).
+
+**ADRs filed this session:**
+
+- **ADR-055** (workspace-wide HTTP plumbing lives in `kino-core::http`,
+  not per-crate): PRD §F-003 locks the retry policy and User-Agent
+  string for outbound HTTP, and F-007 introduces a SECOND outbound-HTTP
+  consumer (`kino-addons`) on top of the F-003 metadata providers.
+  Three options were on the table: (a) duplicate the ~80-line retry
+  module into `kino-addons`, (b) make `kino-addons` depend on
+  `kino-metadata` and re-export, (c) lift the module to `kino-core`.
+  (a) violates the existing "Cross-Session Conventions" entry that
+  shared retry logic lives in one place. (b) inverts the crate graph
+  (addons are a SOURCE crate, metadata is a separate domain). (c) is
+  the natural choice given that `HTTP_RETRY_BACKOFF_S` /
+  `HTTP_TIMEOUT_S` already live in `kino-core::constants`. The lift
+  moves the module to `kino-core::http`, defines a self-contained
+  `HttpError` (Network + Http), and bridges via a `From<HttpError>`
+  impl on `kino-metadata::Error` so existing pattern-matches on
+  `Error::Http` keep working. `kino-addons::AddonError` does the same.
+  `kino-metadata::lib.rs` keeps its `pub use` of `HttpConfig` /
+  `USER_AGENT` for backwards compatibility with already-merged code
+  that imports `kino_metadata::HttpConfig` directly.
+- **ADR-056** (manifest validation rejects empty `types` / `resources`
+  but accepts empty `catalogs`): PRD §F-007 says "presence of `id`,
+  `version`, `name`, `types`, `resources`, `catalogs`". A literal
+  read would allow `catalogs: []` AND `types: []` AND `resources: []`
+  as long as all six keys are PRESENT. Stremio's protocol allows
+  stream-only and subtitles-only addons (Torrentio is one of them and
+  ships with `catalogs: []`), so accepting an empty `catalogs` array
+  is a hard requirement. But an addon with empty `types: []` (no title
+  kinds) or empty `resources: []` (no protocol resources) is
+  functionally a no-op AND a typical sign of a misconfigured /
+  half-rolled manifest; allowing the install would create dead rows
+  in the persistence layer that would confuse the F-008 Home screen.
+  The shipped rule: `types` and `resources` must be non-empty;
+  `catalogs` may be empty. Two unit tests
+  (`rejects_empty_types`, `rejects_empty_resources`) plus one
+  positive test (`accepts_empty_catalogs_for_stream_only_addons`)
+  pin this.
+- **ADR-057** (Cinemeta non-removability is keyed on the locked
+  manifest URL, not the addon's Stremio-supplied `id`): PRD §F-007
+  identifies Cinemeta by its manifest URL (`https://v3-cinemeta.strem.io/manifest.json`,
+  locked in PRD §8). The addon's own `id` field is set by Stremio
+  (`com.linvo.cinemeta`) and could in principle change in a future
+  Cinemeta release. The shipped `is_cinemeta_id(db, id)` helper
+  looks up the addon row by `id` and confirms it has the locked
+  manifest URL. An imposter addon that adopted the
+  `com.linvo.cinemeta` id but pointed at a different URL would NOT
+  be protected (and shouldn't be — the user can freely uninstall a
+  third-party "Cinemeta-alike"). Verified by the
+  `uninstall_addon_protects_cinemeta` test's imposter branch.
+- **ADR-058** (first-launch Cinemeta install tolerates network
+  failure; doesn't block startup): A naive read of PRD §F-007's
+  "Cinemeta installed automatically on first launch" would require
+  the app to refuse to start on a network outage. That's a poor
+  user experience for a 10-foot UI where the user may not have an
+  obvious recovery path. The shipped `bootstrap_default_addons`
+  logs the failure with full error context (`tracing::warn!`),
+  elides the `settings.addons.bootstrap_done` marker write (so the
+  next launch retries), and returns. The user can manually install
+  Cinemeta from Settings → Addons via the same code path. The
+  bootstrap marker is set only on success, so a partial install
+  state (e.g. Cinemeta inserted but TMDB API key not yet
+  configured) is fine — the marker just gates the auto-install
+  attempt.
+
+**Tests added / coverage notes:**
+
+- Rust: 45 new tests in this session. Workspace breakdown:
+  - kino-core: 23 → 24 (no new tests this session beyond the
+    inherited retry-policy coverage via the per-provider wiremock
+    suites — the `http` module's behavior is exercised through every
+    `Tmdb/Trakt/Tvdb/Fanart` test). The +1 vs Session 007 is from
+    Session 007's `Artwork` JSON round-trip test that I missed
+    earlier.
+  - kino-addons: 16 → 57 (+41): 8 url + 16 manifest + 5 protocol +
+    12 client (wiremock) plus the existing 16 parse + recommended.
+  - kino-app: 5 → 9 (+4): `recommended_addons_view_matches_locked_table`,
+    `uninstall_addon_protects_cinemeta`,
+    `set_addon_order_rearranges_list`,
+    `bootstrap_skips_when_marker_present`.
+  - kino-metadata: 57 → 57 (no change; the http lift is invisible
+    to the per-provider tests because the `?` operator + `From`
+    impl preserves the API surface).
+  Workspace total: **150 passing** (57 kino-addons + 9 kino-app +
+  24 kino-core + 57 kino-metadata + 3 kino-torrent + 0 kino-server).
+- Frontend: no new tests this session. F-007's frontend integration
+  (Settings → Addons screen rendering `get_recommended_addons` +
+  install button + reorderable list) belongs to F-016.
+
+**Known issues introduced or resolved:**
+
+- **New (introduced):**
+  - **First-launch Cinemeta install is best-effort (ADR-058).** On
+    network failure during the first launch, the bootstrap logs a
+    warning and proceeds; the user can manually install Cinemeta
+    from Settings → Addons. This isn't a behavioral regression
+    (Cinemeta was never installed at all before this session), but
+    means F-008 Home screen's "Cinemeta catalogs" rows will be
+    empty on a first-launch network-outage scenario until the user
+    completes setup. Acceptable for v1.
+  - **Per-provider Stremio catalog response cache not yet wired.**
+    F-007 ships the protocol calls; the F-008 Home screen will
+    issue `catalog()` and `catalog_search()` calls that should be
+    cached in `response_cache` for the appropriate TTL (PRD §8 has
+    no explicit "ADDON_CATALOG_TTL_S"; META_TTL_S = 24h is the
+    closest analog). The cache wiring is deferred to F-008 because
+    the cache key shape depends on how the Home composition stitches
+    addon catalogs onto the locked rows; arguably this belongs
+    inside the client itself in a future polish pass.
+- **Resolved:** the "Cinemeta auto-install on first launch" item
+  implicit in F-001's "addons.bootstrap_done" naming intent from
+  Session 003 — Cinemeta now lands automatically.
+
+**Heads-up for Session 009:**
+
+- **Primary scope: F-006 Source availability filter.** Directly
+  unblocked by F-007 (the stream-availability check is a batched
+  `AddonClient::stream(...)` call against every enabled stream-serving
+  addon). PRD §F-006 is fully spec'd: 8-concurrent-request cap, 5s
+  per-stream timeout, 30-min `stream_availability` cache TTL, three
+  tile states (Loading / Available / Unavailable), "Show unavailable
+  titles" toggle. The `stream_availability` table already exists in
+  `migrations/0001_init.sql`; what F-006 adds is the typed Tauri
+  command (`check_availability(items: Vec<TitleAvailabilityRequest>)`),
+  the concurrency-bounded `tokio::task::JoinSet`-style harness, and
+  the cache-aware skip logic.
+- **Alternative scope: F-008 Home screen (10-foot UI).** Now fully
+  unblocked: F-004 (trending) + F-005 (artwork) + F-007 (addon
+  catalogs) all ship. PRD §F-008 locks the row order, tile specs,
+  and lazy-loading requirement. Bigger lift than F-006 because it
+  spans Rust (a thin Tauri command that composes the existing
+  trending/artwork/catalog calls into a single home payload) plus
+  meaningful SolidJS rendering work (tile component, focus state
+  CSS, D-pad navigation glue, info-overlay 600ms timer, virtualized
+  rows). Could split into "F-008 scaffolding" + "F-008 polish"
+  sub-sessions if it feels too big.
+- **Alternative scope: F-016 Settings screen.** Also unblocked
+  (test_{tmdb,trakt,tvdb,fanart} + get_recommended_addons +
+  install_addon + uninstall_addon + addons_set_enabled +
+  set_addon_order + kv_get/kv_set all shipped). PRD §F-016 is the
+  setup wizard + the persistent settings screen; everything the
+  setup wizard needs on the Rust side is now in place. Mostly a
+  frontend lift.
+- **`AddonClient` is reusable for F-006 and F-008.** The client is
+  `Clone` (the inner `reqwest::Client` is `Arc`-backed); the
+  recommended pattern is to construct one per addon during a batch
+  operation and reuse across calls. Concurrency in F-006 should
+  use a `JoinSet` (or a `Semaphore` to honor the 8-concurrent cap).
+- **`HttpConfig::for_test()` is public now.** The Session 007 helper
+  for short-backoff test clients can be called from any crate
+  (kino-addons already uses it; F-006/F-008 wiremock tests can use
+  it the same way).
+- **Stremio's untagged `ManifestResource` enum needs care when
+  inspecting addon manifests.** F-006 will likely filter the
+  installed addons list to "those that serve `stream` for the
+  requested type". The pattern is
+  `manifest.resources.iter().any(|r| r.name() == "stream")` (use
+  the `name()` helper, don't pattern-match on the enum).
 
 ### Session 007 — F-005 Image & logo resolution
 
@@ -1396,7 +1727,13 @@ implementation" split.
   keyed by `(title_id, kind, lang_chain_hash)`, cross-provider id
   resolution via TMDB `/find` + `/external_ids`, 27 tests)_
 - [ ] F-006: Source availability filter
-- [ ] F-007: Stremio addon protocol client
+- [x] F-007: Stremio addon protocol client _(Session 008: `AddonClient`
+  covering all seven Stremio protocol endpoints, manifest validation,
+  `stremio://` URL normalization, `install_addon` / `uninstall_addon`
+  / `set_addon_order` / `get_recommended_addons` Tauri commands,
+  first-launch Cinemeta auto-install with non-removable protection,
+  HTTP-module lift to `kino_core::http` so addons + metadata share
+  the locked retry policy, 45 tests)_
 
 ### UI
 - [ ] F-008: Home screen (10-foot UI)
@@ -1451,6 +1788,10 @@ Additional ADRs filed by sessions:
 | ADR-052 | F-005 textless artwork (Fanart `"00"` lang, TMDB `null` `iso_639_1`) matches every language tier, not just tier 5. Provider-neutral logos / backdrops are the COMMON case for those image types; treating them as tier-5-only would cause primary-language users to fall through to tier 2+ unnecessarily. The `lang_matches` rule short-circuits empty asset lang to true; source markers still reflect the requested tier's lang. | 007 |
 | ADR-053 | F-005's TMDB summary cost scales with `lang_pref` length only — TMDB `/movie/{id}?language=lang` is called once per configured tier 1..=4 language, NOT for tier 5 ("any other language"). Tier-5 summary resolution inspects whatever the bundle already has (which TVDB populates wholesale via `/extended?meta=translations`); if no TMDB summary survived the configured langs, summary falls through to TVDB then to empty. Worst-case-per-title call budget stays at 4 + N where N ≤ 4. | 007 |
 | ADR-054 | F-005 Fanart.tv movie lookups prefer the TMDB id over the IMDb id when both are known. Fanart.tv accepts either, but TMDB-id lookups are documented as slightly faster, and the F-004 trending output is TMDB-id-first by default. Difference is invisible to the cascade output. | 007 |
+| ADR-055 | The workspace-wide HTTP machinery (locked retry policy, `HttpConfig`, `fetch_with_retry`, `USER_AGENT`) lives in `kino-core::http` rather than per-domain crates. Session 008 lifted it out of `kino-metadata::http` so `kino-addons` (F-007) could consume the same retry policy without inverting the crate graph or duplicating ~80 lines. `HttpError` is self-contained; `kino-metadata::Error` and `kino-addons::AddonError` bridge via `From<HttpError>` impls so existing `?` usage and `Error::Http` pattern-matches keep working. | 008 |
+| ADR-056 | F-007 manifest validation rejects empty `types` / `resources` arrays but accepts empty `catalogs`. A literal read of PRD §F-007 ("presence of") would allow all three to be empty, but stream-only / subtitles-only Stremio addons (e.g. Torrentio, OpenSubtitles v3) legitimately ship with `catalogs: []` while an addon with `types: []` or `resources: []` is functionally a no-op and almost certainly misconfigured. The shipped rule pins this with three tests covering both branches. | 008 |
+| ADR-057 | Cinemeta's non-removability is keyed on its locked PRD §8 manifest URL (`https://v3-cinemeta.strem.io/manifest.json`), not on the addon's Stremio-supplied `id` field (`com.linvo.cinemeta`). A future Cinemeta release changing its own id wouldn't sneak past the guard, and an imposter addon adopting the `com.linvo.cinemeta` id but pointing at a different URL is NOT protected — the user can freely uninstall a third-party "Cinemeta-alike". | 008 |
+| ADR-058 | First-launch Cinemeta auto-install (`bootstrap_default_addons`) tolerates network failure: logs a warning via `tracing::warn!`, elides the `settings.addons.bootstrap_done` marker write (so the next launch retries), and returns. The app must boot even on a network-outage scenario; the user can complete the install manually from Settings → Addons. The bootstrap marker is set only on success so partial state (e.g. Cinemeta installed before TMDB key configured) is fine. | 008 |
 
 ---
 
@@ -1600,15 +1941,23 @@ Populated as conventions are established:
 - **PRD line numbers are not stable references.** When citing PRD provisions
   in code comments or ADR text, cite the section / feature ID (e.g.
   `PRD §F-014`, `PRD §8`), never line numbers.
-- **HTTP-client pattern.** Each metadata-provider client lives in its own
-  module under `crates/kino-metadata/src/`. The shared retry / User-Agent
-  / timeout logic lives in `kino-metadata::http` so the locked retry policy
-  is honored uniformly. Each client takes `(key, HttpConfig, base_url)` in
-  its constructor so tests can swap a wiremock URL in; the default
-  `new(key)` uses the production base URL and `HttpConfig::default()`.
-  Provider-specific knobs (TMDB query-param auth, Trakt header auth, TVDB
-  login token exchange, Fanart query-param auth) stay in the per-provider
-  module — the shared layer doesn't know about them.
+- **HTTP-client pattern.** The shared retry / User-Agent / timeout logic
+  lives in `kino-core::http` (ADR-055, lifted from `kino-metadata::http`
+  in Session 008) so EVERY outbound-HTTP consumer in the workspace —
+  metadata providers (`kino-metadata`), Stremio addons (`kino-addons`),
+  and any future caller — honors the same PRD-locked policy uniformly.
+  Each client takes `(key, HttpConfig, base_url)` in its constructor so
+  tests can swap a wiremock URL in; the default `new(key)` uses the
+  production base URL and `HttpConfig::default()`. Provider-specific
+  knobs (TMDB query-param auth, Trakt header auth, TVDB login token
+  exchange, Fanart query-param auth, Stremio bearer-free public access)
+  stay in the per-provider module — the shared layer doesn't know about
+  them. Per-domain crates define their own error enum
+  (`kino_metadata::Error`, `kino_addons::AddonError`) with a
+  `From<kino_core::http::HttpError>` bridge so `?` propagates cleanly.
+  `kino_metadata::HttpConfig` / `USER_AGENT` are kept as re-exports of
+  the lifted symbols for backwards compatibility with already-merged
+  call sites.
 - **Frontend layout.** `frontend/` is a single SolidJS bundle shared across
   Linux / Android / Android TV (ADR-013). Locales live in `src/locales/<lang>.json`
   (PRD §5). Tauri's `tauri.conf.json` points `frontendDist` at

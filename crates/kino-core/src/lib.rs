@@ -13,10 +13,12 @@ pub mod addon;
 pub mod constants;
 pub mod cw;
 pub mod db;
+pub mod http;
 pub mod stream;
 pub mod title;
 
 pub use db::{Db, DbError, INSTALL_ID_KEY};
+pub use http::{fetch_with_retry, HttpConfig, HttpError, USER_AGENT};
 
 /// Crate-level error type. Kept narrow on purpose; subsystems add their own
 /// thiserror enums and convert when crossing module boundaries.

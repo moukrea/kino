@@ -1955,9 +1955,13 @@ version = "0.0.0"
 dependencies = [
  "kino-core",
  "regex",
+ "reqwest 0.12.28",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
+ "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
@@ -1966,6 +1970,7 @@ version = "0.0.0"
 dependencies = [
  "chrono",
  "dirs 5.0.1",
+ "kino-addons",
  "kino-core",
  "kino-metadata",
  "serde",
@@ -1983,6 +1988,7 @@ name = "kino-core"
 version = "0.0.0"
 dependencies = [
  "chrono",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sqlx",
