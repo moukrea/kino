@@ -2951,6 +2951,175 @@ async fn apply_availability_filter(
         .collect())
 }
 
+// ---- F-016: Settings screen ---------------------------------------------
+
+use crate::cache_fs;
+use crate::logs;
+use crate::settings::{
+    self, validate_setting, HostPlatform, SettingsView, CACHE_PATH_KEY, KNOWN_SETTINGS_KEYS,
+};
+
+/// Build-time injected commit SHA (see `src-tauri/build.rs`). Surfaced on
+/// the F-016 §8 About panel.
+const COMMIT_SHA: &str = env!("KINO_COMMIT_SHA");
+
+/// Static About-panel facts (version, commit, repo, license). Pure read of
+/// `Cargo.toml` workspace metadata + the compile-time commit SHA.
+#[derive(Debug, Clone, Serialize)]
+pub struct AppInfo {
+    pub name: &'static str,
+    pub version: &'static str,
+    pub commit: &'static str,
+    pub repository: &'static str,
+    pub license: &'static str,
+    pub platform: &'static str,
+}
+
+fn host_platform_label() -> &'static str {
+    if cfg!(target_os = "android") {
+        "android"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        "unknown"
+    }
+}
+
+/// `get_app_info()` (PRD §F-016 §8 About).
+#[tauri::command]
+pub fn get_app_info() -> AppInfo {
+    AppInfo {
+        name: env!("CARGO_PKG_NAME"),
+        version: env!("CARGO_PKG_VERSION"),
+        commit: COMMIT_SHA,
+        repository: env!("CARGO_PKG_REPOSITORY"),
+        license: env!("CARGO_PKG_LICENSE"),
+        platform: host_platform_label(),
+    }
+}
+
+/// `settings_get_all()` (PRD §F-016).
+///
+/// Returns the full settings tree with defaults applied for absent keys.
+/// `cache_path_default` is resolved by the Tauri host via
+/// [`crate::paths::cache_dir_default`] and surfaces in the response so the
+/// Settings → Cache "Path" field renders a meaningful placeholder.
+#[tauri::command]
+pub async fn settings_get_all(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+) -> Result<SettingsView, String> {
+    let cache_default = crate::paths::cache_dir_default(&app)?
+        .to_string_lossy()
+        .into_owned();
+    settings::load_view(&db, HostPlatform::current(), &cache_default).await
+}
+
+/// `settings_set(key, value)` (PRD §F-016 "All settings persist across
+/// restarts"). Validates `(key, value)` against the per-key bounds in
+/// [`validate_setting`] then writes the normalized value to the KV table.
+///
+/// Returns the normalized value the caller should now consider authoritative
+/// (e.g. boolean inputs are canonicalized to `"true"`/`"false"`).
+#[tauri::command]
+pub async fn settings_set(db: State<'_, Db>, key: String, value: String) -> Result<String, String> {
+    let normalized = validate_setting(&key, &value, HostPlatform::current())?;
+    db.kv_set(&key, &normalized).await.map_err(ipc)?;
+    Ok(normalized)
+}
+
+/// `settings_reset_defaults()` (PRD §F-016 "Reset to defaults button with
+/// confirmation restores out-of-box state").
+///
+/// Wipes every key in [`KNOWN_SETTINGS_KEYS`] and removes every non-Cinemeta
+/// addon. Cinemeta is preserved because it's the locked default (PRD §F-007
+/// "Cinemeta only DISABLABLE, never REMOVABLE"). System-internal keys
+/// (`install_id`, `addons.bootstrap_done`) survive so the install identity
+/// remains stable.
+#[tauri::command]
+pub async fn settings_reset_defaults(db: State<'_, Db>) -> Result<(), String> {
+    for key in KNOWN_SETTINGS_KEYS {
+        db.kv_delete(key).await.map_err(ipc)?;
+    }
+    // Drop every non-Cinemeta addon. We walk in two passes so we don't
+    // mutate the list mid-iteration. is_cinemeta_id keys on the manifest
+    // URL (ADR-057) so an "imposter Cinemeta" with the same id but a
+    // different URL is correctly purged.
+    let installed = db.addons_list().await.map_err(ipc)?;
+    for addon in installed {
+        if is_cinemeta_id(&db, &addon.id).await? {
+            // Re-enable Cinemeta and snap it to display_order = 0 so the
+            // reset really does land us back in out-of-box state.
+            db.addons_set_enabled(&addon.id, true).await.map_err(ipc)?;
+            db.addons_reorder(std::slice::from_ref(&addon.id))
+                .await
+                .map_err(ipc)?;
+            continue;
+        }
+        db.addons_delete(&addon.id).await.map_err(ipc)?;
+    }
+    Ok(())
+}
+
+/// `cache_usage_bytes()` (PRD §F-016 §4 "Current usage display"). Returns
+/// the byte count of the user-configured cache directory.
+#[tauri::command]
+pub async fn cache_usage_bytes(app: tauri::AppHandle, db: State<'_, Db>) -> Result<u64, String> {
+    let path = resolve_cache_path(&app, &db).await?;
+    let path_buf = std::path::PathBuf::from(path);
+    tokio::task::spawn_blocking(move || cache_fs::dir_size_bytes(&path_buf))
+        .await
+        .map_err(|e| format!("cache scan failed: {e}"))
+}
+
+/// `cache_clear()` (PRD §F-016 §4 "Clear cache button (confirmation modal)").
+/// Removes every file under the configured cache directory; the directory
+/// itself stays in place.
+#[tauri::command]
+pub async fn cache_clear(app: tauri::AppHandle, db: State<'_, Db>) -> Result<(), String> {
+    let path = resolve_cache_path(&app, &db).await?;
+    let path_buf = std::path::PathBuf::from(path);
+    tokio::task::spawn_blocking(move || cache_fs::clear_dir_contents(&path_buf))
+        .await
+        .map_err(|e| format!("cache clear failed: {e}"))?
+        .map_err(|e| format!("cache clear failed: {e}"))
+}
+
+/// `export_logs(dest_zip)` (PRD §F-016 §8 "Export logs button: zips logs
+/// folder to a chosen location").
+#[tauri::command]
+pub async fn export_logs(app: tauri::AppHandle, dest_zip: String) -> Result<u64, String> {
+    let config_root = crate::paths::app_config_dir(&app)?;
+    let log_dir = logs::log_dir(&config_root);
+    let dest = std::path::PathBuf::from(dest_zip);
+    if let Some(parent) = dest.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("could not create destination dir: {e}"))?;
+        }
+    }
+    tokio::task::spawn_blocking(move || logs::zip_log_dir(&log_dir, &dest))
+        .await
+        .map_err(|e| format!("export_logs failed: {e}"))?
+        .map_err(|e| format!("export_logs failed: {e}"))
+}
+
+async fn resolve_cache_path(app: &tauri::AppHandle, db: &Db) -> Result<String, String> {
+    if let Some(custom) = db.kv_get(CACHE_PATH_KEY).await.map_err(ipc)? {
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    Ok(crate::paths::cache_dir_default(app)?
+        .to_string_lossy()
+        .into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5289,5 +5458,187 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    // ---- F-016: Settings -----------------------------------------------
+
+    /// Direct helper exercising the same logic as `settings_set` without
+    /// the Tauri command wrapper (which needs a `State` extractor).
+    async fn settings_set_helper(db: &Db, key: &str, value: &str) -> Result<String, String> {
+        let normalized =
+            crate::settings::validate_setting(key, value, crate::settings::HostPlatform::Linux)?;
+        db.kv_set(key, &normalized).await.map_err(ipc)?;
+        Ok(normalized)
+    }
+
+    /// Wipes user-set KV + non-Cinemeta addons. Mirrors the body of
+    /// `settings_reset_defaults` so unit tests can exercise it without a
+    /// Tauri State extractor.
+    async fn settings_reset_defaults_helper(db: &Db) -> Result<(), String> {
+        for key in crate::settings::KNOWN_SETTINGS_KEYS {
+            db.kv_delete(key).await.map_err(ipc)?;
+        }
+        let installed = db.addons_list().await.map_err(ipc)?;
+        for addon in installed {
+            if is_cinemeta_id(db, &addon.id).await? {
+                db.addons_set_enabled(&addon.id, true).await.map_err(ipc)?;
+                db.addons_reorder(std::slice::from_ref(&addon.id))
+                    .await
+                    .map_err(ipc)?;
+                continue;
+            }
+            db.addons_delete(&addon.id).await.map_err(ipc)?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn settings_set_persists_normalized_value() {
+        let db = Db::open_in_memory().await.unwrap();
+        let saved = settings_set_helper(&db, crate::settings::DISPLAY_NSFW_KEY, "1")
+            .await
+            .unwrap();
+        assert_eq!(saved, "true");
+        assert_eq!(
+            db.kv_get(crate::settings::DISPLAY_NSFW_KEY).await.unwrap(),
+            Some("true".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_set_rejects_invalid_value_without_writing() {
+        let db = Db::open_in_memory().await.unwrap();
+        let err = settings_set_helper(&db, crate::settings::CACHE_SIZE_GIB_KEY, "999")
+            .await
+            .unwrap_err();
+        assert!(err.contains("cache size"), "got: {err}");
+        assert_eq!(
+            db.kv_get(crate::settings::CACHE_SIZE_GIB_KEY)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_get_all_round_trips_through_set() {
+        let db = Db::open_in_memory().await.unwrap();
+        settings_set_helper(&db, TMDB_API_KEY, "abc").await.unwrap();
+        settings_set_helper(&db, crate::settings::META_PRIMARY_LANG_KEY, "fr")
+            .await
+            .unwrap();
+        settings_set_helper(&db, crate::settings::DISPLAY_TILE_SIZE_KEY, "large")
+            .await
+            .unwrap();
+        let view =
+            crate::settings::load_view(&db, crate::settings::HostPlatform::Linux, "/tmp/kino")
+                .await
+                .unwrap();
+        assert_eq!(view.api_keys.tmdb, "abc");
+        assert_eq!(view.language.metadata_primary, "fr");
+        assert_eq!(view.display.tile_size, "large");
+    }
+
+    #[tokio::test]
+    async fn settings_reset_defaults_wipes_known_keys_but_keeps_install_id() {
+        let db = Db::open_in_memory().await.unwrap();
+        let install_id = db.install_id().await.unwrap();
+        settings_set_helper(&db, TMDB_API_KEY, "abc").await.unwrap();
+        settings_set_helper(&db, crate::settings::DISPLAY_TILE_SIZE_KEY, "large")
+            .await
+            .unwrap();
+
+        settings_reset_defaults_helper(&db).await.unwrap();
+
+        assert_eq!(db.kv_get(TMDB_API_KEY).await.unwrap(), None);
+        assert_eq!(
+            db.kv_get(crate::settings::DISPLAY_TILE_SIZE_KEY)
+                .await
+                .unwrap(),
+            None
+        );
+        // Install id is system-internal — survives the wipe.
+        assert_eq!(db.install_id().await.unwrap(), install_id);
+    }
+
+    #[tokio::test]
+    async fn settings_reset_defaults_keeps_cinemeta_removes_others() {
+        let db = Db::open_in_memory().await.unwrap();
+        // Pre-seed two addons: Cinemeta (URL-matched) and an imposter.
+        db.addons_insert(&AddonInsert {
+            id: "com.linvo.cinemeta".into(),
+            manifest_url: CINEMETA_MANIFEST_URL.into(),
+            manifest_json: serde_json::json!({"id":"com.linvo.cinemeta"}),
+            display_order: None,
+        })
+        .await
+        .unwrap();
+        db.addons_insert(&AddonInsert {
+            id: "other.addon".into(),
+            manifest_url: "https://other/manifest.json".into(),
+            manifest_json: serde_json::json!({"id":"other.addon"}),
+            display_order: None,
+        })
+        .await
+        .unwrap();
+        // Disable Cinemeta to confirm reset re-enables it.
+        db.addons_set_enabled("com.linvo.cinemeta", false)
+            .await
+            .unwrap();
+
+        settings_reset_defaults_helper(&db).await.unwrap();
+
+        let remaining = db.addons_list().await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, "com.linvo.cinemeta");
+        assert!(remaining[0].enabled, "reset must re-enable Cinemeta");
+    }
+
+    #[tokio::test]
+    async fn cache_usage_helper_sums_files() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let mut f = std::fs::File::create(dir.path().join("a.bin")).unwrap();
+        f.write_all(&[0u8; 2048]).unwrap();
+        drop(f);
+        let size = crate::cache_fs::dir_size_bytes(dir.path());
+        assert_eq!(size, 2048);
+    }
+
+    #[tokio::test]
+    async fn cache_clear_helper_keeps_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::File::create(dir.path().join("a.bin")).unwrap();
+        crate::cache_fs::clear_dir_contents(dir.path()).unwrap();
+        assert!(dir.path().is_dir());
+    }
+
+    #[tokio::test]
+    async fn export_logs_writes_zip_at_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(logs.join("kino.log"), "hi").unwrap();
+        let dest = dir.path().join("out.zip");
+        let bytes = crate::logs::zip_log_dir(&logs, &dest).unwrap();
+        assert!(dest.exists());
+        assert!(bytes > 0);
+    }
+
+    #[test]
+    fn get_app_info_returns_workspace_metadata() {
+        let info = get_app_info();
+        assert_eq!(info.name, "kino-app");
+        assert!(!info.version.is_empty());
+        // KINO_COMMIT_SHA is injected by `build.rs`; tests in CI see a real
+        // SHA, local sandboxes without git see "unknown". Either way the
+        // field is non-empty.
+        assert!(!info.commit.is_empty());
+        assert_eq!(info.license, "MIT");
+        let platform = info.platform;
+        assert!(
+            ["linux", "android", "macos", "windows", "unknown"].contains(&platform),
+            "unexpected platform label: {platform}"
+        );
     }
 }

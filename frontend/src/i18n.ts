@@ -51,3 +51,28 @@ const dictionary = createMemo(() => DICTIONARIES[locale()]);
 
 // eslint-disable-next-line solid/reactivity
 export const t = translator(dictionary, resolveTemplate);
+
+/**
+ * Dynamic-key alias used by routes (F-016 Settings) that build i18n keys
+ * at runtime from data — section ids, control ids, etc. — and can't carry
+ * a literal-typed key through. Returns the resolved string, never a
+ * sub-tree object: any nested sub-object lookup is coerced to its name.
+ *
+ * Prefer the typed `t(...)` everywhere a literal works; reach for `tDyn`
+ * only at the dispatch boundary.
+ */
+export function tDyn(
+  key: string,
+  params?: Readonly<Record<string, string>>,
+): string {
+  // The translator's literal-typed signature rejects `string`. Casting via
+  // `unknown` keeps the production call site type-stable while letting
+  // the routes hand a runtime-shaped key down.
+  const fn = t as unknown as (k: string, p?: Record<string, string>) => unknown;
+  const result = fn(key, params);
+  if (typeof result === "string") return result;
+  // Sub-tree hit: stringify the keypath rather than render `[object Object]`,
+  // so a misconfigured key surfaces clearly in QA instead of silently breaking
+  // the UI.
+  return key;
+}

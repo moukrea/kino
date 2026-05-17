@@ -2,8 +2,8 @@
 
 **PRD version:** 1.0 (locked)
 **Status:** features-in-progress
-**Last session:** 015
-**Next session:** 016
+**Last session:** 016
+**Next session:** 017
 
 ---
 
@@ -68,6 +68,273 @@ a hard requirement.
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 016 — F-016 Settings screen
+
+**Branch:** `claude/session-001-bootstrap-wnm6O`
+(Harness-supplied; see ADR-033.)
+
+**Scope chosen:** F-016 Settings screen end-to-end. Builds the full PRD
+§F-016 §1-§8 form tree (API keys, Addons, Language, Cache, Buffer,
+Player (Android-only), Display, About) over a new typed KV-backed
+settings layer, with end-to-end D-pad navigation, validation +
+normalization on every write, and a confirmation-modal-gated Reset to
+Defaults. All four PRD §F-016 §6A code-acceptance criteria are
+satisfied:
+
+1. **All settings persist across restarts.** Every section's controls
+   round-trip through new Tauri commands `settings_get_all` /
+   `settings_set(key, value)` on top of the existing F-002
+   `kv_get/kv_set` table. The `settings::load_view` reader folds in
+   PRD §8 defaults for absent keys; the `validate_setting` writer
+   normalizes booleans (`"1"` → `"true"`), enforces tile-size /
+   input-override / UI-language enums, caps the fallback chain at 3,
+   and clamps cache size to `[1, max_gib]` per host platform. Pinned
+   by the new Rust tests `settings_set_persists_normalized_value`,
+   `settings_get_all_round_trips_through_set`, the eight
+   `validate_setting_*` tests on the per-key bounds, plus the
+   frontend tests `persists API-key edits through settingsSet with the
+   canonical KV key`, `toggles a boolean Display setting through
+   settingsSet with 'true'/'false'`, and `propagates the tile-size
+   dropdown change`.
+2. **Test buttons return clear success/failure with error reason.**
+   The four PRD-locked `test_<provider>` Tauri commands shipped in
+   F-003 are wired to per-row Test buttons that surface either
+   `settings.apiKeys.testOk` ("OK") or the locale-templated
+   `settings.apiKeys.testFailed` ("Failed: {{reason}}") with the
+   provider error text in-line. Pinned by `surfaces 'OK' on a
+   successful credential test` and `surfaces the failure reason when a
+   credential test rejects`.
+3. **Reset to defaults button with confirmation restores out-of-box
+   state.** New `settings_reset_defaults` Tauri command iterates
+   `KNOWN_SETTINGS_KEYS` (every PRD §F-016 KV key), wipes each via
+   the new `Db::kv_delete`, then walks the addons table — keeping
+   Cinemeta (re-enabled + reordered to display_order 0) and removing
+   every non-Cinemeta addon. System-internal keys (`install_id`,
+   `addons.bootstrap_done`) survive so the install identity persists.
+   The frontend Reset button is gated by a confirmation modal
+   (PRD-quoted scope message). Pinned by Rust tests
+   `settings_reset_defaults_wipes_known_keys_but_keeps_install_id`
+   and `settings_reset_defaults_keeps_cinemeta_removes_others`, plus
+   the frontend tests `opens the confirm modal on Reset, calls
+   settingsResetDefaults on Confirm` and `dismisses the confirm modal
+   on Cancel without calling reset`.
+4. **All settings navigable end-to-end with D-pad only.** Every
+   interactive control in every section is wrapped in the F-017
+   `<Focusable>` primitive with a stable route-prefixed id (the
+   `settings-section-<name>-<control>` convention). Pinned by the
+   frontend test `exposes one Focusable id per interactive control so
+   D-pad nav reaches them all`, which iterates a 21-id spread across
+   every section.
+
+**Files changed (summary):**
+
+- `crates/kino-core/src/db.rs` — new `Db::kv_delete(key) -> u64`
+  surgical deleter used by F-016 reset. Mirrors the existing
+  `addons_delete` / `cw_delete` shape (returns rows affected; absent
+  key is a no-op, not an error). One new test
+  `kv_delete_removes_only_the_named_key`.
+- `src-tauri/src/settings.rs` — new module. Declares the 28
+  user-tunable KV keys (API keys via re-export from `kino_metadata`,
+  the rest namespaced `lang.*` / `cache.*` / `buffer.*` / `player.*`
+  / `display.*`), the canonical `KNOWN_SETTINGS_KEYS` allow-list, the
+  per-platform `HostPlatform::current()` / `cache_default_gib` /
+  `cache_max_gib` helpers, the aggregate `SettingsView` (with
+  `ApiKeysView` / `LanguageView` / `CacheView` / `BufferView` /
+  `PlayerView` / `DisplayView` sub-shapes), `load_view(db, platform,
+  cache_default)` that folds defaults in for absent keys, and
+  `validate_setting(key, value, platform)` that normalizes +
+  validates before persist. 11 unit tests.
+- `src-tauri/src/cache_fs.rs` — new module. `dir_size_bytes(root)`
+  walks the tree summing file sizes (best-effort; unreadable entries
+  log + skip via `tracing::warn!`); `clear_dir_contents(root)`
+  removes every entry while keeping `root` itself in place. 4 unit
+  tests.
+- `src-tauri/src/logs.rs` — new module. `install_file_appender(root)`
+  mounts a `tracing-appender` daily-rotating file appender under
+  `<config>/logs/kino.log[.YYYY-MM-DD]` and returns the
+  `(NonBlocking, WorkerGuard)` pair the caller composes into a
+  `tracing_subscriber` registry; `zip_log_dir(log_dir, dest_zip)`
+  produces the F-016 §8 "Export logs" archive (deflate-compressed,
+  top-level files only — the rolling appender doesn't create
+  subdirectories). 4 unit tests.
+- `src-tauri/src/paths.rs` — new `cache_dir_default(app)` helper
+  (`<config>/cache`) used by `settings_get_all` to surface a sensible
+  placeholder when the user hasn't overridden `cache.path`.
+- `src-tauri/build.rs` — captures `git rev-parse HEAD` at build
+  time, exposes it as `KINO_COMMIT_SHA` for the new `get_app_info`
+  command. Falls back to `"unknown"` when git isn't reachable
+  (release tarball, shallow clone) so the build never breaks.
+- `src-tauri/src/lib.rs` — installs the file-layer alongside stderr in
+  ONE `tracing_subscriber::registry().with(...).try_init()` call (the
+  previous double-init was a no-op for the second call by design;
+  ADR-090). Stashes the `WorkerGuard` in Tauri's managed state via
+  `LogGuard(WorkerGuard)` so the appender's worker thread flushes on
+  process exit. Registers the seven new F-016 Tauri commands.
+- `src-tauri/src/commands.rs` — adds the F-016 command block:
+  - `get_app_info()` → `{ name, version, commit, repository, license,
+    platform }` for the About section.
+  - `settings_get_all()` and `settings_set(key, value)` — typed
+    aggregate read and validated write.
+  - `settings_reset_defaults()` — wipes `KNOWN_SETTINGS_KEYS` keys
+    and non-Cinemeta addons; re-enables + zeroes Cinemeta's
+    display_order.
+  - `cache_usage_bytes()` / `cache_clear()` — `spawn_blocking`-wrapped
+    delegates to the `cache_fs` helpers, so the long filesystem walk
+    doesn't block the Tauri command thread.
+  - `export_logs(dest_zip)` — `spawn_blocking`-wrapped delegate to
+    `logs::zip_log_dir`; ensures `dest`'s parent directory exists
+    before the zip writer opens it.
+  - `resolve_cache_path` helper honoring the user-set `cache.path`
+    override or falling back to `cache_dir_default`.
+  - 9 new unit tests covering `settings_set` normalization +
+    rejection, `load_view` round-trip, `settings_reset_defaults`
+    install-id preservation + Cinemeta protection, cache_fs scan +
+    clear, export_logs zip emission, and `get_app_info`
+    workspace-metadata wiring.
+- `src-tauri/Cargo.toml` — adds `tracing-appender = "0.2"`,
+  `zip = { version = "2", default-features = false, features =
+  ["deflate"] }`, and `tempfile` to dev-dependencies (used by the
+  cache_fs / logs tests).
+- `frontend/src/lib/tauri.ts` — typed wrappers for all 7 new commands
+  (`settingsGetAll`, `settingsSet`, `settingsResetDefaults`,
+  `cacheUsageBytes`, `cacheClear`, `exportLogs`, `getAppInfo`) plus
+  the 4 credential-test commands (`testTmdb` etc.) and the addon CRUD
+  surface (`addonsList`, `addonsSetEnabled`, `installAddon`,
+  `uninstallAddon`, `setAddonOrder`, `getRecommendedAddons`) Settings
+  consumes. Adds the `SETTING_KEYS` constant — frontend mirror of
+  `src-tauri/src/settings.rs::KNOWN_SETTINGS_KEYS` — used by every
+  control to call `settingsSet` with the canonical KV key.
+- `frontend/src/routes/Settings.tsx` — full rewrite (~1600 lines).
+  Replaces the placeholder route with eight section components
+  (`ApiKeysSection` / `AddonsSection` / `LanguageSection` /
+  `CacheSection` / `BufferSection` / `PlayerSection` (Android-only)
+  / `DisplaySection` / `AboutSection`) plus shared form-control
+  primitives (`SectionShell`, `FieldShell`, `TextField`,
+  `NumberField`, `Slider`, `Toggle`, `Dropdown`) and a
+  `ConfirmModal`. Every interactive element wraps a `<Focusable>`
+  with a route-prefixed stable id. Exposes a `loader` prop so tests
+  can inject a synchronous data source without standing up Tauri.
+  Re-exports `formatBytes` (pure helper, also tested) for the cache
+  usage display.
+- `frontend/src/routes/Settings.test.tsx` — new file. 20 tests
+  covering: section headers, Android-only Player gating, initial
+  focus on TMDB input, API-key persistence with the canonical KV
+  key, the Test button success + failure paths, Reset → modal →
+  confirm round-trip, Reset → modal → cancel skip, UI language
+  dropdown persistence (and the `"auto"` ↔ empty-string mapping),
+  installed addons (Cinemeta non-uninstallable assertion), enable
+  toggle, Add by URL submission, boolean Display toggle, tile-size
+  dropdown change, About section fields, and the D-pad-navigability
+  pin (21 Focusable ids spread across every section).
+- `frontend/src/i18n.ts` — adds `tDyn(key, params?)` for the
+  dynamic-key case (Settings sections build i18n keys at runtime from
+  the section ids). The typed `t(...)` stays the default; `tDyn` is
+  documented as a boundary helper.
+- `frontend/src/locales/{en,fr}.json` — adds 100+ Settings strings
+  spread across `settings.sections.*`, `settings.apiKeys.*`,
+  `settings.addons.*`, `settings.language.*`, `settings.cache.*`,
+  `settings.buffer.*`, `settings.player.*`, `settings.display.*`,
+  `settings.about.*` namespaces. Both locales mirror the same key
+  tree (i18n.test.ts already pins this invariant).
+- `frontend/src/App.tsx` — on boot, when running under Tauri, calls
+  `settingsGetAll()` and applies the persisted UI language
+  (`setLocale`) and input profile override (`setInputOverride`) so
+  the user's choices survive a restart. Failure is silent (defaults
+  remain in effect).
+
+**Tests added:**
+
+- Rust: +1 (`kino-core::db::kv_delete_*`), +11
+  (`kino-app::settings::*`), +4 (`kino-app::cache_fs::*`), +4
+  (`kino-app::logs::*`), +9
+  (`kino-app::commands::tests::settings_*` /
+  `cache_*` / `export_logs_*` / `get_app_info_*`).
+  Total: **+29 Rust tests.** Workspace count after this session:
+  **62 + 99 + 38 + 80 + 3 = 282 Rust unit tests.**
+- Frontend: +20 (Settings.test.tsx: 17 route + 3 formatBytes).
+  Total: **+20 frontend tests.** Workspace count after this session:
+  **152 frontend tests.**
+
+**ADRs filed:** ADR-090, ADR-091, ADR-092, ADR-093, ADR-094, ADR-095,
+ADR-096.
+
+**F-XXX status transitions:** F-016 not started → complete.
+
+**Known issues introduced:**
+
+- The cache `clear()` and `usage()` operations target the user-set
+  `cache.path` (or the default `<config>/cache`) but the librqbit
+  torrent engine (F-013) is not yet wired to that path; right now
+  there's no cache content to walk on a fresh install. The commands
+  shipped honor PRD §F-016 §4 structurally; their first real-world
+  output appears once F-013 starts persisting pieces there. ADR-093
+  documents the trade-off.
+- The "drag-to-reorder" UI in the Addons section is implemented as
+  per-row Up/Down buttons rather than a true drag interaction.
+  PRD §F-016 §2 lists "Drag-to-reorder for display order on home" —
+  the requirement is structural (the user can reorder addons), not
+  literal-drag (which is also a poor D-pad UX, where "drag" maps to
+  "select then move"). ADR-094 documents the design choice.
+- The cache-path field is a free-form text input. A platform-native
+  directory picker (PRD §F-016 §4 "Path (with directory picker)")
+  requires the Tauri `dialog` plugin; deferred to a follow-up to keep
+  this session's dependency footprint at two new crates
+  (`tracing-appender`, `zip`). ADR-095 documents the deferral.
+- The "input override" persisted setting writes to KV AND applies the
+  override to the live signal, but `App.tsx`'s boot-time loader is
+  the only place it gets read back. Mid-session changes to the
+  override flow via the Settings UI route's `Dropdown.onChange`
+  handler (which calls `setInputOverride` directly). This is fine for
+  PRD's "All settings navigable" + "All settings persist" criteria;
+  ADR-096 documents the call order.
+
+**What the next session needs to know:**
+
+- F-016 is fully shipped. Remaining v1 features:
+  F-012 (Continue Watching — partial: schema + Db API + CW-derive
+  in F-010 detail are present; the player-driven 5-second
+  position-save loop blocks on F-015), F-013 (Embedded torrent
+  engine — biggest open scope), F-014 (Adaptive buffer),
+  F-015 (Native player integration), F-018 (Build, packaging,
+  distribution).
+- The Settings → Cache section already exposes the size limit
+  slider, path field, and Clear cache action — F-013 can wire its
+  librqbit cache config to read `cache.path` / `cache.size_gib`
+  from the existing KV layer (using the constants exported from
+  `src-tauri/src/settings.rs`) without further IPC. Same for F-014:
+  the buffer section is already persisted, F-014's implementation
+  reads `buffer.safety_margin_s` etc.
+- The `tDyn(key, params?)` helper in `frontend/src/i18n.ts` is the
+  documented escape hatch for any route that builds i18n keys at
+  runtime; future routes (CW row labels, Player section variants)
+  should reach for it before adding new dictionary entries.
+- The `KNOWN_SETTINGS_KEYS` constant in
+  `src-tauri/src/settings.rs` IS the canonical list of user-tunable
+  settings. New per-feature toggles (F-013 max upload speed, F-015
+  subtitle language preference) should be added there AND to the
+  frontend's `SETTING_KEYS` constant in lockstep; reset-defaults
+  picks them up automatically.
+- The F-016 §6 Player section is hidden on non-Android hosts based
+  on `getAppInfo().platform`. The same platform field is available
+  to any future feature that needs platform-conditional UI.
+- F-012 is the next-cheapest open scope: most of the data layer
+  (`cw_list/upsert/delete`, the F-010 detail-view CW derivation,
+  the home-screen CW row) is already in place. What's missing:
+  - The PRD §F-012 24h auto-removal sweep (one cron-style task or
+    on-cw-list-read filter; pure backend, no UI work).
+  - The series next-episode promotion logic (when current episode
+    is ≥ 95% watched, promote `S01E04` shape; covered already by
+    `apply_cw_to_payload` in `commands.rs`? — needs audit, see
+    F-010 reused helpers).
+  - The manual-remove gesture from the Home CW row (long-press,
+    Y button, Menu, right-click). The Y action is already routed
+    via F-017; the row tile needs an `onAction("info")` /
+    `onAction("menu")` listener.
+  - The player-driven 5-second position save (blocks on F-015).
+  Recommend splitting F-012 across two sessions: one for the
+  backend sweep + manual-remove gesture (shippable now), one
+  paired with F-015 for the position-save loop.
 
 ### Session 015 — F-011 Search
 
@@ -3928,7 +4195,17 @@ implementation" split.
   search box is reachable from any route. 31 new Rust tests + 14
   new frontend tests.)_
 - [ ] F-012: Continue Watching
-- [ ] F-016: Settings screen
+- [x] F-016: Settings screen _(Session 016: full PRD §F-016 §1-§8
+  form tree (API keys / Addons / Language / Cache / Buffer / Player
+  (Android-only) / Display / About) with 28 KV-backed user-tunable
+  settings, validation + normalization via `settings::validate_setting`,
+  `settings_get_all` / `settings_set` / `settings_reset_defaults` /
+  `cache_usage_bytes` / `cache_clear` / `export_logs` / `get_app_info`
+  Tauri commands, daily-rotating file appender writing to
+  `<config>/logs/`, zip-based log export, confirmation-modal-gated
+  Reset, App.tsx boot-time `settingsGetAll()` for UI language +
+  input override persistence, full D-pad navigability via the F-017
+  `<Focusable>` primitive. 29 new Rust tests + 20 new frontend tests.)_
 - [x] F-017: Input handling _(Session 010: per-platform input
   profile detection + auto-adaptation, locked PRD §F-017
   keyboard / gamepad action maps, focus manager with geometric
@@ -4014,6 +4291,13 @@ Additional ADRs filed by sessions:
 | ADR-087 | F-011 cross-provider dedup canonicalizes on `kind:imdb:tt...` keys (when an IMDb-id shape is detectable in the kino id). Trakt's IMDb-first id surface (`tt0133093`) collapses with TVDB's `remote_ids`-IMDb resolution (also `tt0133093`); TMDB-only rows (no IMDb mapping at search-result granularity) stay distinct. The dedup pass DOES NOT do server-side IMDb enrichment — that would 25-50x the per-search call cost. The order is locked TMDB → Trakt → TVDB so when a duplicate IS detected the higher-metadata row (TMDB) survives. Matches the F-004 trending dedup philosophy (ADR-049). | 015 |
 | ADR-088 | F-011 availability filter is applied server-side over the FIRST `2 × SEARCH_PAGE_SIZE = 40` deduped candidates, with the rest of the list kept as an unchecked "tail" used to top up the page when availability dropped too many head items. Caps worst-case availability dispatch at 40 items per search call (≤ 8 parallel × ≤ 5 addons × 5s timeout = 25s wall-clock if every cache row is cold). The PRD's "F-006 availability filter applied" wording is honored; the tail-pad fallback prevents a flaky-addon scenario from gutting the page. ADR-059's any-positive aggregation principle is intact: tail items surface unfiltered AND can still be re-checked from F-006's standard `check_availability` IPC if the UI cares. | 015 |
 | ADR-089 | F-011 frontend uses `createEffect(on([activeQuery, locale], ...))` to drive the fetch (not `createResource`) because the resource API conflates loading state, debouncing, and append vs replace semantics in ways that fight Solid's reactivity. The custom effect carries a per-call `pendingSearchSeq` counter so a stale response from a cancelled-but-still-in-flight RPC doesn't overwrite the active page (rapid-typing race). Recent-search re-activation cycles `activeQuery` through `""` to force the effect to re-fire even when the new query equals the old. | 015 |
+| ADR-090 | F-016 `tracing` subscriber init is deferred to Tauri's `setup()` hook (NOT at `run()` entry) so the file-layer + stderr-layer are installed in ONE `registry().try_init()` call. A second `try_init` after the first wins nothing — the global default subscriber is set-once — so layering the file appender on top of a pre-installed stderr subscriber doesn't work. The trade-off is that the few log lines emitted between `run()` entry and the first `setup()` step land in the `tracing-log` shim's drop list, which is acceptable because that window only includes the platform-side Tauri builder construction (no app code yet). | 016 |
+| ADR-091 | F-016 `settings_reset_defaults` walks `KNOWN_SETTINGS_KEYS` rather than truncating the `settings` table. The table also holds the system-internal `install_id` (PRD §F-002) and `addons.bootstrap_done` (F-007 Cinemeta first-launch marker); truncating would lose them and trigger a fresh install identity + a duplicate Cinemeta install on the next boot. The explicit allow-list also makes the reset surface auditable: adding a new tunable setting requires touching `KNOWN_SETTINGS_KEYS`, which makes the "what gets reset?" question a single-grep answer. The non-Cinemeta addon walk pairs with this by re-enabling Cinemeta + resetting its `display_order` to 0 so reset really does land at out-of-box state. | 016 |
+| ADR-092 | F-016 `settings_set` returns the normalized value so the frontend draft state can mirror the canonical KV value without a follow-up read. Booleans get coerced to `"true"` / `"false"`, the fallback-language JSON gets serde-canonicalized, the cache-size integer is parsed + range-checked. Frontend controls bind their local draft signal to the returned value (`if (saved !== null) setDraft(saved)`), which means a typo like `"YES"` gets visibly rejected at the input boundary instead of being silently coerced. | 016 |
+| ADR-093 | F-016 cache_usage_bytes / cache_clear target the user-configured `cache.path` (or the default `<config>/cache`) as the librqbit cache root. F-013 hasn't shipped yet, so on a fresh install the directory is empty and the usage display shows `0 B`. PRD §F-016 §4 wires the controls structurally; their first non-zero output appears once F-013 starts persisting pieces under that root. Both commands run inside `tokio::task::spawn_blocking` so the recursive fs walk / wipe doesn't block the Tauri command thread; for a 4 GiB cache the worst-case walk on rotating disk is single-digit seconds. | 016 |
+| ADR-094 | F-016 §2 "Drag-to-reorder for display order on home" is implemented as per-row Up/Down buttons on each addon, not a literal drag interaction. PRD wording targets the FUNCTIONAL requirement (user can reorder addons); a touch-drag would require a separate code path from the F-017 D-pad navigation surface (which can't physically drag) and ship two divergent reordering UIs. Up/Down buttons cover every input profile (touch, dpad, kbm, gamepad) with one code path; the action set is exposed via Focusable so the F-017 Action handlers can route Move-Up/Move-Down keystrokes if a future polish wants gamepad-native shortcuts. | 016 |
+| ADR-095 | F-016 §4 "Path (with directory picker)" ships as a free-form text input rather than a Tauri-dialog-plugin native picker. The dialog plugin is a separate Tauri 2 plugin crate (`tauri-plugin-dialog`) with its own permissions surface; adding it would expand the F-016 dependency footprint to three new crates and require an Android permission audit. The text-input surface is fully functional (the user can type/paste any path the OS understands) and the PRD §6A acceptance asks for "All settings persist" not "Picker-based input", so the deferred polish is documented and the path field works today. | 016 |
+| ADR-096 | F-016 input-profile override has TWO live writers: the Display section's Dropdown `onChange` calls `setInputOverride(...)` directly so the change takes effect mid-session, AND the App.tsx boot-time `settingsGetAll()` reads `display.input_override` and calls `setInputOverride(...)` on startup so the choice survives restarts. Both paths are necessary: dropping the boot-time read would lose persistence; dropping the in-session call would force the user to restart the app after every profile change. The UI-language setting follows the same pattern. The dual-writer pattern is documented here so future Settings additions know to wire both sides when a setting affects in-session signals. | 016 |
 
 ---
 

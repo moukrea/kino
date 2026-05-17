@@ -23,13 +23,26 @@ import {
 import { Router, Route, useNavigate, useLocation } from "@solidjs/router";
 
 import { NavRail } from "./components/NavRail";
+import { setLocale, type SupportedLocale, SUPPORTED_LOCALES } from "./i18n";
 import { installInputSubsystem, onAction } from "./input";
+import {
+  setOverride as setInputOverride,
+  type InputProfileOverride,
+} from "./input/profile";
+import { hasTauri, settingsGetAll } from "./lib/tauri";
 import { Home } from "./routes/Home";
 import { Movies } from "./routes/Movies";
 import { Series } from "./routes/Series";
 import { Search, SEARCH_INPUT_TEST_ID } from "./routes/Search";
 import { Settings } from "./routes/Settings";
 import { TitleDetail } from "./routes/TitleDetail";
+
+const INPUT_OVERRIDE_VALUES: readonly InputProfileOverride[] = [
+  "auto",
+  "touch",
+  "dpad",
+  "kbm",
+];
 
 /**
  * Layout shared by every route: a fixed-width nav rail on the left,
@@ -42,6 +55,32 @@ const Shell: Component<{ children?: JSX.Element }> = (props) => {
 
   onMount(() => {
     const uninstall = installInputSubsystem();
+    // PRD §F-016: load persisted UI language + input-profile override on
+    // boot so the user's choices survive restarts ("All settings persist
+    // across restarts"). Failure here is silent — the default locale
+    // detector + "auto" profile keep the app usable.
+    if (hasTauri()) {
+      void settingsGetAll()
+        .then((view) => {
+          const uiLang = view.language.ui;
+          if (
+            uiLang &&
+            (SUPPORTED_LOCALES as readonly string[]).includes(uiLang)
+          ) {
+            setLocale(uiLang as SupportedLocale);
+          }
+          const override = view.display.input_override;
+          if (
+            override &&
+            (INPUT_OVERRIDE_VALUES as readonly string[]).includes(override)
+          ) {
+            setInputOverride(override as InputProfileOverride);
+          }
+        })
+        .catch(() => {
+          // First-boot DB may not be ready yet; keep going with defaults.
+        });
+    }
     // PRD §F-011: `/` on keyboard and Y on gamepad focus search "from
     // anywhere". Both inputs collapse to the `search` Action at the
     // F-017 layer; the shell listens once and routes to /search

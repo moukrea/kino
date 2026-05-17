@@ -153,6 +153,18 @@ impl Db {
         Ok(())
     }
 
+    /// Delete a settings value. Returns the number of rows removed (0 if the
+    /// key was absent). The F-016 reset-to-defaults flow uses this to wipe
+    /// user-set keys without touching the system-internal entries
+    /// (`install_id`, `addons.bootstrap_done`).
+    pub async fn kv_delete(&self, key: &str) -> Result<u64, DbError> {
+        let res = sqlx::query("DELETE FROM settings WHERE key = ?")
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
     /// Return the install id bootstrapped on first launch.
     pub async fn install_id(&self) -> Result<String, DbError> {
         self.kv_get(INSTALL_ID_KEY)
@@ -681,6 +693,20 @@ mod tests {
         // Upsert overwrites.
         db.kv_set("foo", "baz").await.unwrap();
         assert_eq!(db.kv_get("foo").await.unwrap().as_deref(), Some("baz"));
+    }
+
+    #[tokio::test]
+    async fn kv_delete_removes_only_the_named_key() {
+        let db = Db::open_in_memory().await.unwrap();
+        db.kv_set("keep", "1").await.unwrap();
+        db.kv_set("drop", "2").await.unwrap();
+        let removed = db.kv_delete("drop").await.unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(db.kv_get("drop").await.unwrap(), None);
+        assert_eq!(db.kv_get("keep").await.unwrap().as_deref(), Some("1"));
+        // Deleting an absent key is a no-op, not an error.
+        let removed = db.kv_delete("absent").await.unwrap();
+        assert_eq!(removed, 0);
     }
 
     #[tokio::test]

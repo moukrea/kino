@@ -35,3 +35,11 @@ pub fn app_config_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String>
 pub fn db_path<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
     Ok(app_config_dir(app)?.join(kino_core::Db::db_filename()))
 }
+
+/// Default on-disk cache directory for librqbit pieces and resolved
+/// artwork (PRD §F-016 §4). Lives next to the DB so the F-016 Settings
+/// → Cache "Path (with directory picker)" defaults to a sane location
+/// the user can override.
+pub fn cache_dir_default<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
+    Ok(app_config_dir(app)?.join("cache"))
+}
