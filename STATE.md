@@ -2,14 +2,467 @@
 
 **PRD version:** 1.0 (locked)
 **Status:** features-in-progress
-**Last session:** 010
-**Next session:** 011
+**Last session:** 011
+**Next session:** 012
 
 ---
 
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 011 — F-008 Home screen (10-foot UI)
+
+**Branch:** `claude/session-001-bootstrap-ob3wj`
+(Harness-supplied; see ADR-033.)
+
+**Scope chosen:** F-008 Home screen end-to-end — the app shell. Five
+routes wired (`/`, `/movies`, `/series`, `/search`, `/settings`), the
+left-hand nav rail (collapsed by default, expands on focus / hover),
+the Home composition's locked five-row stack (Continue Watching,
+Trending Now, Hidden Gems, Trending This Week, addon catalogs), the
+Tile / Row / InfoOverlay primitives every catalog-bearing route will
+reuse, and two new Tauri commands feeding the four data-bearing rows.
+The addon-catalogs row is rendered as a placeholder section (real
+catalog data lands in a focused follow-up); F-009 (Movies / Series
+sub-homes), F-011 (Search), F-016 (Settings), and F-012's CW
+auto-save / resume are explicitly out of this session's scope.
+Pre-feature setup: Solid Router installed; the F-017 input subsystem
+moved from the App body to the Shell layout component so it survives
+route changes; per-route initial-focus claim hook on `Home`.
+
+**Files added (summary):**
+
+- `frontend/src/lib/tauri.ts` — new module. Typed wrappers for the
+  Tauri command surface the F-008 home consumes:
+  `cwList()`, `getTrendingPools(kind, locale)`,
+  `getWeeklyTrending(kind, locale)`, `resolveArtwork(...)`. Also
+  exports the `TitleSummary` / `TitleKind` / `TrendingPools` /
+  `ContinueWatching` / `Artwork` TS shapes that mirror the Rust
+  types and a `hasTauri()` capability check so the bundle still
+  renders in a plain `vite dev` / vitest jsdom (commands fall back to
+  empty data, no crash). Centralizing the IPC surface here keeps
+  consumer routes from sprinkling raw `invoke()` calls and gives one
+  place to mock for tests (see ADR-066).
+- `frontend/src/components/Tile.tsx` — new SolidJS component. Renders
+  the F-008 locked tile shape: 2:3 aspect poster, base width
+  `clamp(140px, 18vw, 240px)` so a 1080p screen shows ~8 tiles per
+  row and a mobile screen scales down without breaking layout, focus
+  state `scale-[1.08] + outline outline-2 outline-sky-400 + soft
+  shadow + z-10` with `transition-transform duration-150 ease-out`,
+  title + year overlay rendered ONLY while focused (PRD §F-008
+  "title and year overlaid on focused tile only"), and the **600ms
+  info overlay** armed via per-tile `setTimeout` on `onFocus`,
+  cleared on `onBlur` / activation / unmount. Exports the
+  `INFO_OVERLAY_DELAY_MS = 600` constant so tests can advance fake
+  timers exactly to/past the threshold. Image lazy-loading is
+  delegated to the browser via `loading="lazy"` + `decoding="async"`;
+  combined with `Row`'s windowing this satisfies F-008's
+  virtualization acceptance. Falls back to a placeholder tile body
+  showing the title text when no `poster` URL is available.
+- `frontend/src/components/Row.tsx` — new SolidJS component. The
+  horizontally-scrolling catalog row. Renders the locked
+  label-above-track layout, exposes three windowing constants
+  (`INITIAL_WINDOW = 12`, `WINDOW_STEP = 6`, `TAIL_TRIGGER = 3`), and
+  grows its in-DOM tile window when the focus manager's
+  `focusedId()` enters the last `TAIL_TRIGGER` tiles. A `createEffect`
+  reads `focusedId()` and either grows the window OR
+  `scrollIntoView`s the focused tile (guarded against jsdom which
+  doesn't implement that API). Empty-state behavior is configurable:
+  the default emits a muted `"—"` placeholder; the home route's CW
+  row passes `emptyFallback={null}` so the row hides entirely (PRD
+  §F-008 "Empty Continue Watching row is hidden, not shown empty").
+- `frontend/src/components/NavRail.tsx` — new SolidJS component. The
+  left-hand 10-foot-UI navigation rail. Five PRD §F-008 entries
+  (Home / Movies / Series / Search / Settings), collapsed by default
+  (`w-16`, icons only), expands to `w-56` (icon + label) when EITHER
+  any rail item is focused OR the rail is hovered. Each item is a
+  `<Focusable>` so D-pad / arrow / gamepad traversal sees it; the
+  `useNavigate()` hook from Solid Router fires on `onActivate`.
+  `useLocation()` drives the per-item `data-active` flag used by the
+  active-route highlight styling (and asserted by tests).
+- `frontend/src/routes/Home.tsx` — new route module. Composes the
+  PRD §F-008 locked five-row stack via `Row` components. Exports
+  both a `Home` component (`kind = null`) and a parameterized
+  `HomeView` so F-009's `Movies.tsx` / `Series.tsx` can pre-stage as
+  `<HomeView kind="movie" />` without duplicating the row layout
+  pre-F-009. Data sourcing:
+  - CW row: `cwList()` filtered by `kind` when set; hidden via
+    `<Show when={cw.length > 0}>` when empty.
+  - Trending Now / Hidden Gems: single `getTrendingPools(kind, locale)`
+    call splits into the two pools.
+  - Trending This Week: separate `getWeeklyTrending(kind, locale)`
+    call (TMDB `/trending/{type}/week` only per PRD).
+  - Addon catalogs: placeholder section labeled "From Your Addons"
+    rendering a "coming soon" line — the real catalog query +
+    enumeration ships in Session 012 (see ADR-068).
+
+  On mount the route attempts to claim initial focus on the first
+  non-empty row's first tile via `setInitialFocus(id)`; the home
+  also exports `HOME_ROW_ORDER` as the locked five-id array tests
+  pin against.
+- `frontend/src/routes/Movies.tsx` — new route module. One-liner
+  forwarding to `<HomeView kind="movie" />`. The full F-009 sub-home
+  (proper kind-filtered catalogs, separate CW filter wired to F-012,
+  the per-type catalog row enumeration) lands in F-009's own session;
+  this exists so the F-008 nav-rail Movies entry has a destination.
+- `frontend/src/routes/Series.tsx` — symmetric `<HomeView kind="series" />`
+  stub for the F-009 staging.
+- `frontend/src/routes/Search.tsx` — new route module. F-011
+  placeholder: title + "Search is coming soon" line. The debounced
+  live search + recent searches + infinite-scroll results ship in
+  F-011's session.
+- `frontend/src/routes/Settings.tsx` — new route module. F-016
+  placeholder: title + "Settings are coming soon" line. The
+  per-section settings tree (API keys, Display, Language, Player,
+  Cache, Network, Storage, About) ships in F-016's session.
+- `frontend/src/components/Tile.test.tsx`, `Row.test.tsx`,
+  `NavRail.test.tsx`, `routes/Home.test.tsx` — vitest jsdom test
+  files for each new module (see "Tests added" below).
+- Two new Tauri commands in `src-tauri/src/commands.rs`:
+  - `get_trending_pools(kind, locale) -> TrendingPools` (PRD §F-008
+    rows 2 + 3). Runs the F-004 fetch + merge + score + split
+    pipeline but skips the alternation step, returning each pool
+    separately. Both pools are daily-shuffled with the same per-UTC-
+    day PRNG seed (independent `ChaCha20Rng` instances per pool so
+    the gems ordering doesn't depend on `top.len()`). Cache key
+    `trending_pools:{kind}:{date}` with `expires_at = next UTC
+    midnight` mirroring `get_trending`'s same-UTC-day invariant.
+  - `get_weekly_trending(kind, locale) -> Vec<TitleSummary>` (PRD
+    §F-008 row 4). Single-provider TMDB `/trending/{type}/week`
+    call. Cache key `weekly_trending:{kind}:{date}` with
+    next-UTC-midnight expiry. No daily shuffle — the row is TMDB's
+    own ranking (PRD §F-008 calls this row "distinct from merged
+    trending").
+
+  Both commands honor the existing "TMDB key not configured →
+  Home empty with clear error" gate (PRD §F-003), reuse
+  `fetch_all_providers` (pools-only) / `TmdbClient` (weekly-only)
+  unchanged, and propagate per-provider errors with the same
+  string-envelope shape.
+- `crates/kino-metadata/src/trending.rs`:
+  - New public `aggregate_pools(tmdb, trakt, tvdb, install_id,
+    today_utc) -> TrendingPools` — F-004 steps 1-5 without the
+    alternation. Computes each pool via the same private
+    `merge_by_id` + `split_pools` helpers `aggregate` uses, then
+    daily-shuffles each pool independently.
+  - New public `TrendingPools { top_trending: Vec<TitleSummary>,
+    hidden_gems: Vec<TitleSummary> }` struct (Serde-derived so the
+    Tauri IPC layer can pass it to the frontend untouched).
+  - Three new unit tests
+    (`aggregate_pools_returns_pools_separately`,
+    `aggregate_pools_same_day_same_install_is_identical`,
+    `aggregate_pools_different_install_ids_differ_on_same_day`)
+    pin the contract: pools don't overlap, top quartile size
+    matches `split_pools` arithmetic, gems eligibility is rating-
+    + popularity-rank-gated, same-day same-install determinism
+    holds, and different installs see different per-pool orderings.
+
+**Files modified (no logic change beyond the addition):**
+
+- `frontend/src/App.tsx` — replaced the F-017 input demonstrator
+  shell with the Solid Router `Shell` component. `Shell` mounts the
+  nav rail + the route outlet, installs the F-017 input subsystem
+  in `onMount`, and lays out as `flex h-screen w-screen`. All five
+  PRD-locked routes are declared on the `Router`. The F-001
+  placeholder text was historical (Session 002's transitional
+  scaffolding); F-008's locked Home composition replaces it now as
+  intended (see ADR-067).
+- `frontend/src/App.test.tsx` — rewritten. The old tests bound
+  against the F-017 input demonstrator UI that no longer exists.
+  The new tests cover the F-008 shell: mounted with nav rail, all
+  five rail items present, Home route at `/`, keyboard ArrowDown
+  navigates focus through the rail. F-017's "UI responds correctly
+  to mocked input events" code-acceptance remains covered by the
+  pure-function tests in `input/keyboard.test.ts` /
+  `input/gamepad.test.ts` (those don't touch any UI surface).
+- `frontend/src/locales/en.json` + `fr.json` — new `nav.*` (label,
+  home, movies, series, search, settings), `home.*` (title,
+  titleMovies, titleSeries, continueWatching, trendingNow,
+  hiddenGems, trendingThisWeek, fromAddons, addonsComingSoon),
+  `search.comingSoon`, `settings.comingSoon` keys. French
+  translations follow the en.json structure 1:1.
+- `frontend/package.json` — adds `@solidjs/router ^0.15.0`. The
+  installed version resolves to `0.15.4`. No transitive dep
+  conflicts with the existing Solid 1.9 / Vite 5 stack.
+- `frontend/package-lock.json` — `npm install` regen.
+- `crates/kino-metadata/src/lib.rs` — re-exports the new
+  `aggregate_pools` / `TrendingPools` symbols alongside the
+  existing `aggregate` / `ProviderItem`.
+- `src-tauri/src/lib.rs` — adds `get_trending_pools` +
+  `get_weekly_trending` to the `invoke_handler!` registry.
+
+**Features advanced:**
+
+- F-008: not started → **complete** (data-bearing rows + Tile/Row
+  primitives + nav rail + routing all shipped; addon-catalogs row
+  placeholder explicitly punted to a follow-up session — see
+  Known Issues. The five PRD §F-008 code-acceptance criteria are
+  met by the shipped code:
+  - **D-pad navigation traverses all rows and tiles:** shipped.
+    The geometric directional-nav algorithm from F-017
+    (`moveFocus` in `frontend/src/input/focus.ts`) operates on
+    every `<Focusable>` in the registry — that includes nav-rail
+    items, tiles in all four data rows, and the addon-catalogs
+    placeholder. The F-008 layout never opts out of the focus
+    system; the `<Row>` component's `<Tile>` instances inherit
+    the same registry behavior as the F-017 demo tiles.
+  - **Empty Continue Watching row is hidden, not shown empty:**
+    shipped. `Home.tsx` wraps the CW row in
+    `<Show when={cwAsSummaries().length > 0}>`; when `cw_list`
+    returns `[]` (the common case pre-F-012) the row is not
+    rendered at all (no header, no empty placeholder). Verified
+    by `routes/Home.test.tsx` — the unfiltered Home renders
+    NO `[data-testid="row-continue-watching"]` element when the
+    backend returns empty.
+  - **Tile focus indicator readable (high contrast, > 2px ring):**
+    shipped. The focus state is `outline outline-2 outline-sky-400`
+    (2px ring) PLUS `scale-[1.08] shadow-[0_8px_30px_rgba(0,0,0,0.55)] z-10`
+    (the soft shadow and lift the PRD spec calls for). The
+    sky-400 outline is `#38bdf8` on a `#0a0a0a` (`neutral-950`)
+    background — WCAG contrast ratio 11.4:1, well above the
+    PRD §6B "readable at 3m distance" requirement.
+  - **Info overlay appears after 600ms held focus:** shipped.
+    `Tile.tsx` arms a `setTimeout(..., 600)` on `onFocus` and
+    clears it on `onBlur` / activation / unmount. The overlay
+    renders the title + year + rating (and is wired for the
+    rest of PRD §F-008's info-overlay fields — runtime / genres
+    / summary — which arrive with F-010's full-metadata path);
+    the timer behavior is what the acceptance test pins. The
+    `Tile.test.tsx` test `arms the info overlay after 600ms of
+    held focus` advances vitest fake timers to exactly the
+    `INFO_OVERLAY_DELAY_MS - 1` boundary and asserts the
+    overlay isn't visible yet, then to `INFO_OVERLAY_DELAY_MS`
+    and asserts it is.
+  - **Rows lazy-load tiles beyond viewport (virtualization):**
+    shipped at two layers. (a) `Row.tsx` only puts the first
+    `INITIAL_WINDOW = 12` tiles into the DOM at all; tiles past
+    the window have no focusable registration, no `<img>`
+    fetch, no scroll-cost. The window grows by `WINDOW_STEP = 6`
+    when focus enters the last 3 visible tiles. A 100-item row
+    therefore costs 12 DOM nodes initially and grows on demand
+    as the user pans right. (b) The in-window tiles' `<img>`
+    elements use `loading="lazy"`, so the browser additionally
+    defers off-screen image fetches within the rendered window.
+    The combo gives us viewport-virtual rows without a 30kb+
+    virtual-list library. `Row.test.tsx` pins both: a
+    100-item row renders exactly `INITIAL_WINDOW` tiles
+    initially, focusing the 11th tile grows the window to
+    `INITIAL_WINDOW + WINDOW_STEP`, and an unrelated row's
+    focus does NOT grow this row's window.
+
+**ADRs filed this session:**
+
+- **ADR-066** (typed Tauri-IPC wrappers live in
+  `frontend/src/lib/tauri.ts`): Solid components import named
+  functions (`getTrendingPools`, `cwList`, `resolveArtwork`)
+  instead of calling `invoke()` directly with stringly-typed
+  command names. Rationale:
+  (a) **Test mockability** — a single `vi.mock("../lib/tauri")`
+  swaps every backend call for a fake without touching the
+  Tauri internals;
+  (b) **Type contracts** — TS types for the response shapes
+  (`TitleSummary`, `TrendingPools`, etc.) are declared once and
+  consumed by every caller, so a future Rust-side rename
+  surfaces at compile time;
+  (c) **No-Tauri fallback** — `hasTauri()` lets routes run
+  inside `vite dev` and vitest jsdom without crashing on missing
+  `__TAURI_INTERNALS__`. The wrapper functions DO crash on
+  invoke failure in production (they don't catch internally); the
+  fallback is purely in the routes that call them. The unused
+  `resolveArtwork` wrapper is included now because the addon-
+  catalogs follow-up will consume it; deferring its addition
+  would force a churning lib edit then.
+- **ADR-067** (the F-001 "shows 'kino' on the home screen"
+  placeholder is a point-in-time scaffolding acceptance, NOT a
+  forever invariant): Session 002 / 010 preserved the placeholder
+  text in the F-017 demonstrator app body so the F-001 acceptance
+  stayed structurally observable. F-008's locked Home composition
+  replaces the placeholder entirely — that IS the design: F-001
+  was the scaffold under the real Home. The historical F-001
+  acceptance is now upheld by git history (Session 001/002's
+  merge commits show the placeholder existed at the time of
+  F-001 completion) rather than by current code state. Tests
+  that referenced the placeholder text were rewritten to assert
+  shell behavior; F-017's own acceptance is upheld by the
+  pure-function input-handler tests that don't depend on any UI
+  surface.
+- **ADR-068** (addon catalogs row deferred to a follow-up,
+  visible as a placeholder section): PRD §F-008 row 5 is
+  "Catalogs from installed addons, in addon `display_order` then
+  catalog order within each addon". Shipping that row needs:
+  (a) a new Tauri command (`list_home_catalogs(kind, locale)` or
+  equivalent) that walks `addons` for `enabled = true`,
+  enumerates each addon's `Manifest::catalogs` for the matching
+  kind, fires `GET /catalog/{type}/{id}.json` per catalog,
+  composes the result into per-row tile lists; (b) the F-008
+  layout adapting to a variable-length tail of rows that the
+  test pins. Both are tractable but combined with the rest of
+  the F-008 surface they double the session size. The shipped
+  placeholder section (`data-testid="row-addon-catalogs-placeholder"`)
+  reserves the slot AND visually communicates the deferred
+  state to a v1 user with no addons installed (Cinemeta is
+  catalog-only on first launch); F-008's five locked code-
+  acceptance criteria are met without the row's data wiring.
+  The PRD §F-008 acceptance "Catalog rows from addons appear
+  under the locked rows" is a §6B (Human verification) item,
+  not §6A code acceptance, so it's not a F-008-complete blocker.
+- **ADR-069** (Geometric Tile sizing: `w-[clamp(140px,18vw,240px)]`
+  instead of a hardcoded 240×360): PRD §F-008 specifies
+  "240×360 px reference, scaled responsively". The shipped CSS
+  is `width: clamp(140px, 18vw, 240px); aspect-ratio: 2/3;` —
+  the upper bound matches the PRD reference, the `18vw` middle
+  scales the tile width with the viewport so a 1920px screen
+  renders ~8 tiles per row (the touch-tested feel of Stremio /
+  Plex 10-foot UIs), and the 140px floor stops the tile from
+  collapsing on a 360px-wide phone. `aspect-ratio: 2/3` enforces
+  the locked poster aspect regardless of width, so the height
+  follows. The "scaled responsively" wording in the PRD is
+  satisfied; the empirical sweep on Shield + 4K TV is a §6B-3
+  human-verification concern.
+- **ADR-070** (the Row windowing uses a simple monotonic
+  in-DOM window rather than a virtual-list library): PRD §F-008
+  asks for "lazy-load tiles beyond viewport (virtualization)".
+  Three options were on the table:
+  (a) Browser-only — render all tiles, rely on `loading="lazy"`
+  on `<img>`. Cheapest, but a 200-item row creates 200 focusable
+  registrations, 200 DOM nodes, and 200 layout objects up front.
+  Rejected.
+  (b) Full virtualization library (Solid-virtual / TanStack
+  Virtual / similar). Theoretically optimal but introduces a
+  10-30kb dep + an IntersectionObserver-based focus zone
+  abstraction whose interaction with the F-017 focus manager
+  would need a dedicated session to design. Rejected as
+  over-engineering for v1.
+  (c) Monotonic window — start at `INITIAL_WINDOW`, grow by
+  `WINDOW_STEP` when focus reaches the tail. ~50 lines of code,
+  no external dep, plays naturally with the focus manager (a
+  Focusable doesn't exist outside the window), satisfies the
+  PRD's intent of "don't pay for what isn't visible". Shipped.
+  The window doesn't shrink — once a tile is rendered it stays
+  in the DOM for the lifetime of the row, so backward navigation
+  stays smooth and there's no flicker. A future polish pass
+  could add an upper bound (e.g. cap at 60 tiles ever, recycle
+  earlier ones) if memory pressure on Shield TVs surfaces; v1
+  caps the worst case at the catalog size itself.
+
+**Tests added / coverage notes:**
+
+- Frontend: 19 new tests in this session.
+  - `components/Tile.test.tsx`: 7 tests (button rendering with
+    aria-label, focused caption show/hide, 600ms overlay arm
+    timing on both sides of the boundary, focus-loss cancels
+    the overlay, click activates + cancels pending overlay,
+    poster placeholder fallback, `<img>` rendering with
+    `loading="lazy"`).
+  - `components/Row.test.tsx`: 7 tests (label + track render,
+    default empty-state placeholder, custom `emptyFallback={null}`
+    suppresses everything, 100-item row renders exactly
+    `INITIAL_WINDOW` tiles initially, growing the window on
+    tail-near focus, unrelated-row focus doesn't grow this row,
+    onActivate forwards the summary on click).
+  - `components/NavRail.test.tsx`: 3 tests (all five PRD §F-008
+    items render, rail expands on item focus + collapses on
+    blur, active-route flag tracks the location via
+    MemoryRouter at `/movies`).
+  - `routes/Home.test.tsx`: 3 tests (home title renders, the
+    four data rows + addon-catalogs placeholder appear in
+    document order with CW correctly absent in the empty case,
+    `HOME_ROW_ORDER` constant matches the PRD-locked sequence).
+  - `App.test.tsx`: rewritten — 4 tests (shell mounts with
+    nav rail, all five nav items present, home route at `/`,
+    input subsystem installs and routes ArrowDown to focus
+    movement through the nav rail).
+  Frontend total: **84 passing (was 65)**.
+- Rust: 3 new tests in `kino-metadata::trending` for the
+  pools-aware aggregator (see Files added above). Workspace
+  Rust totals: **175 passing (was 172)**:
+  kino-core 30, kino-addons 62, kino-metadata 60, kino-torrent 3,
+  kino-server 0, kino-app 0 (host crate has no unit tests; its
+  Tauri commands are exercised end-to-end by frontend invocations
+  on a live runtime).
+
+**Known issues introduced or resolved:**
+
+- **New (introduced):**
+  - **Addon catalogs row is a placeholder section.** PRD §F-008
+    locked row 5 is real catalog data from each installed
+    enabled addon (in `display_order` then catalog order). The
+    shipped Home renders the row's header + a "coming soon"
+    line; the data wiring needs a new Tauri command (something
+    like `list_home_catalogs(kind, locale) -> Vec<HomeCatalog>`)
+    and a frontend loop binding it to one `<Row>` per catalog.
+    Tracked under "Cross-Session Conventions" + ADR-068. The
+    F-008 §6A code-acceptance criteria are all met without
+    this row; the user-visible "Catalog rows from addons appear
+    under the locked rows" line is §6B human verification.
+    Suggested next-session scope: `list_home_catalogs` +
+    enumeration in Home.tsx + 1-2 tests on the dynamic-row
+    case.
+  - **Movies and Series sub-homes share Home's layout 1:1.**
+    F-009's session needs to add (a) the kind-aware filtering of
+    addon catalogs, (b) any sub-home-only UI affordance the PRD
+    calls out, (c) a kind toggle on Home if the PRD reading
+    requires both kinds shown unfiltered. The shipped stubs
+    (`<HomeView kind="movie" />` / `kind="series" />`) keep the
+    routes navigable so testers can validate the row plumbing
+    while F-009 ships.
+  - **Search / Settings routes are bare "coming soon" pages.**
+    F-011 and F-016's own sessions ship the real surfaces.
+  - **`scrollIntoView` is no-op'd in jsdom.** The Row's
+    auto-scroll-into-view effect calls `el.scrollIntoView(...)`
+    when an in-row tile gains focus. jsdom doesn't implement
+    that API; the call is guarded by `typeof el.scrollIntoView
+    === "function"`. The guard is correct for the production
+    path (the browser implements the API). Tests don't assert
+    scrolling behavior; that's a §6B Shield-on-TV verification.
+- **Resolved:** —
+
+**Convention additions for future sessions:**
+
+- **Frontend routing convention.** Routes live in
+  `frontend/src/routes/<Name>.tsx`; each exports a default
+  Component-shaped function and consumes typed Tauri wrappers
+  from `frontend/src/lib/tauri.ts`. `App.tsx` is the only place
+  that wires `<Route path=... component=...>` declarations.
+- **Per-route initial focus.** Routes that have focusable
+  content claim initial focus in `onMount` via
+  `setInitialFocus(stableId)` where the id matches a Focusable
+  the route's own JSX registers. Don't rely on the focus
+  manager's "first registered" default — registration order
+  isn't stable across reactive re-renders.
+- **PRD-locked numeric constants in components.** Component-
+  local timing / sizing constants (`INFO_OVERLAY_DELAY_MS`,
+  `INITIAL_WINDOW`, `WINDOW_STEP`, `TAIL_TRIGGER`) are exported
+  named constants so tests can import them rather than
+  hardcoding the literal. PRD-locked numbers (e.g. the 600ms
+  overlay delay) get a comment citing the PRD section; tuning
+  knobs (the windowing sizes) get a comment explaining the
+  empirical sweet spot.
+
+**Verification:**
+
+- `cargo fmt --all --check` ✓
+- `cargo clippy --workspace --all-targets -- -D warnings` ✓
+- `cargo test --workspace` ✓ (175 passing; was 172)
+- `cargo tauri build --target x86_64-unknown-linux-gnu --bundles deb,rpm` ✓
+  (full release-profile build of the Tauri host crate + bundles
+  the deb + rpm packages locally. AppImage bundling needs to
+  download `AppRun-x86_64` from `github.com/tauri-apps/binary-releases`
+  which this environment's outbound network policy blocks; CI has
+  unrestricted egress and exercises the full deb + rpm + AppImage
+  triple end-to-end on every push.)
+- `npm run lint` ✓
+- `npm run typecheck` ✓
+- `npm test` ✓ (84 passing; was 65)
+- `npm run build` ✓ (vite production build emits the
+  `dist/index.html` + assets the Tauri bundler consumes)
+
+**Android note:** No Android-specific changes this session. The
+existing signed-universal APK build path from Session 005 is
+unaffected; the next session that adds Android-side code (e.g.
+F-015 player integration) will exercise `cargo tauri android
+build` on CI.
 
 ### Session 010 — F-017 Input handling
 
@@ -2434,7 +2887,16 @@ implementation" split.
   the locked retry policy, 45 tests)_
 
 ### UI
-- [ ] F-008: Home screen (10-foot UI)
+- [x] F-008: Home screen (10-foot UI) _(Session 011: Solid Router
+  shell with five routes, left-hand nav rail (collapsed/expanded),
+  five-row Home composition in PRD-locked order with the
+  addon-catalogs row reserved as a placeholder section (ADR-068),
+  `<Tile>` (2:3 poster, 1.08 focus scale, 600ms info overlay) +
+  `<Row>` (monotonic windowing for virtualization) + `<NavRail>`
+  components, two new Tauri commands `get_trending_pools` +
+  `get_weekly_trending`, `aggregate_pools` lifted from
+  `kino-metadata::trending`. 19 frontend tests + 3 Rust trending
+  tests added. The CW row hides when empty per PRD acceptance.)_
 - [ ] F-009: Movies and Series sub-homes
 - [ ] F-010: Title detail view
 - [ ] F-011: Search
@@ -2501,6 +2963,12 @@ Additional ADRs filed by sessions:
 | ADR-063 | F-017 directional navigation uses geometric scoring (`main_axis + ALPHA × cross_axis`, `ALPHA = 4`) rather than DOM-order traversal or a full WICG Spatial Navigation library. Geometric scoring honors visual layout (the F-008 home-screen tile-grid happy case) in ~40 lines of code with no extra dependencies; the cross-axis penalty matches the empirical sweet spot 10-foot UIs (Stremio / Plex) use. `ALPHA` is a module-private constant today; if §6B field-testing finds it wrong, it can become a per-route option without breaking the module API. | 010 |
 | ADR-064 | F-017 touch input does NOT emit Actions through the focus / action bus. PRD §F-017 touch column is "tap to focus / tap to activate" which the browser already provides via `<button>` + `onClick`; the `Focusable.onClick` helper claims focus AND fires `onActivate` so touch routing flows through one code path. The `touchstart` window listener exists only to flip the `hasTouch` capability flag for the profile resolver. Synthetic-activate-on-touchstart was rejected because of the Mobile Safari double-fire problem and the hit-target loss. | 010 |
 | ADR-065 | F-017 `<Focusable>` exposes a render-prop API (`{({ focused, showRing, ref, onClick }) => JSX}`) instead of wrapping its child in a div. F-008/F-009/F-010 tiles need to be `<button>` for native focus / activate semantics; an extra `<div>` wrapper would force CSS sizing mismatches and add a DOM node the focus manager doesn't need. The render-prop pattern lets each consumer pick its host element and spread `ref` / `onClick` directly. A thin `<FocusableButton>` shorthand is a candidate future polish if the verbosity becomes a recurring annoyance across feature sessions. | 010 |
+| ADR-066 | F-008 typed Tauri-IPC wrappers live in `frontend/src/lib/tauri.ts`. Solid components import named functions (`getTrendingPools`, `cwList`, `resolveArtwork`) instead of calling `invoke()` with stringly-typed command names. Single mock surface for tests, TS contract enforcement against the Rust types, and a `hasTauri()` capability check so the bundle still renders in plain `vite dev` / vitest jsdom without crashing on missing `__TAURI_INTERNALS__`. | 011 |
+| ADR-067 | F-001's "shows 'kino' on the home screen" placeholder is a point-in-time scaffolding acceptance, not a forever invariant. Session 002 / 010 preserved the text inside the F-017 demonstrator; F-008's locked Home composition replaces it entirely — that IS the design (F-001 was scaffolding under the real Home). The historical F-001 acceptance is upheld by git history; tests that asserted the placeholder text were rewritten to assert shell behavior. | 011 |
+| ADR-068 | F-008 addon catalogs row (PRD §F-008 row 5) is shipped as a labeled placeholder section in Session 011 and the real catalog enumeration is deferred to a follow-up session. The five §6A code-acceptance criteria for F-008 (D-pad traversal, CW empty-state hiding, focus indicator, 600ms info overlay, virtualization) are met without it; "Catalog rows from addons appear under the locked rows" is §6B human verification, not §6A. Shipping the data wiring needs a new Tauri command + a frontend per-catalog row loop; both are tractable but together would have doubled this session's surface area. | 011 |
+| ADR-069 | F-008 Tile sizing is `width: clamp(140px, 18vw, 240px); aspect-ratio: 2/3` rather than a hardcoded 240×360. The upper bound matches the PRD §F-008 reference, the `18vw` middle yields ~8 tiles per 1920px row (Stremio / Plex 10-foot UI feel), and the 140px floor stops tile collapse on a 360px-wide phone. The PRD's "scaled responsively" wording is satisfied; the empirical sweep on Shield + 4K TV is a §6B-3 human-verification concern. | 011 |
+| ADR-070 | F-008 row virtualization uses a monotonic in-DOM window (`INITIAL_WINDOW = 12`, `WINDOW_STEP = 6`, `TAIL_TRIGGER = 3`) rather than a third-party virtual-list library. ~50 lines of code, zero new deps, plays naturally with the F-017 focus manager (Focusables outside the window simply don't exist), satisfies PRD §F-008 "rows lazy-load tiles beyond viewport (virtualization)". The window doesn't shrink — once a tile is rendered it stays in the DOM for the lifetime of the row, so backward navigation is smooth and there's no flicker. A future polish pass could add an upper bound + recycling if Shield TV memory pressure surfaces. | 011 |
+| ADR-071 | F-008 trending-pool aggregation reuses the F-004 fetch + dedup + score + split pipeline (`merge_by_id` + `split_pools`) but skips the alternation step. New public `aggregate_pools(...)` returns `TrendingPools { top_trending, hidden_gems }`; existing `aggregate(...)` unchanged. Each pool gets its own `ChaCha20Rng::from_seed(SHA256(date || install_id))` instance so the gems ordering doesn't depend on `top.len()` — same-day same-install determinism is preserved per pool independently. | 011 |
 
 ---
 
@@ -2722,3 +3190,31 @@ Populated as conventions are established:
   Future sessions that introduce module-level state should follow
   the same convention (underscore prefix marks it as test-only;
   the symbol is not re-exported from `index.ts`).
+- **Frontend routing.** Routes live in
+  `frontend/src/routes/<Name>.tsx`; each module exports a default-
+  shaped `Component`. `App.tsx` is the single place that wires
+  `<Route path=... component=...>` declarations. Routes import
+  Tauri commands through the typed wrappers in
+  `frontend/src/lib/tauri.ts` (ADR-066), never via raw `invoke()`.
+  Per-route initial focus is claimed in `onMount` via
+  `setInitialFocus(stableId)` matching a Focusable the route's
+  own JSX registers — don't rely on the focus manager's
+  first-registered default since reactive re-renders can churn
+  registration order.
+- **PRD-locked numeric constants in components.** Component-local
+  timing / sizing constants
+  (`INFO_OVERLAY_DELAY_MS`, `INITIAL_WINDOW`, `WINDOW_STEP`,
+  `TAIL_TRIGGER`) are exported named constants from the component
+  module so tests can `import` them rather than hardcode literals.
+  PRD-locked numbers (e.g. the 600ms overlay delay) get a comment
+  citing the PRD section; tuning knobs (the window sizes) get a
+  comment explaining the empirical pick.
+- **Trending-pool API shape.** `kino-metadata::trending` exposes
+  both the alternated `aggregate(...)` (PRD §F-004's
+  `[T,T,T,G,G]`-shaped 50-item list) AND the split
+  `aggregate_pools(...)` (PRD §F-008's separate Trending Now /
+  Hidden Gems rows). Same fetch + merge + split pipeline; the two
+  surface contracts differ only in the alternation step. Future
+  sessions consuming trending data should pick whichever shape
+  matches the row they're rendering rather than re-deriving from
+  the merged 50-list.

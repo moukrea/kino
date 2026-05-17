@@ -71,6 +71,8 @@ pub fn run() {
             commands::test_tvdb,
             commands::test_fanart,
             commands::get_trending,
+            commands::get_trending_pools,
+            commands::get_weekly_trending,
             commands::resolve_artwork,
             commands::check_availability,
             commands::get_recommended_addons,
