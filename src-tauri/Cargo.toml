@@ -51,6 +51,11 @@ dirs = "5"
 chrono = { workspace = true }
 tokio = { workspace = true }
 
+# F-010: title-detail stream-row parsing extracts seeders + filesize from
+# addon-supplied stream titles via small regex patterns. The §8 quality /
+# HDR / audio / codec regex set lives in `kino-addons::parse`.
+regex = { workspace = true }
+
 [dev-dependencies]
 # F-006 unit tests stand up mock Stremio stream endpoints.
 wiremock = { workspace = true }

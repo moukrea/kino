@@ -96,6 +96,43 @@ impl TraktClient {
             .collect())
     }
 
+    /// Fetch the Trakt user-rating for a single title (PRD §F-010 ratings
+    /// row). Trakt's `/movies/{id}/ratings` and `/shows/{id}/ratings`
+    /// endpoints accept either the Trakt slug, the Trakt numeric id, or
+    /// the `IMDb` id directly — we always pass the `IMDb` id since that's
+    /// the shape kino's `TitleIds` carries.
+    ///
+    /// Returns the `rating` field (0-10 scale) when Trakt has votes;
+    /// `None` when the title is unknown to Trakt or no ratings have been
+    /// recorded.
+    pub async fn title_rating(&self, imdb_id: &str, kind: TitleKind) -> Result<Option<f64>, Error> {
+        let segment = match kind {
+            TitleKind::Movie => "movies",
+            TitleKind::Series => "shows",
+        };
+        let url = format!("{}/{segment}/{imdb_id}/ratings", self.base_url);
+        let response = match fetch_with_retry(
+            || {
+                self.client
+                    .get(&url)
+                    .header("trakt-api-version", "2")
+                    .header("trakt-api-key", self.key.as_str())
+            },
+            &self.config,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(kino_core::http::HttpError::Http { status: 404, .. }) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let body: TraktRatings = response
+            .json()
+            .await
+            .map_err(|e| Error::Decode(format!("trakt {segment} ratings: {e}")))?;
+        Ok(body.rating.filter(|n| *n > 0.0))
+    }
+
     async fn fetch_trending<T: for<'de> Deserialize<'de>>(&self, url: &str) -> Result<T, Error> {
         let response = fetch_with_retry(
             || {
@@ -142,6 +179,13 @@ struct TitleIds {
     imdb: Option<String>,
     #[serde(default)]
     tmdb: Option<u64>,
+}
+
+/// `/{movies,shows}/{id}/ratings` response shape (PRD §F-010).
+#[derive(Debug, Deserialize)]
+struct TraktRatings {
+    #[serde(default)]
+    rating: Option<f64>,
 }
 
 impl TitleEntry {
@@ -263,6 +307,91 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].summary.id, "tt7777777");
         assert_eq!(items[0].summary.kind, TitleKind::Series);
+    }
+
+    #[tokio::test]
+    async fn title_rating_returns_value_for_movie() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/movies/tt0133093/ratings"))
+            .and(header("trakt-api-version", "2"))
+            .and(header("trakt-api-key", "test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "rating": 8.34,
+                "votes": 12345,
+                "distribution": {}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TraktClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let rating = client
+            .title_rating("tt0133093", TitleKind::Movie)
+            .await
+            .unwrap();
+        assert_eq!(rating, Some(8.34));
+    }
+
+    #[tokio::test]
+    async fn title_rating_uses_shows_segment_for_series() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/shows/tt0944947/ratings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "rating": 9.1,
+                "votes": 99999,
+                "distribution": {}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TraktClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let rating = client
+            .title_rating("tt0944947", TitleKind::Series)
+            .await
+            .unwrap();
+        assert_eq!(rating, Some(9.1));
+    }
+
+    #[tokio::test]
+    async fn title_rating_returns_none_on_404() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/movies/tt9999999/ratings"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TraktClient::with_options("test-key", HttpConfig::for_test(), server.uri()).unwrap();
+        let rating = client
+            .title_rating("tt9999999", TitleKind::Movie)
+            .await
+            .unwrap();
+        assert!(rating.is_none());
+    }
+
+    #[tokio::test]
+    async fn title_rating_returns_none_when_value_zero() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/movies/tt1234567/ratings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "rating": 0.0,
+                "votes": 0
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TraktClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let rating = client
+            .title_rating("tt1234567", TitleKind::Movie)
+            .await
+            .unwrap();
+        assert!(rating.is_none());
     }
 
     #[tokio::test]

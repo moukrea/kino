@@ -9,9 +9,11 @@
 //! module rather than introducing parallel registries.
 
 use chrono::{Datelike, NaiveDate, TimeZone, Utc};
+use kino_addons::parse::parse as parse_filename;
 use kino_addons::{
-    normalize_manifest_url, AddonClient, AddonError, CatalogDescriptor, Manifest, MetaPreview,
-    RecommendedAddon, CINEMETA_MANIFEST_URL, RECOMMENDED_ADDONS,
+    normalize_manifest_url, AddonClient, AddonError, CatalogDescriptor, Manifest, MetaDetail,
+    MetaPreview, RecommendedAddon, Stream as AddonStream, CINEMETA_MANIFEST_URL,
+    RECOMMENDED_ADDONS,
 };
 use kino_core::addon::{Addon, AddonInsert};
 use kino_core::availability::AvailabilityRow;
@@ -20,13 +22,14 @@ use kino_core::constants::{
 };
 use kino_core::cw::ContinueWatching;
 use kino_core::http::HttpConfig;
+use kino_core::stream::{Audio, Codec, Hdr, ParsedTags, Quality};
 use kino_core::title::{Artwork, TitleKind, TitleSummary};
 use kino_core::Db;
 use kino_metadata::artwork::{cascade, lang_chain_hash, CachedArtwork, ProviderBundles};
 use kino_metadata::tmdb::TitleIds;
 use kino_metadata::{
-    aggregate, FanartClient, ProviderItem, TmdbClient, TraktClient, TvdbClient, FANART_API_KEY,
-    TMDB_API_KEY, TRAKT_API_KEY, TVDB_API_KEY,
+    aggregate, FanartClient, ProviderItem, TmdbCastMember, TmdbClient, TmdbTitleDetails,
+    TraktClient, TvdbClient, FANART_API_KEY, TMDB_API_KEY, TRAKT_API_KEY, TVDB_API_KEY,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1485,6 +1488,1025 @@ async fn is_cinemeta_id(db: &Db, id: &str) -> Result<bool, String> {
         .any(|a| a.id == id && a.manifest_url == CINEMETA_MANIFEST_URL))
 }
 
+// ---- F-010: title detail view ------------------------------------------
+//
+// `get_title_detail(title_id, kind, lang_pref)` builds the title-detail
+// payload from three sources, in this order:
+//
+//   1. Cinemeta (`/meta/{kind}/{imdb_id}.json`) — always called first when
+//      we can resolve an IMDb id. Cinemeta is the PRD-locked default addon
+//      (auto-installed on first launch) and serves a reasonably complete
+//      MetaDetail (title, runtime string, IMDb rating, genres, cast names,
+//      videos[] for series) with no API key required. We treat its
+//      response as the baseline.
+//
+//   2. TMDB title_details + credits — overrides Cinemeta's runtime,
+//      summary, genres, and rating (TMDB's vote_average) with localized /
+//      higher-quality data when a TMDB key is configured. The cast row
+//      gets photo URLs from TMDB credits (the PRD requires top-6 with
+//      photos — Cinemeta only carries names).
+//
+//   3. Trakt title_rating — fills the trakt_rating field when configured.
+//
+// CW lookup happens last: per-episode progress is keyed on (title_id,
+// season, episode) for series, and an aggregate "resume target" is
+// picked from the most-recently-played CW row across all episodes (or
+// the single row for movies).
+//
+// Caching: `meta:{title_id}:{kind}:{chain_hash}` with `META_TTL_S = 24h`
+// (PRD §8). The CW lookup is NOT cached — it reads the live `Db` table
+// after a cache hit so the Resume button toggles correctly when the user
+// starts / stops a title between detail-view visits.
+//
+// `get_streams(title_id, kind, season?, episode?)` is a separate command
+// because (a) movies and series need different stream-id shapes
+// (`tt0133093` vs `tt0944947:1:1`), (b) episode switching in the detail
+// view re-fires only this call, not the metadata one, and (c) the PRD
+// §F-010 stream-row sort + badge parsing logic is independent from the
+// metadata pipeline. The shipped sort: quality DESC, then seeders DESC,
+// then size DESC.
+
+/// One cast member entry in the detail view's cast row (PRD §F-010
+/// "top 6 with photos"). The frontend renders this as a circular
+/// photo + name + (optional) character tile.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CastMember {
+    pub name: String,
+    pub character: Option<String>,
+    pub photo: Option<String>,
+}
+
+/// One episode in the series detail view (PRD §F-010 "season selector +
+/// episode list"). `progress` is the fraction of the episode the user
+/// has watched (0.0..=1.0); zero when no CW entry exists for that
+/// `(title_id, season, episode)` tuple.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[allow(clippy::struct_field_names)] // `episode` field is a domain term (episode number within season).
+pub struct Episode {
+    /// Stremio video id (`tt0944947:1:1` shape). The frontend passes
+    /// this back to `get_streams` via the `season` / `episode` numeric
+    /// pair, but the id is kept around as a stable React-style key.
+    pub video_id: String,
+    pub season: i64,
+    pub episode: i64,
+    pub title: String,
+    /// ISO-8601 air date when the addon supplies one; otherwise empty.
+    pub air_date: Option<String>,
+    /// Episode synopsis, truncated to 120 chars per PRD §F-010.
+    pub overview: Option<String>,
+    pub thumbnail: Option<String>,
+    /// `[0.0, 1.0]` watch progress for THIS episode. Zero when no CW
+    /// entry exists for the matching `(title_id, season, episode)` tuple.
+    pub progress: f64,
+}
+
+/// Title-detail payload returned to the frontend (PRD §F-010).
+///
+/// Several fields are `Option<…>` because PRD §F-010 specifies them as
+/// "when known": age rating, runtime, summary, the three ratings, the
+/// hero artwork. The frontend renders missing fields as absent (not
+/// "Unknown") per the 10-foot UI norm.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TitleDetail {
+    /// Provider-prefixed id forwarded from the request (echoed so the
+    /// frontend can route back to it via state without re-encoding).
+    pub id: String,
+    pub kind: TitleKind,
+    pub title: String,
+    pub year: Option<u16>,
+    pub runtime_minutes: Option<u32>,
+    pub age_rating: Option<String>,
+    pub genres: Vec<String>,
+    pub summary: Option<String>,
+    pub imdb_rating: Option<f64>,
+    pub tmdb_rating: Option<f64>,
+    pub trakt_rating: Option<f64>,
+    pub backdrop: Option<String>,
+    pub logo: Option<String>,
+    pub poster: Option<String>,
+    /// Cast roster, truncated to the top six (PRD §F-010).
+    pub cast: Vec<CastMember>,
+    /// Series episodes. Empty for movies. Ordered by `(season, episode)`
+    /// ascending.
+    pub episodes: Vec<Episode>,
+    /// CW resume position (seconds) for the most-recently-played row of
+    /// this title. `None` when no CW row exists → frontend hides the
+    /// Resume button (PRD §F-010 code acceptance).
+    pub resume_position_s: Option<f64>,
+    pub resume_duration_s: Option<f64>,
+    /// Season the user should resume on for series; `None` for movies.
+    pub resume_season: Option<i64>,
+    pub resume_episode: Option<i64>,
+    /// Stremio id the user should be sent to when activating Resume
+    /// (`tt0133093` for movies, `tt0944947:1:1` for series). Populated
+    /// alongside `resume_position_s` so the frontend doesn't have to
+    /// re-derive it.
+    pub resume_video_id: Option<String>,
+    /// `IMDb` id resolved from the supplied `title_id` (falls back
+    /// through TMDB when not directly known). The frontend uses this
+    /// when activating Play on a movie or building per-episode stream
+    /// ids.
+    pub stremio_id: Option<String>,
+}
+
+/// One stream row in the detail view (PRD §F-010 stream row contents).
+///
+/// `quality` / `hdr` / `audio` / `codec` come from
+/// `kino_addons::parse::parse` over the concatenation of the addon-
+/// supplied `name` / `title` / `description` fields (Stremio addons put
+/// the parseable filename text in different places — Torrentio puts
+/// quality + audio + codec in `title`, `OpenSubtitles` uses `description`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StreamRow {
+    pub addon_id: String,
+    pub addon_name: String,
+    /// Display label rendered as the row title — the addon's `name` field
+    /// when present, else a `"{addon} stream"` fallback.
+    pub name: String,
+    /// Filename-like detail line (parsed from `title` / `description`).
+    pub detail: Option<String>,
+    /// Parsed quality badge (4K / 1080p / 720p / SD). `None` when the
+    /// stream's text didn't match any locked PRD §8 regex.
+    pub quality: Option<Quality>,
+    pub hdr: Option<Hdr>,
+    pub audio: Option<Audio>,
+    pub codec: Option<Codec>,
+    /// Seeders extracted from the stream's `title` / `description`.
+    /// Recognized shapes: Torrentio's `"👤 156"`, plain `"Seeders: 156"`.
+    pub seeders: Option<u32>,
+    /// Filesize in bytes (extracted from `"💾 5.4 GB"` / `"Size: 5.4 GB"`).
+    pub size_bytes: Option<u64>,
+    /// Direct playable URL when the addon supplies one (e.g. Public
+    /// Domain Movies); otherwise `None`.
+    pub url: Option<String>,
+    /// `BitTorrent` info hash (`infoHash` in the Stremio protocol).
+    /// `None` when this is a direct URL stream.
+    pub info_hash: Option<String>,
+    /// Multi-file torrent: which file to play (`fileIdx`).
+    pub file_idx: Option<i64>,
+    /// Tracker / source hints carried through unchanged.
+    pub sources: Vec<String>,
+}
+
+/// `get_title_detail(title_id, kind, lang_pref) -> TitleDetail` (PRD §F-010).
+#[tauri::command]
+pub async fn get_title_detail(
+    db: State<'_, Db>,
+    title_id: String,
+    kind: TitleKind,
+    lang_pref: Vec<String>,
+) -> Result<TitleDetail, String> {
+    let chain_hash = lang_chain_hash(&lang_pref);
+    let cache_key = format!("meta:{}:{}:{}", title_id, kind.as_str(), chain_hash);
+
+    let cached_payload: Option<TitleDetailPayload> = match db.cache_get(&cache_key).await {
+        Ok(Some(payload)) => serde_json::from_str(&payload).ok(),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, "title-detail cache_get failed");
+            None
+        }
+    };
+
+    let mut payload = if let Some(p) = cached_payload {
+        p
+    } else {
+        let fetched =
+            get_title_detail_uncached(&db, &title_id, kind, &lang_pref, &HttpConfig::default())
+                .await?;
+        let serialized = serde_json::to_string(&fetched).map_err(|e| e.to_string())?;
+        let expires_at = now_unix()
+            .saturating_add(i64::try_from(kino_core::constants::META_TTL_S).unwrap_or(i64::MAX));
+        if let Err(e) = db.cache_set(&cache_key, &serialized, expires_at).await {
+            tracing::warn!(error = %e, "failed to persist title-detail cache");
+        }
+        fetched
+    };
+
+    // Always read CW live — even on a cache hit. PRD §F-010 "Resume button
+    // only present when matching CW entry exists" must toggle as soon as
+    // the user starts / completes a playback session.
+    apply_cw_to_payload(&db, &mut payload).await;
+
+    Ok(payload.into_detail(title_id))
+}
+
+/// Inner payload used in the meta cache. Mirrors [`TitleDetail`] but
+/// omits the resume / progress fields — those are layered in at read
+/// time by [`apply_cw_to_payload`] so a stale cache doesn't pin the
+/// Resume button to a previous session's state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct TitleDetailPayload {
+    kind: TitleKind,
+    title: String,
+    year: Option<u16>,
+    runtime_minutes: Option<u32>,
+    age_rating: Option<String>,
+    genres: Vec<String>,
+    summary: Option<String>,
+    imdb_rating: Option<f64>,
+    tmdb_rating: Option<f64>,
+    trakt_rating: Option<f64>,
+    backdrop: Option<String>,
+    logo: Option<String>,
+    poster: Option<String>,
+    cast: Vec<CastMember>,
+    episodes: Vec<Episode>,
+    stremio_id: Option<String>,
+    // CW-derived fields, populated by `apply_cw_to_payload` (never persisted).
+    #[serde(default, skip_serializing)]
+    resume_position_s: Option<f64>,
+    #[serde(default, skip_serializing)]
+    resume_duration_s: Option<f64>,
+    #[serde(default, skip_serializing)]
+    resume_season: Option<i64>,
+    #[serde(default, skip_serializing)]
+    resume_episode: Option<i64>,
+    #[serde(default, skip_serializing)]
+    resume_video_id: Option<String>,
+}
+
+impl TitleDetailPayload {
+    fn into_detail(self, id: String) -> TitleDetail {
+        TitleDetail {
+            id,
+            kind: self.kind,
+            title: self.title,
+            year: self.year,
+            runtime_minutes: self.runtime_minutes,
+            age_rating: self.age_rating,
+            genres: self.genres,
+            summary: self.summary,
+            imdb_rating: self.imdb_rating,
+            tmdb_rating: self.tmdb_rating,
+            trakt_rating: self.trakt_rating,
+            backdrop: self.backdrop,
+            logo: self.logo,
+            poster: self.poster,
+            cast: self.cast,
+            episodes: self.episodes,
+            resume_position_s: self.resume_position_s,
+            resume_duration_s: self.resume_duration_s,
+            resume_season: self.resume_season,
+            resume_episode: self.resume_episode,
+            resume_video_id: self.resume_video_id,
+            stremio_id: self.stremio_id,
+        }
+    }
+}
+
+/// Cache-bypassing core of [`get_title_detail`]. Public to the module so
+/// tests can drive it with a `for_test()` `HttpConfig` (zero backoffs)
+/// without going through `response_cache`.
+async fn get_title_detail_uncached(
+    db: &Db,
+    title_id: &str,
+    kind: TitleKind,
+    lang_pref: &[String],
+    http_config: &HttpConfig,
+) -> Result<TitleDetailPayload, String> {
+    let tmdb_key = db.kv_get(TMDB_API_KEY).await.map_err(ipc)?;
+    let trakt_key = db.kv_get(TRAKT_API_KEY).await.map_err(ipc)?;
+
+    let tmdb_client = match tmdb_key {
+        Some(k) => Some(
+            TmdbClient::with_options(
+                k,
+                http_config.clone(),
+                kino_metadata::tmdb::TMDB_BASE_URL.to_string(),
+            )
+            .map_err(ipc)?,
+        ),
+        None => None,
+    };
+    let trakt_client = match trakt_key {
+        Some(k) => Some(
+            TraktClient::with_options(
+                k,
+                http_config.clone(),
+                kino_metadata::trakt::TRAKT_BASE_URL.to_string(),
+            )
+            .map_err(ipc)?,
+        ),
+        None => None,
+    };
+
+    let ids = resolve_title_ids(title_id, kind, tmdb_client.as_ref()).await?;
+    let stremio_id = ids.imdb_id.clone();
+
+    let primary_lang = lang_pref
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "en".to_string());
+
+    // (1) Stremio meta baseline. Walk enabled addons that serve the
+    // `meta` resource for this kind in display_order and use the first
+    // one that returns a useful response. Cinemeta is the locked
+    // default (lowest display_order on first launch) but any meta-
+    // serving addon can substitute. Stremio addons take the IMDb id
+    // directly; without one we skip this stage entirely.
+    let mut payload = if let Some(ref imdb) = stremio_id {
+        match fetch_meta_for_title(db, kind, imdb, http_config).await {
+            Ok(Some(meta)) => payload_from_cinemeta(kind, meta),
+            Ok(None) => payload_skeleton(kind),
+            Err(e) => {
+                tracing::warn!(error = %e, "addon meta fetch failed; continuing with TMDB-only payload");
+                payload_skeleton(kind)
+            }
+        }
+    } else {
+        payload_skeleton(kind)
+    };
+
+    payload.stremio_id = stremio_id.clone();
+
+    // (2) TMDB overlay.
+    if let (Some(client), Some(tmdb_id)) = (tmdb_client.as_ref(), ids.tmdb_id) {
+        match client.title_details(tmdb_id, kind, &primary_lang).await {
+            Ok(details) => apply_tmdb_details(&mut payload, &details),
+            Err(e) => tracing::warn!(error = %e, "tmdb title_details failed"),
+        }
+        match client.credits(tmdb_id, kind).await {
+            Ok(cast) => apply_tmdb_cast(&mut payload, cast),
+            Err(e) => tracing::warn!(error = %e, "tmdb credits failed"),
+        }
+    }
+
+    // (3) Trakt overlay.
+    if let (Some(client), Some(imdb)) = (trakt_client.as_ref(), stremio_id.as_deref()) {
+        match client.title_rating(imdb, kind).await {
+            Ok(r) => payload.trakt_rating = r,
+            Err(e) => tracing::warn!(error = %e, "trakt title_rating failed"),
+        }
+    }
+
+    // Trim cast to top six per PRD §F-010.
+    payload.cast.truncate(6);
+    // Truncate per-episode overview per PRD §F-010 ("summary truncated to
+    // 120 chars"). Done here, not at render-time, so the cache holds the
+    // already-truncated form and the frontend stays simple.
+    for ep in &mut payload.episodes {
+        if let Some(text) = ep.overview.as_mut() {
+            truncate_to_chars(text, 120);
+        }
+    }
+    Ok(payload)
+}
+
+/// Fetch a `MetaDetail` for the given `IMDb` id by walking the enabled
+/// meta-serving addons in `display_order`. Cinemeta is the locked
+/// default (lowest `display_order`); any other addon that declares the
+/// `meta` resource AND lists the relevant `type` in its manifest is a
+/// valid fallback.
+///
+/// Returns `Ok(None)` when no addon could supply a response (every
+/// candidate either failed transport-side or didn't carry the `meta`
+/// resource). A transport failure on one addon does not abort the
+/// walk — we move to the next.
+async fn fetch_meta_for_title(
+    db: &Db,
+    kind: TitleKind,
+    imdb_id: &str,
+    http_config: &HttpConfig,
+) -> Result<Option<MetaDetail>, String> {
+    let installed = db.addons_list().await.map_err(ipc)?;
+    for addon in installed {
+        if !addon.enabled {
+            continue;
+        }
+        let Ok(manifest) = serde_json::from_value::<Manifest>(addon.manifest_json.clone()) else {
+            continue;
+        };
+        if !manifest.types.iter().any(|t| t == kind.as_str()) {
+            continue;
+        }
+        if !manifest.resources.iter().any(|r| r.name() == "meta") {
+            continue;
+        }
+        let client = match AddonClient::with_options(&addon.manifest_url, http_config.clone()) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(addon = %addon.id, error = %e, "meta addon client build failed");
+                continue;
+            }
+        };
+        match client.meta(kind.as_str(), imdb_id).await {
+            Ok(r) => return Ok(Some(r.meta)),
+            Err(AddonError::Http(e)) => {
+                tracing::warn!(addon = %addon.id, error = %e, "meta addon http failure; trying next");
+            }
+            Err(e) => {
+                tracing::warn!(addon = %addon.id, error = %e, "meta addon decode failure; trying next");
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Build an empty payload skeleton for the requested kind.
+fn payload_skeleton(kind: TitleKind) -> TitleDetailPayload {
+    TitleDetailPayload {
+        kind,
+        title: String::new(),
+        year: None,
+        runtime_minutes: None,
+        age_rating: None,
+        genres: Vec::new(),
+        summary: None,
+        imdb_rating: None,
+        tmdb_rating: None,
+        trakt_rating: None,
+        backdrop: None,
+        logo: None,
+        poster: None,
+        cast: Vec::new(),
+        episodes: Vec::new(),
+        stremio_id: None,
+        resume_position_s: None,
+        resume_duration_s: None,
+        resume_season: None,
+        resume_episode: None,
+        resume_video_id: None,
+    }
+}
+
+/// Map a Cinemeta `MetaDetail` into the baseline payload.
+fn payload_from_cinemeta(kind: TitleKind, meta: MetaDetail) -> TitleDetailPayload {
+    let year = meta.release_info.as_deref().and_then(parse_release_year);
+    let runtime_minutes = meta.runtime.as_deref().and_then(parse_runtime_minutes);
+    let imdb_rating = meta
+        .imdb_rating
+        .as_deref()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|n| *n > 0.0);
+    let cast = meta
+        .cast
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .map(|name| CastMember {
+            name,
+            character: None,
+            photo: None,
+        })
+        .collect();
+    let episodes = if matches!(kind, TitleKind::Series) {
+        meta.videos
+            .into_iter()
+            .filter_map(|v| {
+                let season = v.season?;
+                let episode = v.episode?;
+                // Stremio "specials" / "extras" videos come through as
+                // season 0; PRD §F-010 doesn't include them in the
+                // episode list (locked: "season selector + episode list"
+                // for canonical seasons).
+                if season < 1 || episode < 1 {
+                    return None;
+                }
+                Some(Episode {
+                    video_id: v.id,
+                    season,
+                    episode,
+                    title: v.title,
+                    air_date: v.released.filter(|s| !s.is_empty()),
+                    overview: v.overview.filter(|s| !s.is_empty()),
+                    thumbnail: v.thumbnail.filter(|s| !s.is_empty()),
+                    progress: 0.0,
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // Ensure episodes are sorted by (season, episode) — Cinemeta is
+    // usually already sorted but we don't rely on it.
+    let mut episodes = episodes;
+    episodes.sort_by(|a, b| {
+        a.season
+            .cmp(&b.season)
+            .then_with(|| a.episode.cmp(&b.episode))
+    });
+    TitleDetailPayload {
+        kind,
+        title: meta.name,
+        year,
+        runtime_minutes,
+        age_rating: None,
+        genres: meta.genres,
+        summary: meta.description.filter(|s| !s.is_empty()),
+        imdb_rating,
+        tmdb_rating: None,
+        trakt_rating: None,
+        backdrop: meta.background.filter(|s| !s.is_empty()),
+        logo: meta.logo.filter(|s| !s.is_empty()),
+        poster: meta.poster.filter(|s| !s.is_empty()),
+        cast,
+        episodes,
+        stremio_id: None,
+        resume_position_s: None,
+        resume_duration_s: None,
+        resume_season: None,
+        resume_episode: None,
+        resume_video_id: None,
+    }
+}
+
+/// Layer TMDB details over the Cinemeta-derived payload. TMDB wins on
+/// fields where it returns a value; Cinemeta's values stay as fallbacks
+/// (notably runtime, which Cinemeta serves as `"136 min"` and TMDB as
+/// the same minutes but parsed natively).
+fn apply_tmdb_details(payload: &mut TitleDetailPayload, details: &TmdbTitleDetails) {
+    if let Some(n) = details.runtime_minutes {
+        payload.runtime_minutes = Some(n);
+    }
+    if let Some(ref r) = details.age_rating {
+        payload.age_rating = Some(r.clone());
+    }
+    if !details.genres.is_empty() {
+        payload.genres.clone_from(&details.genres);
+    }
+    if let Some(ref text) = details.overview {
+        payload.summary = Some(text.clone());
+    }
+    if let Some(r) = details.rating {
+        payload.tmdb_rating = Some(r);
+    }
+}
+
+/// Replace the Cinemeta name-only cast with the TMDB photo-augmented
+/// roster. TMDB's order is the canonical billing order — we don't merge
+/// or dedup; for v1 the photo-bearing list is strictly better.
+fn apply_tmdb_cast(payload: &mut TitleDetailPayload, cast: Vec<TmdbCastMember>) {
+    if cast.is_empty() {
+        return;
+    }
+    payload.cast = cast
+        .into_iter()
+        .map(|m| CastMember {
+            name: m.name,
+            character: m.character,
+            photo: m.photo_url,
+        })
+        .collect();
+}
+
+/// Walk the user's CW table and stamp the payload with per-episode
+/// progress + the title-level resume target. CW reads are cheap (single
+/// SQL query) so we always issue the lookup even on a cache hit.
+async fn apply_cw_to_payload(db: &Db, payload: &mut TitleDetailPayload) {
+    let Some(ref imdb) = payload.stremio_id else {
+        return;
+    };
+    let rows = match db.cw_list().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "cw_list failed during title-detail enrichment");
+            return;
+        }
+    };
+    let matching: Vec<&ContinueWatching> = rows
+        .iter()
+        .filter(|cw| cw.title_id == *imdb && cw.kind == payload.kind)
+        .collect();
+    if matching.is_empty() {
+        return;
+    }
+
+    // Per-episode progress: stamp each Episode whose (season, episode)
+    // tuple matches a CW row.
+    if matches!(payload.kind, TitleKind::Series) {
+        for ep in &mut payload.episodes {
+            if let Some(cw) = matching
+                .iter()
+                .find(|c| c.season == ep.season && c.episode == ep.episode)
+            {
+                ep.progress = cw.progress();
+            }
+        }
+    }
+
+    // Resume target: pick the most-recently-played CW row (max
+    // `last_played_at`). For movies the row's season/episode are 0/0;
+    // the stremio id is the IMDb id verbatim. For series we synthesize
+    // `tt0944947:S:E`.
+    let resume = matching
+        .iter()
+        .max_by_key(|cw| cw.last_played_at)
+        .copied()
+        .unwrap();
+    payload.resume_position_s = Some(resume.position_s);
+    payload.resume_duration_s = Some(resume.duration_s);
+    payload.resume_season = if matches!(payload.kind, TitleKind::Series) {
+        Some(resume.season)
+    } else {
+        None
+    };
+    payload.resume_episode = if matches!(payload.kind, TitleKind::Series) {
+        Some(resume.episode)
+    } else {
+        None
+    };
+    payload.resume_video_id = Some(match payload.kind {
+        TitleKind::Movie => imdb.clone(),
+        TitleKind::Series => format!("{imdb}:{}:{}", resume.season, resume.episode),
+    });
+}
+
+/// Parse a Cinemeta `runtime` string into integer minutes.
+///
+/// Cinemeta emits `"136 min"`, `"1h 36min"`, `"96 min"`, `"58 min."`. We
+/// pull the first integer token. `"1h 36min"` returns 1 (the leading
+/// number) which is wrong; in practice Cinemeta uses `"96 min"` form for
+/// movies and `"60 min"` for TV episode runtimes, so the simple parser
+/// covers the observed shapes. TMDB's native `runtime` field overrides
+/// this when available (see `apply_tmdb_details`).
+fn parse_runtime_minutes(s: &str) -> Option<u32> {
+    let digits: String = s.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<u32>().ok().filter(|n| *n > 0)
+}
+
+/// Truncate `text` in place to at most `max_chars` Unicode scalar
+/// values. Append `"…"` when truncation actually occurred so the UI
+/// signals the elision per PRD §F-010 "summary truncated to 120 chars".
+fn truncate_to_chars(text: &mut String, max_chars: usize) {
+    let mut byte_idx = text.len();
+    for (count, (i, _)) in text.char_indices().enumerate() {
+        if count == max_chars {
+            byte_idx = i;
+            break;
+        }
+    }
+    if byte_idx < text.len() {
+        text.truncate(byte_idx);
+        text.push('…');
+    }
+}
+
+// ---- F-010: streams enumeration ---------------------------------------
+
+/// `get_streams(title_id, kind, season?, episode?) -> Vec<StreamRow>`
+/// (PRD §F-010 stream rows).
+///
+/// `season` / `episode` MUST be `Some` together for series, `None`
+/// together for movies. The command tolerates bad shapes by returning
+/// an error string.
+///
+/// Result is sorted descending by (quality, seeders, size) per PRD
+/// §F-010. Per-addon failures are logged and skipped — one flaky stream
+/// source must not blank the whole list.
+#[tauri::command]
+pub async fn get_streams(
+    db: State<'_, Db>,
+    title_id: String,
+    kind: TitleKind,
+    season: Option<i64>,
+    episode: Option<i64>,
+) -> Result<Vec<StreamRow>, String> {
+    get_streams_with_config(
+        &db,
+        &title_id,
+        kind,
+        season,
+        episode,
+        &HttpConfig::default(),
+    )
+    .await
+}
+
+/// PRD §F-010 shape invariant: movies have no season/episode; series
+/// must carry both, each ≥ 1. Bad shapes return an error string the
+/// IPC layer surfaces to the frontend (which never builds bad shapes
+/// in normal use; this is purely defensive).
+fn validate_stream_request_shape(
+    kind: TitleKind,
+    season: Option<i64>,
+    episode: Option<i64>,
+) -> Result<(), String> {
+    match kind {
+        TitleKind::Movie => {
+            if season.is_some() || episode.is_some() {
+                return Err(format!(
+                    "get_streams: kind=movie must not carry season/episode (got season={season:?}, episode={episode:?})"
+                ));
+            }
+        }
+        TitleKind::Series => match (season, episode) {
+            (Some(s), Some(e)) if s >= 1 && e >= 1 => {}
+            _ => {
+                return Err(format!(
+                    "get_streams: kind=series requires season>=1 AND episode>=1 (got season={season:?}, episode={episode:?})"
+                ));
+            }
+        },
+    }
+    Ok(())
+}
+
+/// Resolve the kino `title_id` (`imdb:tt…` / `tmdb:N` / `tvdb:N`) into
+/// the Stremio addon id shape: bare `IMDb` id for movies, `imdb:S:E`
+/// for series episodes. Returns `None` when no `IMDb` id can be
+/// resolved (e.g. a TVDB-only entry with no TMDB key configured to
+/// cross-resolve) — Stremio addons can't serve streams in that case.
+async fn resolve_stremio_id(
+    db: &Db,
+    title_id: &str,
+    kind: TitleKind,
+    season: Option<i64>,
+    episode: Option<i64>,
+    http_config: &HttpConfig,
+) -> Result<Option<String>, String> {
+    let tmdb_key = db.kv_get(TMDB_API_KEY).await.map_err(ipc)?;
+    let tmdb_client = match tmdb_key {
+        Some(k) => Some(
+            TmdbClient::with_options(
+                k,
+                http_config.clone(),
+                kino_metadata::tmdb::TMDB_BASE_URL.to_string(),
+            )
+            .map_err(ipc)?,
+        ),
+        None => None,
+    };
+    let ids = resolve_title_ids(title_id, kind, tmdb_client.as_ref()).await?;
+    let Some(imdb) = ids.imdb_id else {
+        return Ok(None);
+    };
+    Ok(Some(match (kind, season, episode) {
+        (TitleKind::Movie, _, _) => imdb,
+        (TitleKind::Series, Some(s), Some(e)) => format!("{imdb}:{s}:{e}"),
+        _ => unreachable!("season/episode shape validated above"),
+    }))
+}
+
+/// Walk the persisted addon list and produce a [`StreamWorkItem`] for
+/// each enabled stream-serving addon that handles `kind`. Reuses the
+/// F-006 manifest filter; non-stream addons (catalogs / metadata only)
+/// are silently skipped.
+async fn build_stream_work(
+    db: &Db,
+    kind: TitleKind,
+    stremio_id: &str,
+    http_config: &HttpConfig,
+) -> Result<Vec<StreamWorkItem>, String> {
+    let installed = db.addons_list().await.map_err(ipc)?;
+    let mut work: Vec<StreamWorkItem> = Vec::new();
+    for addon in installed {
+        if !addon.enabled {
+            continue;
+        }
+        let manifest = match serde_json::from_value::<Manifest>(addon.manifest_json.clone()) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    addon = %addon.id,
+                    error = %e,
+                    "could not parse persisted manifest for stream fetch"
+                );
+                continue;
+            }
+        };
+        if !manifest.serves_stream(kind.as_str()) {
+            continue;
+        }
+        let client = match AddonClient::with_options(&addon.manifest_url, http_config.clone()) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    addon = %addon.id,
+                    error = %e,
+                    "could not build addon client for stream fetch"
+                );
+                continue;
+            }
+        };
+        work.push(StreamWorkItem {
+            addon_id: addon.id,
+            addon_name: manifest.name,
+            client,
+            stremio_id: stremio_id.to_string(),
+            kind,
+        });
+    }
+    Ok(work)
+}
+
+async fn get_streams_with_config(
+    db: &Db,
+    title_id: &str,
+    kind: TitleKind,
+    season: Option<i64>,
+    episode: Option<i64>,
+    http_config: &HttpConfig,
+) -> Result<Vec<StreamRow>, String> {
+    validate_stream_request_shape(kind, season, episode)?;
+
+    let Some(stremio_id) =
+        resolve_stremio_id(db, title_id, kind, season, episode, http_config).await?
+    else {
+        // Without an IMDb id no Stremio addon can serve streams.
+        return Ok(Vec::new());
+    };
+
+    let work = build_stream_work(db, kind, &stremio_id, http_config).await?;
+    if work.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Bounded fan-out — reuses the F-006 / F-008 row-5 ceiling. The
+    // detail-view stream fetch is a fairly cold path (only fires when
+    // the user opens a title), but the same 8-permit budget applies.
+    let semaphore = Arc::new(Semaphore::new(AVAILABILITY_CONCURRENCY));
+    let mut set: tokio::task::JoinSet<Vec<StreamRow>> = tokio::task::JoinSet::new();
+    for item in work {
+        let permit = Arc::clone(&semaphore);
+        set.spawn(async move {
+            let _permit = permit.acquire_owned().await.ok();
+            fetch_streams_for_addon(item).await
+        });
+    }
+    let mut rows: Vec<StreamRow> = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(mut chunk) => rows.append(&mut chunk),
+            Err(e) => tracing::warn!(error = %e, "stream-fetch task panicked"),
+        }
+    }
+
+    // PRD §F-010 stream sort (locked, descending priority): quality
+    // (4K > 1080p > 720p > SD > none), then seeders, then size.
+    rows.sort_by(|a, b| {
+        quality_rank(b.quality)
+            .cmp(&quality_rank(a.quality))
+            .then_with(|| b.seeders.unwrap_or(0).cmp(&a.seeders.unwrap_or(0)))
+            .then_with(|| b.size_bytes.unwrap_or(0).cmp(&a.size_bytes.unwrap_or(0)))
+    });
+    Ok(rows)
+}
+
+struct StreamWorkItem {
+    addon_id: String,
+    addon_name: String,
+    client: AddonClient,
+    stremio_id: String,
+    kind: TitleKind,
+}
+
+async fn fetch_streams_for_addon(item: StreamWorkItem) -> Vec<StreamRow> {
+    let StreamWorkItem {
+        addon_id,
+        addon_name,
+        client,
+        stremio_id,
+        kind,
+    } = item;
+    let resp = match client.stream(kind.as_str(), &stremio_id).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                addon = %addon_id,
+                stremio_id = %stremio_id,
+                error = %e,
+                "addon stream fetch failed; skipping"
+            );
+            return Vec::new();
+        }
+    };
+    resp.streams
+        .into_iter()
+        .map(|s| addon_stream_to_row(&addon_id, &addon_name, s))
+        .collect()
+}
+
+/// Convert a Stremio [`AddonStream`] into a PRD §F-010 [`StreamRow`].
+fn addon_stream_to_row(addon_id: &str, addon_name: &str, s: AddonStream) -> StreamRow {
+    let combined_for_parse = stream_text_for_parse(&s);
+    let tags: ParsedTags = parse_filename(&combined_for_parse);
+    let seeders = extract_seeders(&combined_for_parse);
+    let size_bytes = extract_size_bytes(&combined_for_parse);
+    let detail = pick_detail_line(&s);
+    let display_name = s
+        .name
+        .clone()
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| format!("{addon_name} stream"));
+    StreamRow {
+        addon_id: addon_id.to_string(),
+        addon_name: addon_name.to_string(),
+        name: display_name,
+        detail,
+        quality: tags.quality,
+        hdr: tags.hdr,
+        audio: tags.audio,
+        codec: tags.codec,
+        seeders,
+        size_bytes,
+        url: s.url,
+        info_hash: s.info_hash,
+        file_idx: s.file_idx,
+        sources: s.sources,
+    }
+}
+
+/// Concatenate every text-bearing field on a stream so the §8 regex set
+/// has the largest possible haystack. Different addons surface the
+/// parseable filename in different places (`name` for Public Domain
+/// Movies, `title` for Torrentio, `description` for `OpenSubtitles`).
+fn stream_text_for_parse(s: &AddonStream) -> String {
+    let mut buf = String::new();
+    if let Some(ref n) = s.name {
+        buf.push_str(n);
+        buf.push(' ');
+    }
+    if let Some(ref t) = s.title {
+        buf.push_str(t);
+        buf.push(' ');
+    }
+    if let Some(ref d) = s.description {
+        buf.push_str(d);
+    }
+    buf
+}
+
+/// The display-detail line shown under the stream name. Picks `title`
+/// when present (Torrentio's filename + emoji line) else `description`.
+fn pick_detail_line(s: &AddonStream) -> Option<String> {
+    if let Some(t) = s.title.as_deref() {
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+    s.description
+        .as_deref()
+        .filter(|d| !d.is_empty())
+        .map(str::to_string)
+}
+
+/// Map a [`Quality`] tag to its sort rank. Higher is better. Used by
+/// the PRD §F-010 stream sort.
+const fn quality_rank(q: Option<Quality>) -> u8 {
+    match q {
+        Some(Quality::Uhd4K) => 4,
+        Some(Quality::Fhd1080) => 3,
+        Some(Quality::Hd720) => 2,
+        Some(Quality::Sd) => 1,
+        None => 0,
+    }
+}
+
+/// Extract a seeders count from a stream's combined text. Recognized
+/// shapes:
+///
+///   - Torrentio: `"👤 156"` / `"👤 7,894"`
+///   - Generic: `"Seeders: 156"` / `"seeds 156"` / `"Seeds: 156"`
+///
+/// Returns the first parsable integer following one of those markers.
+fn extract_seeders(text: &str) -> Option<u32> {
+    static SEEDERS_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)(?:👤\s*|seeder?s?\s*[:=]?\s*|seeds?\s*[:=]?\s*)([\d,]+)").unwrap()
+    });
+    let cap = SEEDERS_RE.captures(text)?;
+    let raw = cap.get(1)?.as_str().replace(',', "");
+    raw.parse::<u32>().ok()
+}
+
+/// Extract a filesize-in-bytes from a stream's combined text. Recognized
+/// shapes:
+///
+///   - Torrentio: `"💾 5.4 GB"` / `"💾 920 MB"`
+///   - Generic: `"Size: 5.4 GB"` / `"5.4GB"`
+///
+/// The numeric part may be integer or decimal; the unit is one of B / KB
+/// / MB / GB / TB (case-insensitive).
+fn extract_size_bytes(text: &str) -> Option<u64> {
+    static SIZE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)(?:💾\s*|size\s*[:=]?\s*)?(\d+(?:[.,]\d+)?)\s*(B|KB|MB|GB|TB)\b")
+            .unwrap()
+    });
+    let cap = SIZE_RE.captures(text)?;
+    let num_raw = cap.get(1)?.as_str().replace(',', ".");
+    let num: f64 = num_raw.parse().ok()?;
+    let unit = cap.get(2)?.as_str().to_ascii_uppercase();
+    let bytes = match unit.as_str() {
+        "B" => num,
+        "KB" => num * 1024.0,
+        "MB" => num * 1024.0 * 1024.0,
+        "GB" => num * 1024.0 * 1024.0 * 1024.0,
+        "TB" => num * 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    // Stream sizes are bounded well below 2^53 (Tauri IPC is JSON, which
+    // doesn't carry larger integers losslessly anyway). Guard the cast
+    // explicitly so a malformed numeric token can't produce garbage.
+    if !bytes.is_finite() || !(0.0..9.0e18).contains(&bytes) {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let n = bytes as u64;
+    Some(n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2541,5 +3563,774 @@ mod tests {
             .unwrap();
         assert!(!got[0].available);
         assert_eq!(got[0].source_count, 0);
+    }
+
+    // ---- F-010: title detail view ---------------------------------------
+
+    fn cinemeta_movie_manifest_body() -> String {
+        r#"{
+            "id": "com.linvo.cinemeta",
+            "version": "3.0.13",
+            "name": "Cinemeta",
+            "types": ["movie", "series"],
+            "resources": ["catalog", "meta"],
+            "catalogs": [{"type": "movie", "id": "top"}]
+        }"#
+        .to_string()
+    }
+
+    async fn install_cinemeta_at(db: &Db, manifest_url: &str) {
+        let manifest_json: serde_json::Value =
+            serde_json::from_str(&cinemeta_movie_manifest_body()).unwrap();
+        db.addons_insert(&AddonInsert {
+            id: "com.linvo.cinemeta".into(),
+            manifest_url: manifest_url.into(),
+            manifest_json,
+            display_order: None,
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Build an in-memory DB whose `addons` row points Cinemeta at the
+    /// supplied mock server (so the Cinemeta `meta/...` fetch is
+    /// intercepted instead of hitting strem.io). NOT the production
+    /// Cinemeta URL — the bootstrap protection (which keys on the URL)
+    /// won't fire, so we can freely tweak addon state.
+    async fn db_with_cinemeta_at(server: &MockServer) -> Db {
+        let db = Db::open_in_memory().await.unwrap();
+        let manifest_url = format!("{}/manifest.json", server.uri());
+        install_cinemeta_at(&db, &manifest_url).await;
+        db
+    }
+
+    #[tokio::test]
+    async fn get_title_detail_pulls_baseline_from_cinemeta_for_movies() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/meta/movie/tt0133093.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {
+                    "id": "tt0133093",
+                    "type": "movie",
+                    "name": "The Matrix",
+                    "poster": "https://p.example/p.jpg",
+                    "background": "https://p.example/bg.jpg",
+                    "logo": "https://p.example/logo.png",
+                    "description": "A computer hacker learns about reality.",
+                    "releaseInfo": "1999",
+                    "runtime": "136 min",
+                    "imdbRating": "8.7",
+                    "genres": ["Action", "Sci-Fi"],
+                    "cast": ["Keanu Reeves", "Carrie-Anne Moss", ""],
+                    "videos": []
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let db = db_with_cinemeta_at(&server).await;
+        let detail = get_title_detail_uncached(
+            &db,
+            "imdb:tt0133093",
+            TitleKind::Movie,
+            &["en".to_string()],
+            &HttpConfig::for_test(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(detail.title, "The Matrix");
+        assert_eq!(detail.year, Some(1999));
+        assert_eq!(detail.runtime_minutes, Some(136));
+        assert_eq!(detail.imdb_rating, Some(8.7));
+        assert_eq!(detail.genres, vec!["Action", "Sci-Fi"]);
+        assert_eq!(
+            detail.summary.as_deref(),
+            Some("A computer hacker learns about reality.")
+        );
+        assert_eq!(detail.poster.as_deref(), Some("https://p.example/p.jpg"));
+        assert_eq!(detail.backdrop.as_deref(), Some("https://p.example/bg.jpg"));
+        assert_eq!(detail.logo.as_deref(), Some("https://p.example/logo.png"));
+        // Empty cast name is filtered out.
+        assert_eq!(detail.cast.len(), 2);
+        assert_eq!(detail.cast[0].name, "Keanu Reeves");
+        assert!(detail.cast[0].photo.is_none()); // No TMDB enrichment.
+        assert!(detail.episodes.is_empty());
+        // No CW row → no resume.
+        assert!(detail.resume_position_s.is_none());
+        assert_eq!(detail.stremio_id.as_deref(), Some("tt0133093"));
+    }
+
+    #[tokio::test]
+    async fn get_title_detail_builds_episode_list_for_series() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/meta/series/tt0944947.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {
+                    "id": "tt0944947",
+                    "type": "series",
+                    "name": "Game of Thrones",
+                    "videos": [
+                        {
+                            "id": "tt0944947:1:2",
+                            "title": "The Kingsroad",
+                            "season": 1,
+                            "episode": 2,
+                            "released": "2011-04-24",
+                            "overview": "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Long form text exceeds the 120-char PRD limit and must be truncated.",
+                            "thumbnail": "https://t.example/t2.jpg"
+                        },
+                        {
+                            "id": "tt0944947:1:1",
+                            "title": "Winter Is Coming",
+                            "season": 1,
+                            "episode": 1,
+                            "released": "2011-04-17",
+                            "thumbnail": "https://t.example/t1.jpg"
+                        },
+                        {
+                            "id": "tt0944947:0:5",
+                            "title": "Specials promo",
+                            "season": 0,
+                            "episode": 5
+                        }
+                    ]
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let db = db_with_cinemeta_at(&server).await;
+        let detail = get_title_detail_uncached(
+            &db,
+            "imdb:tt0944947",
+            TitleKind::Series,
+            &["en".to_string()],
+            &HttpConfig::for_test(),
+        )
+        .await
+        .unwrap();
+        // Specials (season 0) dropped; episodes sorted by (season, episode).
+        assert_eq!(detail.episodes.len(), 2);
+        assert_eq!(detail.episodes[0].season, 1);
+        assert_eq!(detail.episodes[0].episode, 1);
+        assert_eq!(detail.episodes[0].title, "Winter Is Coming");
+        assert_eq!(detail.episodes[1].season, 1);
+        assert_eq!(detail.episodes[1].episode, 2);
+        // 120-char truncation with ellipsis.
+        let overview = detail.episodes[1].overview.as_deref().unwrap();
+        assert!(overview.ends_with('…'), "got: {overview:?}");
+        assert_eq!(overview.chars().count(), 121); // 120 + '…'
+    }
+
+    #[tokio::test]
+    async fn get_title_detail_per_episode_progress_from_cw() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/meta/series/tt0944947.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {
+                    "id": "tt0944947",
+                    "type": "series",
+                    "name": "Game of Thrones",
+                    "videos": [
+                        {"id": "tt0944947:1:1", "title": "Winter Is Coming", "season": 1, "episode": 1},
+                        {"id": "tt0944947:1:2", "title": "The Kingsroad", "season": 1, "episode": 2}
+                    ]
+                }
+            })))
+            .mount(&server)
+            .await;
+        let db = db_with_cinemeta_at(&server).await;
+        // CW: user has watched 50% of S1E1, 0% of S1E2.
+        db.cw_upsert(&ContinueWatching {
+            title_id: "tt0944947".into(),
+            kind: TitleKind::Series,
+            season: 1,
+            episode: 1,
+            position_s: 30.0 * 60.0,
+            duration_s: 60.0 * 60.0,
+            last_played_at: 100,
+            meta_json: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+        let mut payload = get_title_detail_uncached(
+            &db,
+            "imdb:tt0944947",
+            TitleKind::Series,
+            &["en".to_string()],
+            &HttpConfig::for_test(),
+        )
+        .await
+        .unwrap();
+        apply_cw_to_payload(&db, &mut payload).await;
+        // F-010 acceptance: episode list shows correct progress for
+        // partially-watched episodes.
+        assert!((payload.episodes[0].progress - 0.5).abs() < 1e-9);
+        assert!(payload.episodes[1].progress.abs() < f64::EPSILON);
+        // Resume target was set to S1E1.
+        assert_eq!(payload.resume_position_s, Some(30.0 * 60.0));
+        assert_eq!(payload.resume_season, Some(1));
+        assert_eq!(payload.resume_episode, Some(1));
+        assert_eq!(payload.resume_video_id.as_deref(), Some("tt0944947:1:1"));
+    }
+
+    #[tokio::test]
+    async fn get_title_detail_resume_target_picks_latest_played_episode() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/meta/series/tt0944947.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {
+                    "id": "tt0944947",
+                    "type": "series",
+                    "name": "Game of Thrones",
+                    "videos": [
+                        {"id": "tt0944947:1:1", "title": "WIC", "season": 1, "episode": 1},
+                        {"id": "tt0944947:1:5", "title": "WW", "season": 1, "episode": 5}
+                    ]
+                }
+            })))
+            .mount(&server)
+            .await;
+        let db = db_with_cinemeta_at(&server).await;
+        db.cw_upsert(&ContinueWatching {
+            title_id: "tt0944947".into(),
+            kind: TitleKind::Series,
+            season: 1,
+            episode: 1,
+            position_s: 100.0,
+            duration_s: 3600.0,
+            last_played_at: 100,
+            meta_json: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+        db.cw_upsert(&ContinueWatching {
+            title_id: "tt0944947".into(),
+            kind: TitleKind::Series,
+            season: 1,
+            episode: 5,
+            position_s: 200.0,
+            duration_s: 3600.0,
+            last_played_at: 500, // newer
+            meta_json: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+        let mut payload = get_title_detail_uncached(
+            &db,
+            "imdb:tt0944947",
+            TitleKind::Series,
+            &["en".to_string()],
+            &HttpConfig::for_test(),
+        )
+        .await
+        .unwrap();
+        apply_cw_to_payload(&db, &mut payload).await;
+        assert_eq!(payload.resume_season, Some(1));
+        assert_eq!(payload.resume_episode, Some(5));
+    }
+
+    #[tokio::test]
+    async fn get_title_detail_resume_set_for_movie_with_cw_row() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/meta/movie/tt0133093.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"id": "tt0133093", "type": "movie", "name": "The Matrix"}
+            })))
+            .mount(&server)
+            .await;
+        let db = db_with_cinemeta_at(&server).await;
+        db.cw_upsert(&ContinueWatching {
+            title_id: "tt0133093".into(),
+            kind: TitleKind::Movie,
+            season: 0,
+            episode: 0,
+            position_s: 1800.0,
+            duration_s: 8160.0,
+            last_played_at: 100,
+            meta_json: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+        let mut payload = get_title_detail_uncached(
+            &db,
+            "imdb:tt0133093",
+            TitleKind::Movie,
+            &["en".to_string()],
+            &HttpConfig::for_test(),
+        )
+        .await
+        .unwrap();
+        apply_cw_to_payload(&db, &mut payload).await;
+        // F-010 acceptance: Resume button only present when matching CW exists.
+        assert_eq!(payload.resume_position_s, Some(1800.0));
+        assert!(payload.resume_season.is_none()); // null for movies
+        assert!(payload.resume_episode.is_none());
+        assert_eq!(payload.resume_video_id.as_deref(), Some("tt0133093"));
+    }
+
+    #[tokio::test]
+    async fn get_title_detail_no_cw_means_no_resume() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/meta/movie/tt0133093.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"id": "tt0133093", "type": "movie", "name": "The Matrix"}
+            })))
+            .mount(&server)
+            .await;
+        let db = db_with_cinemeta_at(&server).await;
+        let mut payload = get_title_detail_uncached(
+            &db,
+            "imdb:tt0133093",
+            TitleKind::Movie,
+            &["en".to_string()],
+            &HttpConfig::for_test(),
+        )
+        .await
+        .unwrap();
+        apply_cw_to_payload(&db, &mut payload).await;
+        assert!(payload.resume_position_s.is_none());
+        assert!(payload.resume_video_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_title_detail_truncates_cast_to_top_six() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/meta/movie/tt1.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {
+                    "id": "tt1",
+                    "type": "movie",
+                    "name": "T",
+                    "cast": ["A", "B", "C", "D", "E", "F", "G", "H"]
+                }
+            })))
+            .mount(&server)
+            .await;
+        let db = db_with_cinemeta_at(&server).await;
+        let detail = get_title_detail_uncached(
+            &db,
+            "imdb:tt1",
+            TitleKind::Movie,
+            &["en".to_string()],
+            &HttpConfig::for_test(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(detail.cast.len(), 6);
+        assert_eq!(detail.cast[5].name, "F");
+    }
+
+    #[tokio::test]
+    async fn get_title_detail_skips_cinemeta_when_uninstalled() {
+        // No Cinemeta row in the addons table — payload comes back empty
+        // (TMDB-only path also not configured), but the command does NOT
+        // fail.
+        let db = Db::open_in_memory().await.unwrap();
+        let detail = get_title_detail_uncached(
+            &db,
+            "imdb:tt0133093",
+            TitleKind::Movie,
+            &["en".to_string()],
+            &HttpConfig::for_test(),
+        )
+        .await
+        .unwrap();
+        assert!(detail.title.is_empty());
+        assert!(detail.cast.is_empty());
+        assert_eq!(detail.stremio_id.as_deref(), Some("tt0133093"));
+    }
+
+    // ---- F-010: stream parsing & sort ----
+
+    fn stream_response(streams: &serde_json::Value) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({"streams": streams}))
+    }
+
+    /// PRD §F-010 code acceptance: stream parsing produces correct badges
+    /// from the locked §8 fixture filenames. This test exercises the
+    /// addon-stream → `StreamRow` conversion path (the regex set itself
+    /// is tested in `kino_addons::parse`; this asserts the wiring carries
+    /// the tags through into the IPC shape).
+    #[test]
+    fn addon_stream_row_quality_badges_match_prd_fixtures() {
+        let cases = [
+            (
+                "The Matrix 1999 2160p UHD BluRay HEVC TrueHD Atmos 7.1-FraMeSToR",
+                Quality::Uhd4K,
+                Codec::H265,
+                Audio::Atmos,
+                None,
+            ),
+            (
+                "Inception 2010 1080p BluRay DV HDR10 x265 DTS-HD MA 5.1",
+                Quality::Fhd1080,
+                Codec::H265,
+                Audio::DtsHd,
+                Some(Hdr::DolbyVision),
+            ),
+            (
+                "Some Show S01E01 720p WEB-DL DDP5.1 H.264",
+                Quality::Hd720,
+                Codec::H264,
+                Audio::Eac3,
+                None,
+            ),
+        ];
+        for (filename, q, c, a, hdr) in cases {
+            let s = AddonStream {
+                name: Some("src".into()),
+                title: Some(filename.into()),
+                description: None,
+                url: None,
+                info_hash: None,
+                file_idx: None,
+                yt_id: None,
+                external_url: None,
+                behavior_hints: serde_json::Value::Null,
+                sources: Vec::new(),
+                extra: serde_json::Map::new(),
+            };
+            let row = addon_stream_to_row("addon-id", "Addon", s);
+            assert_eq!(row.quality, Some(q), "quality for {filename}");
+            assert_eq!(row.codec, Some(c), "codec for {filename}");
+            assert_eq!(row.audio, Some(a), "audio for {filename}");
+            assert_eq!(row.hdr, hdr, "hdr for {filename}");
+        }
+    }
+
+    #[test]
+    fn addon_stream_row_extracts_torrentio_seeders_and_size() {
+        let s = AddonStream {
+            name: Some("Torrentio".into()),
+            title: Some(
+                "The Matrix 1999 2160p UHD BluRay HEVC TrueHD Atmos 7.1\n👤 156 💾 23.4 GB ⚙️ EZTV"
+                    .into(),
+            ),
+            description: None,
+            url: None,
+            info_hash: Some("deadbeef".into()),
+            file_idx: None,
+            yt_id: None,
+            external_url: None,
+            behavior_hints: serde_json::Value::Null,
+            sources: vec!["dht".into()],
+            extra: serde_json::Map::new(),
+        };
+        let row = addon_stream_to_row("addon-id", "Torrentio", s);
+        assert_eq!(row.seeders, Some(156));
+        // 23.4 GiB = 23.4 * 1024^3 ≈ 25,125,762,662 bytes.
+        let want = gib_to_bytes(23.4);
+        let got = row.size_bytes.unwrap();
+        // Allow ±4 bytes for floating-point rounding.
+        assert!(got.abs_diff(want) < 4, "got: {got}, want: {want}");
+    }
+
+    #[test]
+    fn addon_stream_row_extracts_plain_seeders_size_shapes() {
+        let s = AddonStream {
+            name: Some("Public Domain Movies".into()),
+            title: Some("Old Movie 1939 1080p".into()),
+            description: Some("Size: 1.2 GB Seeders: 42".into()),
+            url: Some("https://archive.org/m.mp4".into()),
+            info_hash: None,
+            file_idx: None,
+            yt_id: None,
+            external_url: None,
+            behavior_hints: serde_json::Value::Null,
+            sources: Vec::new(),
+            extra: serde_json::Map::new(),
+        };
+        let row = addon_stream_to_row("addon-id", "Public Domain Movies", s);
+        assert_eq!(row.seeders, Some(42));
+        let want = gib_to_bytes(1.2);
+        assert!(row.size_bytes.unwrap().abs_diff(want) < 4);
+        assert_eq!(row.url.as_deref(), Some("https://archive.org/m.mp4"));
+    }
+
+    #[test]
+    fn addon_stream_row_no_match_returns_none_badges() {
+        let s = AddonStream {
+            name: Some("Unknown".into()),
+            title: Some("just a random file with no tags".into()),
+            description: None,
+            url: None,
+            info_hash: None,
+            file_idx: None,
+            yt_id: None,
+            external_url: None,
+            behavior_hints: serde_json::Value::Null,
+            sources: Vec::new(),
+            extra: serde_json::Map::new(),
+        };
+        let row = addon_stream_to_row("id", "Unknown", s);
+        assert!(row.quality.is_none());
+        assert!(row.hdr.is_none());
+        assert!(row.audio.is_none());
+        assert!(row.codec.is_none());
+        assert!(row.seeders.is_none());
+        assert!(row.size_bytes.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_streams_sorts_by_quality_seeders_size_descending() {
+        // Two stream-serving addons with different quality streams.
+        // Verifies the locked sort: quality DESC > seeders DESC > size DESC.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/a/manifest.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(stream_manifest_body("a")))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/b/manifest.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(stream_manifest_body("b")))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/a/stream/movie/tt0133093.json"))
+            .respond_with(stream_response(&serde_json::json!([
+                {
+                    "name": "a1",
+                    "title": "Some 1080p WEB-DL\n👤 10 💾 1 GB",
+                    "infoHash": "aaa1"
+                },
+                {
+                    "name": "a2",
+                    "title": "Some 4K UHD\n👤 50 💾 30 GB",
+                    "infoHash": "aaa2"
+                }
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/b/stream/movie/tt0133093.json"))
+            .respond_with(stream_response(&serde_json::json!([
+                {
+                    "name": "b1",
+                    "title": "Some 1080p WEB-DL\n👤 200 💾 5 GB",
+                    "infoHash": "bbb1"
+                },
+                {
+                    "name": "b2",
+                    "title": "Some 1080p WEB-DL\n👤 200 💾 50 GB",
+                    "infoHash": "bbb2"
+                }
+            ])))
+            .mount(&server)
+            .await;
+        let db = Db::open_in_memory().await.unwrap();
+        install_stream_addon(&db, "a", &format!("{}/a/manifest.json", server.uri()), true).await;
+        install_stream_addon(&db, "b", &format!("{}/b/manifest.json", server.uri()), true).await;
+        let rows = get_streams_with_config(
+            &db,
+            "imdb:tt0133093",
+            TitleKind::Movie,
+            None,
+            None,
+            &HttpConfig::for_test(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 4);
+        // First: 4K (a2)
+        assert_eq!(rows[0].quality, Some(Quality::Uhd4K));
+        // Among 1080p rows: higher seeders first; same seeders → larger size first.
+        assert_eq!(rows[1].quality, Some(Quality::Fhd1080));
+        assert_eq!(rows[1].seeders, Some(200));
+        // b2 (200 seeders, 50 GB) before b1 (200 seeders, 5 GB).
+        assert_eq!(rows[1].info_hash.as_deref(), Some("bbb2"));
+        assert_eq!(rows[2].info_hash.as_deref(), Some("bbb1"));
+        // a1: 10 seeders, comes after both b rows.
+        assert_eq!(rows[3].info_hash.as_deref(), Some("aaa1"));
+    }
+
+    #[tokio::test]
+    async fn get_streams_routes_series_episodes_via_imdb_season_episode_form() {
+        // The stremio id MUST be `imdb:S:E` for series episodes — assert
+        // the mock receives the exact path with `:1:1` appended.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/s/manifest.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(stream_manifest_body("s")))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/s/stream/series/tt0944947:1:1.json"))
+            .respond_with(stream_response(&serde_json::json!([
+                {"name": "x", "title": "S01E01 1080p\n👤 7 💾 800 MB", "infoHash": "h"}
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let db = Db::open_in_memory().await.unwrap();
+        install_stream_addon(&db, "s", &format!("{}/s/manifest.json", server.uri()), true).await;
+        let rows = get_streams_with_config(
+            &db,
+            "imdb:tt0944947",
+            TitleKind::Series,
+            Some(1),
+            Some(1),
+            &HttpConfig::for_test(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].quality, Some(Quality::Fhd1080));
+    }
+
+    #[tokio::test]
+    async fn get_streams_returns_empty_when_no_imdb_id_resolvable() {
+        // TVDB-only id with no TMDB key configured to cross-resolve. The
+        // command tolerates this and returns an empty list (the UI shows
+        // "no streams found" rather than an error).
+        let db = Db::open_in_memory().await.unwrap();
+        let rows = get_streams_with_config(
+            &db,
+            "tvdb:12345",
+            TitleKind::Movie,
+            None,
+            None,
+            &HttpConfig::for_test(),
+        )
+        .await
+        .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_streams_rejects_bad_kind_season_episode_shape() {
+        let db = Db::open_in_memory().await.unwrap();
+        // Movie + season is invalid.
+        let err = get_streams_with_config(
+            &db,
+            "imdb:tt1",
+            TitleKind::Movie,
+            Some(1),
+            None,
+            &HttpConfig::for_test(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("kind=movie"));
+        // Series with no episode is invalid.
+        let err = get_streams_with_config(
+            &db,
+            "imdb:tt1",
+            TitleKind::Series,
+            Some(1),
+            None,
+            &HttpConfig::for_test(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("kind=series"));
+    }
+
+    #[tokio::test]
+    async fn get_streams_skips_catalog_only_addons() {
+        // An addon declaring `["catalog", "meta"]` (no `stream`) must
+        // receive ZERO stream requests; `serves_stream` filters at the
+        // manifest gate.
+        let server = MockServer::start().await;
+        let mock = Mock::given(method("GET"))
+            .and(path("/stream/movie/tt0133093.json"))
+            .respond_with(stream_response(&serde_json::json!([])))
+            .expect(0);
+        mock.mount(&server).await;
+        let db = Db::open_in_memory().await.unwrap();
+        let manifest_url = format!("{}/manifest.json", server.uri());
+        db.addons_insert(&AddonInsert {
+            id: "cat-only".into(),
+            manifest_url,
+            manifest_json: serde_json::json!({
+                "id": "cat-only",
+                "version": "1",
+                "name": "Catalog Only",
+                "types": ["movie"],
+                "resources": ["catalog", "meta"],
+                "catalogs": []
+            }),
+            display_order: None,
+        })
+        .await
+        .unwrap();
+        let rows = get_streams_with_config(
+            &db,
+            "imdb:tt0133093",
+            TitleKind::Movie,
+            None,
+            None,
+            &HttpConfig::for_test(),
+        )
+        .await
+        .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn extract_seeders_handles_various_shapes() {
+        assert_eq!(extract_seeders("👤 156"), Some(156));
+        assert_eq!(extract_seeders("👤 7,894"), Some(7894));
+        assert_eq!(extract_seeders("Seeders: 42"), Some(42));
+        assert_eq!(extract_seeders("Seeds: 8"), Some(8));
+        assert_eq!(extract_seeders("seed 5"), Some(5));
+        assert_eq!(extract_seeders("nothing here"), None);
+    }
+
+    #[test]
+    fn extract_size_bytes_handles_units() {
+        assert_eq!(extract_size_bytes("💾 1 GB"), Some(1024 * 1024 * 1024));
+        assert_eq!(extract_size_bytes("Size: 5.0 MB"), Some(5 * 1024 * 1024));
+        assert_eq!(extract_size_bytes("23 KB"), Some(23 * 1024));
+        assert_eq!(extract_size_bytes("no size"), None);
+        // Comma decimal (European locales).
+        assert_eq!(extract_size_bytes("💾 1,5 GB"), Some(gib_to_bytes(1.5)));
+    }
+
+    /// Test helper: gigabytes → bytes via the same 1024 cascade
+    /// `extract_size_bytes` uses, with the cast guarded so clippy's
+    /// `cast_possible_truncation` / `cast_sign_loss` lints don't fire.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn gib_to_bytes(n: f64) -> u64 {
+        (n * 1024.0 * 1024.0 * 1024.0) as u64
+    }
+
+    #[test]
+    fn quality_rank_orders_4k_above_lower_buckets() {
+        assert!(quality_rank(Some(Quality::Uhd4K)) > quality_rank(Some(Quality::Fhd1080)));
+        assert!(quality_rank(Some(Quality::Fhd1080)) > quality_rank(Some(Quality::Hd720)));
+        assert!(quality_rank(Some(Quality::Hd720)) > quality_rank(Some(Quality::Sd)));
+        assert!(quality_rank(Some(Quality::Sd)) > quality_rank(None));
+    }
+
+    #[test]
+    fn parse_runtime_minutes_picks_leading_integer() {
+        assert_eq!(parse_runtime_minutes("136 min"), Some(136));
+        assert_eq!(parse_runtime_minutes("96"), Some(96));
+        assert_eq!(parse_runtime_minutes(""), None);
+        assert_eq!(parse_runtime_minutes("min"), None);
+        assert_eq!(parse_runtime_minutes("0 min"), None); // zero filtered out
+    }
+
+    #[test]
+    fn truncate_to_chars_appends_ellipsis_only_when_truncating() {
+        let mut s = "hello".to_string();
+        truncate_to_chars(&mut s, 10);
+        assert_eq!(s, "hello");
+        let mut s = "abcdefghij".to_string();
+        truncate_to_chars(&mut s, 5);
+        assert_eq!(s, "abcde…");
+        // Unicode boundary safety.
+        let mut s = "héllo wörld".to_string();
+        truncate_to_chars(&mut s, 4);
+        assert_eq!(s, "héll…");
     }
 }

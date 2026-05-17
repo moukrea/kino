@@ -36,9 +36,10 @@ import {
   Show,
   type Component,
 } from "solid-js";
+import { useNavigate } from "@solidjs/router";
 
 import { Row } from "../components/Row";
-import { setInitialFocus } from "../input/focus";
+import { focusedId, pushReturnFocus, setInitialFocus } from "../input/focus";
 import { locale } from "../i18n";
 import { t } from "../i18n";
 import {
@@ -106,6 +107,23 @@ export function interleaveByKind<T>(a: readonly T[], b: readonly T[]): T[] {
 }
 
 export const HomeView: Component<HomeViewProps> = (props) => {
+  const navigate = useNavigate();
+
+  /**
+   * Tile activation handler. Remembers the focused-tile id so the
+   * detail route's back navigation can restore focus (PRD §F-010
+   * acceptance), then navigates to the detail route. The summary id
+   * is URL-encoded so provider-prefixed ids (`imdb:tt...`, `tmdb:603`)
+   * survive transit through the path segment.
+   */
+  const activateTile = (summary: TitleSummary) => {
+    const here = focusedId();
+    if (here !== null) pushReturnFocus(here);
+    navigate(
+      `/title/${encodeURIComponent(summary.id)}?kind=${summary.kind}`,
+    );
+  };
+
   const [cwResource] = createResource<ContinueWatching[]>(async () => {
     if (!hasTauri()) return [];
     try {
@@ -260,6 +278,7 @@ export const HomeView: Component<HomeViewProps> = (props) => {
           label={t("home.continueWatching")}
           focusIdPrefix="row-cw"
           items={cwAsSummaries()}
+          onActivate={activateTile}
           testId="row-continue-watching"
         />
       </Show>
@@ -268,18 +287,21 @@ export const HomeView: Component<HomeViewProps> = (props) => {
         label={t("home.trendingNow")}
         focusIdPrefix="row-trending-now"
         items={poolsResource()?.top_trending ?? []}
+        onActivate={activateTile}
         testId="row-trending-now"
       />
       <Row
         label={t("home.hiddenGems")}
         focusIdPrefix="row-hidden-gems"
         items={poolsResource()?.hidden_gems ?? []}
+        onActivate={activateTile}
         testId="row-hidden-gems"
       />
       <Row
         label={t("home.trendingThisWeek")}
         focusIdPrefix="row-weekly"
         items={weeklyResource() ?? []}
+        onActivate={activateTile}
         testId="row-trending-this-week"
       />
 
@@ -289,6 +311,7 @@ export const HomeView: Component<HomeViewProps> = (props) => {
             label={cat.catalog_name}
             focusIdPrefix={`row-cat-${cat.addon_id}-${cat.catalog_id}`}
             items={cat.items}
+            onActivate={activateTile}
             testId={`row-cat-${cat.addon_id}-${cat.catalog_id}`}
           />
         )}

@@ -21,6 +21,27 @@
     "hiddenGems": "Hidden Gems",
     "trendingThisWeek": "Trending This Week"
   },
+  "detail": {
+    "back": "Back",
+    "play": "Play",
+    "resume": "Resume",
+    "markWatched": "Mark Watched",
+    "ratings": "Ratings",
+    "ratingImdb": "IMDb",
+    "ratingTmdb": "TMDB",
+    "ratingTrakt": "Trakt",
+    "cast": "Cast",
+    "streams": "Streams",
+    "noStreams": "No streams available.",
+    "loadingStreams": "Loading streams…",
+    "seasons": "Seasons",
+    "seasonLabel": "Season {{n}}",
+    "episodes": "Episodes",
+    "episodeLabel": "S{{season}}E{{episode}}",
+    "minutes": "{{n}} min",
+    "loading": "Loading…",
+    "error": "Could not load this title."
+  },
   "search": {
     "comingSoon": "Search is coming soon."
   },
