@@ -56,9 +56,19 @@ tokio = { workspace = true }
 # HDR / audio / codec regex set lives in `kino-addons::parse`.
 regex = { workspace = true }
 
+# F-016 Settings → About: daily-rotating log file under the app config dir
+# feeds the `export_logs` command (zips the logs folder into a user-chosen
+# location). `tracing-appender` is the official `tracing` ecosystem file
+# rotator; `zip` produces the archive.
+tracing-appender = "0.2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
 [dev-dependencies]
 # F-006 unit tests stand up mock Stremio stream endpoints.
 wiremock = { workspace = true }
+# F-016 cache/logs filesystem helpers run their unit tests against a
+# scratch directory; tempfile gives a per-test cleanup-safe path.
+tempfile = "3"
 
 [lints.rust]
 unsafe_code = "forbid"

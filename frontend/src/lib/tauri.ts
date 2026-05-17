@@ -304,3 +304,192 @@ export async function recentSearchesUpsert(query: string): Promise<void> {
 export async function recentSearchesClear(): Promise<number> {
   return invoke<number>("recent_searches_clear");
 }
+
+// ---- F-016: Settings -------------------------------------------------
+
+export type ApiKeysView = {
+  tmdb: string;
+  trakt: string;
+  tvdb: string;
+  fanart: string;
+};
+
+export type LanguageView = {
+  metadata_primary: string;
+  metadata_fallback: string[];
+  ui: string;
+};
+
+export type CacheView = {
+  path: string;
+  size_gib: number;
+  min_gib: number;
+  max_gib: number;
+};
+
+export type BufferView = {
+  safety_margin_s: number;
+  prebuffer_target_s: number;
+  piece_high_s: number;
+  piece_med_s: number;
+  recompute_interval_s: number;
+};
+
+export type PlayerView = {
+  passthrough_truehd: boolean;
+  passthrough_dtshd: boolean;
+  passthrough_dtsx: boolean;
+  passthrough_atmos: boolean;
+  passthrough_ac3: boolean;
+  passthrough_dts: boolean;
+  passthrough_eac3: boolean;
+  force_hw_decode: boolean;
+  tunneling: boolean;
+};
+
+export type DisplayView = {
+  tile_size: "small" | "medium" | "large" | string;
+  focus_animation: boolean;
+  nsfw: boolean;
+  input_override: "auto" | "touch" | "dpad" | "kbm" | string;
+  high_contrast: boolean;
+};
+
+export type SettingsView = {
+  api_keys: ApiKeysView;
+  language: LanguageView;
+  cache: CacheView;
+  buffer: BufferView;
+  player: PlayerView;
+  display: DisplayView;
+};
+
+export type AppInfo = {
+  name: string;
+  version: string;
+  commit: string;
+  repository: string;
+  license: string;
+  platform: string;
+};
+
+/**
+ * KV keys for every PRD §F-016 setting. Kept in lockstep with
+ * `src-tauri/src/settings.rs::KNOWN_SETTINGS_KEYS`. The Settings UI uses
+ * these constants when calling `settingsSet`.
+ */
+export const SETTING_KEYS = {
+  apiTmdb: "tmdb_api_key",
+  apiTrakt: "trakt_api_key",
+  apiTvdb: "tvdb_api_key",
+  apiFanart: "fanart_api_key",
+  metaPrimaryLang: "lang.metadata_primary",
+  metaFallbackLangs: "lang.metadata_fallback",
+  uiLang: "lang.ui",
+  cachePath: "cache.path",
+  cacheSizeGib: "cache.size_gib",
+  bufferSafetyMarginS: "buffer.safety_margin_s",
+  bufferPrebufferTargetS: "buffer.prebuffer_target_s",
+  bufferPieceHighS: "buffer.piece_high_s",
+  bufferPieceMedS: "buffer.piece_med_s",
+  bufferRecomputeIntervalS: "buffer.recompute_interval_s",
+  playerPassthroughTruehd: "player.passthrough.truehd",
+  playerPassthroughDtshd: "player.passthrough.dtshd",
+  playerPassthroughDtsx: "player.passthrough.dtsx",
+  playerPassthroughAtmos: "player.passthrough.atmos",
+  playerPassthroughAc3: "player.passthrough.ac3",
+  playerPassthroughDts: "player.passthrough.dts",
+  playerPassthroughEac3: "player.passthrough.eac3",
+  playerForceHwDecode: "player.force_hw_decode",
+  playerTunneling: "player.tunneling",
+  displayTileSize: "display.tile_size",
+  displayFocusAnimation: "display.focus_animation",
+  displayNsfw: "display.nsfw",
+  displayInputOverride: "display.input_override",
+  displayHighContrast: "display.high_contrast",
+} as const;
+
+export async function settingsGetAll(): Promise<SettingsView> {
+  return invoke<SettingsView>("settings_get_all");
+}
+
+export async function settingsSet(key: string, value: string): Promise<string> {
+  return invoke<string>("settings_set", { key, value });
+}
+
+export async function settingsResetDefaults(): Promise<void> {
+  return invoke<void>("settings_reset_defaults");
+}
+
+export async function cacheUsageBytes(): Promise<number> {
+  return invoke<number>("cache_usage_bytes");
+}
+
+export async function cacheClear(): Promise<void> {
+  return invoke<void>("cache_clear");
+}
+
+export async function exportLogs(destZip: string): Promise<number> {
+  return invoke<number>("export_logs", { destZip });
+}
+
+export async function getAppInfo(): Promise<AppInfo> {
+  return invoke<AppInfo>("get_app_info");
+}
+
+// ---- F-003 credential tests + F-007 addon controls (used by F-016) -----
+
+export async function testTmdb(): Promise<void> {
+  return invoke<void>("test_tmdb");
+}
+export async function testTrakt(): Promise<void> {
+  return invoke<void>("test_trakt");
+}
+export async function testTvdb(): Promise<void> {
+  return invoke<void>("test_tvdb");
+}
+export async function testFanart(): Promise<void> {
+  return invoke<void>("test_fanart");
+}
+
+export type AddonRow = {
+  id: string;
+  manifest_url: string;
+  enabled: boolean;
+  installed_at: number;
+  manifest_json: unknown;
+  display_order: number;
+};
+
+export type RecommendedAddon = {
+  name: string;
+  manifest_url: string;
+  description: string;
+};
+
+export async function addonsList(): Promise<AddonRow[]> {
+  return invoke<AddonRow[]>("addons_list");
+}
+
+export async function addonsSetEnabled(
+  id: string,
+  enabled: boolean,
+): Promise<number> {
+  return invoke<number>("addons_set_enabled", { id, enabled });
+}
+
+export async function getRecommendedAddons(): Promise<RecommendedAddon[]> {
+  return invoke<RecommendedAddon[]>("get_recommended_addons");
+}
+
+export async function installAddon(url: string): Promise<AddonRow> {
+  return invoke<AddonRow>("install_addon", { url });
+}
+
+export async function uninstallAddon(id: string): Promise<number> {
+  return invoke<number>("uninstall_addon", { id });
+}
+
+export async function setAddonOrder(id: string, order: number): Promise<void> {
+  return invoke<void>("set_addon_order", { id, order });
+}
