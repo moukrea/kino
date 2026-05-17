@@ -1,5 +1,6 @@
-// F-009 Series sub-home placeholder. See `Movies.tsx` for the F-009
-// staging story.
+// F-009 Series sub-home. Identical to Home, filtered to `kind="series"`.
+// See `Movies.tsx` for the routing / mount story; the implementation is
+// shared via `HomeView`.
 
 import type { Component } from "solid-js";
 

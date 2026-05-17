@@ -92,6 +92,7 @@ export const Tile: Component<TileProps> = (props) => {
           }}
           data-testid={`tile-${props.focusId}`}
           data-focused={focused() ? "true" : "false"}
+          data-kind={props.summary.kind}
           aria-label={`${props.summary.title}${
             yearLabel() ? ` (${yearLabel()})` : ""
           }`}

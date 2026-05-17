@@ -4,19 +4,26 @@
 //   2. Trending Now (F-004 top pool)
 //   3. Hidden Gems (F-004 gems pool)
 //   4. Trending This Week (TMDB-only /trending/{type}/week)
-//   5. Catalogs from installed addons (deferred to Session 012)
+//   5. Catalogs from installed addons (deferred — see ADR-068; lands
+//      in a follow-up session)
 //
-// The Home route accepts no kind filter; Movies and Series sub-homes
-// (F-009) reuse the same row stack via `<KindSubHome kind="movie">` /
-// `kind="series"` filtering. For Home, we render BOTH movies and
-// series rows interleaved per the PRD's "Home composition (locked row
-// order)" wording — the locked rows above describe ONE Home; F-009
-// describes the filtered variants. To keep v1 simple and match the
-// trending-aggregator's per-kind shape (`get_trending_pools(kind, ...)`),
-// the Home route shows the movie variants by default; F-009's session
-// (or a polish pass) will introduce a kind toggle if the PRD reading
-// turns out to need both. The acceptance criteria are satisfied either
-// way: the locked row order is honored and CW is shown unfiltered.
+// The Home route accepts no kind filter and renders a mixed
+// movies + series feed (PRD §F-009: "Movies and Series sub-homes are
+// identical structure to Home, filtered to type=movie / type=series" —
+// which positions Home as the unfiltered superset). The trending and
+// weekly aggregators in `kino-metadata` are per-kind (PRD §F-004), so
+// for `kind === null` HomeView fires both calls in parallel and
+// interleaves them via [`interleaveByKind`] — alternating movie /
+// series at each index — to produce a balanced mixed row. CW is
+// already kind-tagged so the `kind === null` path simply does not
+// filter it.
+//
+// `HomeView` is parameterized by `kind` so `Movies.tsx` and
+// `Series.tsx` (F-009 sub-homes) can mount the same row stack with
+// the per-kind filter applied. Switching between Home / Movies /
+// Series via the nav rail re-renders only the route content (the
+// shared Shell in `App.tsx` stays mounted), satisfying F-009's
+// "instant — no full reload" acceptance.
 
 import {
   createResource,
@@ -58,24 +65,41 @@ export type HomeRowId = (typeof HOME_ROW_ORDER)[number];
 
 /**
  * The Home and the sub-homes share this shape. `kind` is the F-009
- * filter; `null` means Home (no filter — current v1 default uses
- * "movie" as the trending kind because `get_trending_pools` is
- * per-kind; the toggle ships with F-009).
+ * filter; `null` means Home (unfiltered — mixed movies + series).
  */
 export type HomeViewProps = {
   /**
-   * `"movie"` → render the Movies sub-home variant.
+   * `"movie"` → render the Movies sub-home variant (PRD §F-009).
    * `"series"` → render the Series sub-home variant.
-   * `null` → render the unfiltered Home. v1 uses the movies kind for
-   * the trending feeds until a kind toggle lands; see component
-   * comment.
+   * `null` → render the unfiltered Home: trending and weekly pools
+   * for both kinds, interleaved.
    */
   kind: TitleKind | null;
 };
 
-export const HomeView: Component<HomeViewProps> = (props) => {
-  const trendingKind = (): TitleKind => props.kind ?? "movie";
+/**
+ * Alternate two per-kind lists into one mixed list at index granularity:
+ * `[a0, b0, a1, b1, a2, b2, ...]`, dropping `undefined` slots when one
+ * list is shorter. Used by the unfiltered Home to balance movies and
+ * series across the trending and weekly rows so neither kind dominates
+ * the visible window. Dedup is intentionally a no-op: the inputs come
+ * from disjoint per-kind feeds, so collisions imply distinct titles
+ * with shared ids across kinds (rare; the `kind:id` pair is the natural
+ * key) — letting them through keeps the row order predictable.
+ */
+export function interleaveByKind<T>(a: readonly T[], b: readonly T[]): T[] {
+  const out: T[] = [];
+  const max = Math.max(a.length, b.length);
+  for (let i = 0; i < max; i++) {
+    const ai = a[i];
+    if (ai !== undefined) out.push(ai);
+    const bi = b[i];
+    if (bi !== undefined) out.push(bi);
+  }
+  return out;
+}
 
+export const HomeView: Component<HomeViewProps> = (props) => {
   const [cwResource] = createResource<ContinueWatching[]>(async () => {
     if (!hasTauri()) return [];
     try {
@@ -89,11 +113,24 @@ export const HomeView: Component<HomeViewProps> = (props) => {
     }
   });
 
-  const [poolsResource] = createResource<TrendingPools, [TitleKind, string]>(
-    () => [trendingKind(), locale()] as [TitleKind, string],
+  const [poolsResource] = createResource<
+    TrendingPools,
+    [TitleKind | null, string]
+  >(
+    () => [props.kind, locale()] as [TitleKind | null, string],
     async ([kind, loc]) => {
       if (!hasTauri()) return { top_trending: [], hidden_gems: [] };
       try {
+        if (kind === null) {
+          const [m, s] = await Promise.all([
+            getTrendingPools("movie", loc),
+            getTrendingPools("series", loc),
+          ]);
+          return {
+            top_trending: interleaveByKind(m.top_trending, s.top_trending),
+            hidden_gems: interleaveByKind(m.hidden_gems, s.hidden_gems),
+          };
+        }
         return await getTrendingPools(kind, loc);
       } catch (e) {
         console.warn("get_trending_pools failed", e);
@@ -102,11 +139,21 @@ export const HomeView: Component<HomeViewProps> = (props) => {
     },
   );
 
-  const [weeklyResource] = createResource<TitleSummary[], [TitleKind, string]>(
-    () => [trendingKind(), locale()] as [TitleKind, string],
+  const [weeklyResource] = createResource<
+    TitleSummary[],
+    [TitleKind | null, string]
+  >(
+    () => [props.kind, locale()] as [TitleKind | null, string],
     async ([kind, loc]) => {
       if (!hasTauri()) return [];
       try {
+        if (kind === null) {
+          const [m, s] = await Promise.all([
+            getWeeklyTrending("movie", loc),
+            getWeeklyTrending("series", loc),
+          ]);
+          return interleaveByKind(m, s);
+        }
         return await getWeeklyTrending(kind, loc);
       } catch (e) {
         console.warn("get_weekly_trending failed", e);
