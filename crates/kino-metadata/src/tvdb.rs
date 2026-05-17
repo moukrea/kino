@@ -9,15 +9,69 @@
 //! `get_trending` invocation only logs in once even though it issues two
 //! filter calls.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use reqwest::StatusCode;
 use serde::Deserialize;
 use tokio::sync::RwLock;
 
+use crate::artwork::{LocalizedAsset, ProviderBundle};
 use crate::error::Error;
 use crate::http::{fetch_with_retry, HttpConfig};
 use crate::trending::ProviderItem;
 use kino_core::title::{TitleKind, TitleSummary};
+
+/// TVDB v4 artwork type ids the F-005 resolver cares about.
+///
+/// TVDB documents distinct id ranges for movies and series. Confirmed against
+/// `https://thetvdb.com/api/v4/artwork/types`. We map only the four PRD §F-005
+/// image types; ignore the rest.
+mod artwork_types {
+    pub const SERIES_BANNER: i32 = 1;
+    pub const SERIES_POSTER: i32 = 2;
+    pub const SERIES_BACKGROUND: i32 = 3;
+    pub const SERIES_CLEARART: i32 = 22;
+    pub const SERIES_CLEARLOGO: i32 = 23;
+
+    pub const MOVIE_POSTER: i32 = 14;
+    pub const MOVIE_BACKGROUND: i32 = 15;
+    pub const MOVIE_BANNER: i32 = 16;
+    pub const MOVIE_CLEARART: i32 = 24;
+    pub const MOVIE_CLEARLOGO: i32 = 25;
+
+    pub const fn is_poster(ty: i32, is_movie: bool) -> bool {
+        if is_movie {
+            ty == MOVIE_POSTER
+        } else {
+            ty == SERIES_POSTER
+        }
+    }
+
+    pub const fn is_background(ty: i32, is_movie: bool) -> bool {
+        if is_movie {
+            ty == MOVIE_BACKGROUND || ty == MOVIE_BANNER
+        } else {
+            ty == SERIES_BACKGROUND || ty == SERIES_BANNER
+        }
+    }
+
+    pub const fn is_logo(ty: i32, is_movie: bool) -> bool {
+        if is_movie {
+            ty == MOVIE_CLEARLOGO
+        } else {
+            ty == SERIES_CLEARLOGO
+        }
+    }
+
+    pub const fn is_clearart(ty: i32, is_movie: bool) -> bool {
+        if is_movie {
+            ty == MOVIE_CLEARART
+        } else {
+            ty == SERIES_CLEARART
+        }
+    }
+}
 
 /// Production TVDB v4 base URL.
 pub const TVDB_BASE_URL: &str = "https://api4.thetvdb.com";
@@ -102,6 +156,80 @@ impl TvdbClient {
             .collect())
     }
 
+    /// Fetch F-005 artwork + per-language overviews for a TVDB title.
+    ///
+    /// Calls `/v4/{movies|series}/{id}/extended?meta=translations` once and
+    /// parses the `artworks` array (filtered by PRD-locked type ids) plus
+    /// `translations.overviewTranslations` into a [`ProviderBundle`].
+    /// Returns `Ok(None)` on a TVDB 404 so the resolver can move on without
+    /// the entire cascade failing.
+    pub async fn artwork(
+        &self,
+        tvdb_id: u64,
+        kind: TitleKind,
+    ) -> Result<Option<ProviderBundle>, Error> {
+        let path = match kind {
+            TitleKind::Movie => "movies",
+            TitleKind::Series => "series",
+        };
+        let url = format!("{}/v4/{path}/{tvdb_id}/extended", self.base_url);
+        let token = self.login().await?;
+        let request_result = fetch_with_retry(
+            || {
+                self.client
+                    .get(&url)
+                    .bearer_auth(&token)
+                    .query(&[("meta", "translations")])
+            },
+            &self.config,
+        )
+        .await;
+        let response = match request_result {
+            Ok(r) => r,
+            Err(Error::Http { status, .. }) if status == StatusCode::NOT_FOUND.as_u16() => {
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        let envelope: ExtendedEnvelope = response
+            .json()
+            .await
+            .map_err(|e| Error::Decode(format!("tvdb {path} extended: {e}")))?;
+        let is_movie = matches!(kind, TitleKind::Movie);
+        let mut posters = Vec::new();
+        let mut backdrops = Vec::new();
+        let mut logos = Vec::new();
+        let mut clearart = Vec::new();
+        for entry in envelope.data.artworks {
+            let asset = LocalizedAsset {
+                lang: entry.language.unwrap_or_default(),
+                url: entry.image,
+            };
+            if artwork_types::is_poster(entry.r#type, is_movie) {
+                posters.push(asset);
+            } else if artwork_types::is_background(entry.r#type, is_movie) {
+                backdrops.push(asset);
+            } else if artwork_types::is_logo(entry.r#type, is_movie) {
+                logos.push(asset);
+            } else if artwork_types::is_clearart(entry.r#type, is_movie) {
+                clearart.push(asset);
+            }
+        }
+        let mut summaries = HashMap::new();
+        for t in envelope.data.translations.overview_translations {
+            if !t.overview.is_empty() {
+                summaries.insert(t.language, t.overview);
+            }
+        }
+        Ok(Some(ProviderBundle {
+            posters,
+            backdrops,
+            logos,
+            clearart,
+            summaries,
+        }))
+    }
+
     /// Issue a TVDB v4 filter request, deserializing the standard
     /// `{ status, data }` envelope. The endpoint requires three mandatory
     /// query parameters (`country`, `lang`, `sort`). We default to
@@ -165,6 +293,40 @@ struct LoginData {
 #[derive(Debug, Deserialize)]
 struct FilterEnvelope {
     data: Vec<FilterEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExtendedEnvelope {
+    data: ExtendedData,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExtendedData {
+    #[serde(default)]
+    artworks: Vec<ArtworkEntry>,
+    #[serde(default)]
+    translations: TranslationsBlock,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TranslationsBlock {
+    #[serde(default, rename = "overviewTranslations")]
+    overview_translations: Vec<OverviewTranslation>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OverviewTranslation {
+    language: String,
+    #[serde(default)]
+    overview: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtworkEntry {
+    image: String,
+    r#type: i32,
+    #[serde(default)]
+    language: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -302,5 +464,137 @@ mod tests {
         assert_eq!(shows.len(), 1);
         assert_eq!(shows[0].summary.kind, TitleKind::Series);
         assert_eq!(shows[0].summary.id, "tvdb:99");
+    }
+
+    #[tokio::test]
+    async fn artwork_movie_parses_locked_type_ids() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v4/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status":"success","data":{"token":"tok"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v4/movies/5/extended"))
+            .and(header("authorization", "Bearer tok"))
+            .and(query_param("meta", "translations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status":"success",
+                "data": {
+                    "id": 5,
+                    "artworks": [
+                        {"id":1,"image":"https://tvdb/poster-en.jpg","type":14,"language":"eng"},
+                        {"id":2,"image":"https://tvdb/bg.jpg","type":15,"language":null},
+                        {"id":3,"image":"https://tvdb/logo-en.jpg","type":25,"language":"eng"},
+                        {"id":4,"image":"https://tvdb/clearart-en.jpg","type":24,"language":"eng"},
+                        {"id":5,"image":"https://tvdb/skipped-character.jpg","type":99,"language":"eng"}
+                    ],
+                    "translations": {
+                        "overviewTranslations": [
+                            {"language":"eng","overview":"Movie overview EN"},
+                            {"language":"fra","overview":"Aperçu FR"}
+                        ]
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client =
+            TvdbClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let bundle = client.artwork(5, TitleKind::Movie).await.unwrap().unwrap();
+        assert_eq!(bundle.posters.len(), 1);
+        assert_eq!(bundle.posters[0].lang, "eng");
+        assert_eq!(bundle.posters[0].url, "https://tvdb/poster-en.jpg");
+        assert_eq!(bundle.backdrops.len(), 1);
+        assert_eq!(bundle.backdrops[0].lang, ""); // null lang
+        assert_eq!(bundle.logos.len(), 1);
+        assert_eq!(bundle.clearart.len(), 1);
+        assert_eq!(
+            bundle.summaries.get("eng").map(String::as_str),
+            Some("Movie overview EN")
+        );
+        assert_eq!(
+            bundle.summaries.get("fra").map(String::as_str),
+            Some("Aperçu FR")
+        );
+    }
+
+    #[tokio::test]
+    async fn artwork_series_parses_series_type_ids() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v4/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status":"success","data":{"token":"tok"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v4/series/123/extended"))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status":"success",
+                "data": {
+                    "id": 123,
+                    "artworks": [
+                        {"id":1,"image":"https://tvdb/series-poster.jpg","type":2,"language":"eng"},
+                        {"id":2,"image":"https://tvdb/series-bg.jpg","type":3,"language":"eng"},
+                        {"id":3,"image":"https://tvdb/series-banner.jpg","type":1,"language":null},
+                        {"id":4,"image":"https://tvdb/series-clearart.jpg","type":22,"language":"eng"},
+                        {"id":5,"image":"https://tvdb/series-clearlogo.jpg","type":23,"language":"eng"}
+                    ],
+                    "translations": {"overviewTranslations": []}
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client =
+            TvdbClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let bundle = client
+            .artwork(123, TitleKind::Series)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bundle.posters.len(), 1);
+        // Series uses type 1 (banner) and type 3 (background) as wide art.
+        assert_eq!(bundle.backdrops.len(), 2);
+        assert_eq!(bundle.logos.len(), 1);
+        assert_eq!(bundle.clearart.len(), 1);
+        assert!(bundle.summaries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn artwork_404_returns_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v4/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status":"success","data":{"token":"tok"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v4/movies/9999/extended"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client =
+            TvdbClient::with_options("test-key", HttpConfig::for_test(), server.uri()).unwrap();
+        assert!(client
+            .artwork(9999, TitleKind::Movie)
+            .await
+            .unwrap()
+            .is_none());
     }
 }

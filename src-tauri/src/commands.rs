@@ -10,13 +10,18 @@
 
 use chrono::{Datelike, NaiveDate, TimeZone, Utc};
 use kino_core::addon::{Addon, AddonInsert};
+use kino_core::constants::ARTWORK_TTL_S;
 use kino_core::cw::ContinueWatching;
-use kino_core::title::{TitleKind, TitleSummary};
+use kino_core::title::{Artwork, TitleKind, TitleSummary};
 use kino_core::Db;
+use kino_metadata::artwork::{cascade, lang_chain_hash, CachedArtwork, ProviderBundles};
+use kino_metadata::tmdb::TitleIds;
 use kino_metadata::{
     aggregate, FanartClient, ProviderItem, TmdbClient, TraktClient, TvdbClient, FANART_API_KEY,
     TMDB_API_KEY, TRAKT_API_KEY, TVDB_API_KEY,
 };
+use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::State;
 
 /// Convert a `kino-core` error into the string the Tauri IPC layer
@@ -289,6 +294,273 @@ fn next_utc_midnight_unix(today: &str) -> Option<i64> {
     Some(Utc.from_utc_datetime(&midnight).timestamp())
 }
 
+// ---- F-005: image & logo resolution -----------------------------------
+//
+// `resolve_artwork(title_id, kind, lang_pref)` builds the F-005 cascade
+// against the configured metadata providers. The locked algorithm and
+// per-tier provider order live in `kino_metadata::artwork`; this command
+// supplies the I/O.
+//
+// PRD §F-005 caching: payloads land in `response_cache` for `ARTWORK_TTL_S`
+// (7 days) keyed by `(title_id, kind, lang_chain_hash)`. The lang-chain hash
+// is part of the key so a user changing their language preferences in F-016
+// transparently invalidates this cache on next read.
+
+/// `resolve_artwork(title_id, kind, lang_pref) -> Artwork` (PRD §F-005).
+///
+/// `title_id` is a provider-prefixed id of the form `tmdb:N` / `imdb:tt...`
+/// / `tvdb:N` (the trending aggregator's [`TitleSummary::id`] shape). Other
+/// shapes return an error. `lang_pref` is the primary + fallback language
+/// chain (up to 4 entries per PRD §F-016); pass `["en"]` for the default.
+///
+/// Returns an [`Artwork`] with the resolved URLs plus a [`Provenance`] block
+/// for debugging which tier won for each asset.
+#[tauri::command]
+#[allow(clippy::similar_names)] // PRD-locked provider names (tmdb / tvdb).
+pub async fn resolve_artwork(
+    db: State<'_, Db>,
+    title_id: String,
+    kind: TitleKind,
+    lang_pref: Vec<String>,
+) -> Result<Artwork, String> {
+    let chain_hash = lang_chain_hash(&lang_pref);
+    let cache_key = format!("artwork:{}:{}:{}", title_id, kind.as_str(), chain_hash);
+
+    if let Some(cached) = db.cache_get(&cache_key).await.map_err(ipc)? {
+        if let Ok(parsed) = serde_json::from_str::<CachedArtwork>(&cached) {
+            return Ok(parsed.artwork);
+        }
+        tracing::warn!(key = %cache_key, "discarding malformed cached artwork payload");
+    }
+
+    let tmdb_key = db.kv_get(TMDB_API_KEY).await.map_err(ipc)?;
+    let tvdb_key = db.kv_get(TVDB_API_KEY).await.map_err(ipc)?;
+    let fanart_key = db.kv_get(FANART_API_KEY).await.map_err(ipc)?;
+
+    let tmdb_client = match tmdb_key {
+        Some(k) => Some(TmdbClient::new(k).map_err(ipc)?),
+        None => None,
+    };
+    let tvdb_client = match tvdb_key {
+        Some(k) => Some(TvdbClient::new(k).map_err(ipc)?),
+        None => None,
+    };
+    let fanart_client = match fanart_key {
+        Some(k) => Some(FanartClient::new(k).map_err(ipc)?),
+        None => None,
+    };
+
+    // Resolve the full TitleIds (tmdb + imdb + tvdb) so each provider gets
+    // the id shape it expects.
+    let ids = resolve_title_ids(&title_id, kind, tmdb_client.as_ref()).await?;
+
+    let bundles = build_bundles(
+        kind,
+        &lang_pref,
+        &ids,
+        tmdb_client.as_ref(),
+        tvdb_client.as_ref(),
+        fanart_client.as_ref(),
+    )
+    .await;
+
+    let artwork = cascade(kind, &bundles, &lang_pref);
+
+    // Cache through `ARTWORK_TTL_S` from now. Per PRD §F-005, changing the
+    // user's language chain invalidates the cache on the NEXT read — the
+    // hash in the key handles this; we don't proactively flush.
+    let payload = serde_json::to_string(&CachedArtwork {
+        artwork: artwork.clone(),
+    })
+    .map_err(|e| e.to_string())?;
+    let expires_at = now_unix().saturating_add(i64::try_from(ARTWORK_TTL_S).unwrap_or(i64::MAX));
+    if let Err(e) = db.cache_set(&cache_key, &payload, expires_at).await {
+        tracing::warn!(error = %e, "failed to persist artwork cache");
+    }
+    Ok(artwork)
+}
+
+/// Parse a provider-prefixed `title_id` into its (provider, raw id) pair.
+fn parse_title_id(title_id: &str) -> Result<(&str, &str), String> {
+    title_id
+        .split_once(':')
+        .filter(|(p, _)| matches!(*p, "tmdb" | "imdb" | "tvdb"))
+        .ok_or_else(|| {
+            format!("unsupported title_id '{title_id}': expected 'tmdb:N', 'imdb:ttN', or 'tvdb:N'")
+        })
+}
+
+/// Fan out the prefix into the full [`TitleIds`]. If TMDB is configured we
+/// always end up with a TMDB id (resolving cross-provider via TMDB's `/find`)
+/// AND the matching `imdb_id` + `tvdb_id` via `/external_ids`. With no TMDB
+/// client, only the directly-encoded id is available — the cascade falls back
+/// to whichever providers can still match.
+async fn resolve_title_ids(
+    title_id: &str,
+    kind: TitleKind,
+    tmdb: Option<&TmdbClient>,
+) -> Result<TitleIds, String> {
+    let (provider, raw) = parse_title_id(title_id)?;
+    let mut ids = TitleIds::default();
+    match provider {
+        "tmdb" => {
+            let parsed: u64 = raw
+                .parse()
+                .map_err(|_| format!("tmdb title_id has non-numeric id: '{raw}'"))?;
+            ids.tmdb_id = Some(parsed);
+        }
+        "imdb" => {
+            ids.imdb_id = Some(raw.to_string());
+        }
+        "tvdb" => {
+            let parsed: u64 = raw
+                .parse()
+                .map_err(|_| format!("tvdb title_id has non-numeric id: '{raw}'"))?;
+            ids.tvdb_id = Some(parsed);
+        }
+        _ => unreachable!("parse_title_id guards the prefix"),
+    }
+    let Some(client) = tmdb else {
+        return Ok(ids);
+    };
+    if ids.tmdb_id.is_none() {
+        let (external_id, source) = if let Some(imdb) = ids.imdb_id.as_deref() {
+            (imdb.to_string(), "imdb_id")
+        } else if let Some(tvdb) = ids.tvdb_id {
+            (tvdb.to_string(), "tvdb_id")
+        } else {
+            return Ok(ids);
+        };
+        match client.find_external(&external_id, source, kind).await {
+            Ok(Some(tmdb_id)) => ids.tmdb_id = Some(tmdb_id),
+            Ok(None) => tracing::info!(
+                provider = "tmdb",
+                external = %external_id,
+                "tmdb find returned no match"
+            ),
+            Err(e) => tracing::warn!(error = %e, "tmdb find_external failed"),
+        }
+    }
+    if let Some(tmdb_id) = ids.tmdb_id {
+        match client.external_ids(tmdb_id, kind).await {
+            Ok(extras) => {
+                if ids.imdb_id.is_none() {
+                    ids.imdb_id = extras.imdb_id;
+                }
+                if ids.tvdb_id.is_none() {
+                    ids.tvdb_id = extras.tvdb_id;
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "tmdb external_ids failed"),
+        }
+    }
+    Ok(ids)
+}
+
+/// Fetch every provider in parallel and stuff the responses into a
+/// [`ProviderBundles`] for the cascade. A `None` bundle means the provider
+/// produced nothing usable (no key, no resolvable id, or a transport failure
+/// we logged and elided).
+#[allow(clippy::similar_names)] // PRD-locked provider names (tmdb / tvdb).
+async fn build_bundles(
+    kind: TitleKind,
+    lang_pref: &[String],
+    ids: &TitleIds,
+    tmdb: Option<&TmdbClient>,
+    tvdb: Option<&TvdbClient>,
+    fanart: Option<&FanartClient>,
+) -> ProviderBundles {
+    let fanart_fut = async move {
+        let client = fanart?;
+        let result = match kind {
+            TitleKind::Movie => {
+                let id = ids
+                    .tmdb_id
+                    .map(|n| n.to_string())
+                    .or_else(|| ids.imdb_id.clone())?;
+                client.movie_artwork(&id).await
+            }
+            TitleKind::Series => {
+                let tvdb_id = ids.tvdb_id?;
+                client.show_artwork(tvdb_id).await
+            }
+        };
+        match result {
+            Ok(Some(bundle)) => Some(bundle),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(provider = "fanart", error = %e, "artwork fetch failed");
+                None
+            }
+        }
+    };
+
+    let tmdb_fut = async move {
+        let client = tmdb?;
+        let tmdb_id = ids.tmdb_id?;
+        let images_result = client.artwork_images(tmdb_id, kind, lang_pref).await;
+        let mut bundle = match images_result {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(provider = "tmdb", error = %e, "artwork images fetch failed");
+                return None;
+            }
+        };
+        bundle.summaries = fetch_tmdb_summaries(client, tmdb_id, kind, lang_pref).await;
+        Some(bundle)
+    };
+
+    let tvdb_fut = async move {
+        let client = tvdb?;
+        let tvdb_id = ids.tvdb_id?;
+        match client.artwork(tvdb_id, kind).await {
+            Ok(Some(b)) => Some(b),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(provider = "tvdb", error = %e, "artwork fetch failed");
+                None
+            }
+        }
+    };
+
+    let (fanart_bundle, tmdb_bundle, tvdb_bundle) = tokio::join!(fanart_fut, tmdb_fut, tvdb_fut);
+    ProviderBundles {
+        fanart: fanart_bundle,
+        tmdb: tmdb_bundle,
+        tvdb: tvdb_bundle,
+    }
+}
+
+/// Fetch per-language summaries for TMDB at every configured tier. Empty
+/// overviews are dropped so the cascade can fall through to the next tier.
+async fn fetch_tmdb_summaries(
+    client: &TmdbClient,
+    tmdb_id: u64,
+    kind: TitleKind,
+    lang_pref: &[String],
+) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for lang in lang_pref {
+        match client.summary(tmdb_id, kind, lang).await {
+            Ok(Some(text)) => {
+                out.insert(lang.clone(), text);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(provider = "tmdb", lang = %lang, error = %e, "summary fetch failed");
+            }
+        }
+    }
+    out
+}
+
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,5 +578,26 @@ mod tests {
         assert_eq!(s.len(), 10);
         assert_eq!(&s[4..5], "-");
         assert_eq!(&s[7..8], "-");
+    }
+
+    #[test]
+    fn parse_title_id_accepts_three_provider_prefixes() {
+        assert_eq!(parse_title_id("tmdb:603").unwrap(), ("tmdb", "603"));
+        assert_eq!(
+            parse_title_id("imdb:tt0133093").unwrap(),
+            ("imdb", "tt0133093")
+        );
+        assert_eq!(parse_title_id("tvdb:78878").unwrap(), ("tvdb", "78878"));
+    }
+
+    #[test]
+    fn parse_title_id_rejects_unsupported_prefix() {
+        let err = parse_title_id("trakt:matrix").unwrap_err();
+        assert!(err.contains("unsupported"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_title_id_rejects_unprefixed_value() {
+        assert!(parse_title_id("603").is_err());
     }
 }

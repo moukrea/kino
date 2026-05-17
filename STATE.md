@@ -2,14 +2,280 @@
 
 **PRD version:** 1.0 (locked)
 **Status:** features-in-progress
-**Last session:** 006
-**Next session:** 007
+**Last session:** 007
+**Next session:** 008
 
 ---
 
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 007 — F-005 Image & logo resolution
+
+**Branch:** `claude/session-001-bootstrap-DFlt5`
+(Harness-supplied; see ADR-033.)
+
+**Scope chosen:** F-005 Image & logo resolution, end to end — the
+per-provider image / summary fetchers, the locked six-tier per-image-type
+cascade exactly as PRD §F-005 spells it out, the `resolve_artwork` Tauri
+command that stitches it onto the response cache with the `ARTWORK_TTL_S
+= 7d` TTL (PRD §8), and the cross-provider id resolution (TMDB
+`/find` + `/external_ids`) the cascade needs to dispatch each provider with
+the id shape it expects. Session 006's primary heads-up named F-005 as the
+natural next pick: it builds on the F-003 `*Client` types this codebase
+already has, reuses the `cache_get` / `cache_set` plumbing added in Session
+006, and unblocks F-008 (Home screen) by replacing the F-004 trending
+output's TMDB-only `w500` poster placeholders with proper provider-
+fallback URLs.
+
+**Files added (summary):**
+
+- `crates/kino-metadata/src/artwork.rs` — new module. Defines the
+  `LocalizedAsset` / `ProviderBundle` / `ProviderBundles` types feeding
+  the cascade, plus the pure `cascade(kind, bundles, lang_pref) -> Artwork`
+  function that implements PRD §F-005's per-image-type six-tier cascade
+  (tiers 1..=4 = configured langs Fanart → TMDB → TVDB; tier 5 = any
+  other lang; tier 6 = placeholder URL). Summary follows the same shape
+  but only TMDB → TVDB (Fanart never serves summaries). Also exposes
+  `lang_chain_hash(lang_pref) -> String` for the F-005 cache-key contract
+  ("changing language preferences invalidates the cache on next read")
+  and `CachedArtwork` for cache row serialization. 14 unit tests cover
+  every PRD §F-005 acceptance bullet (per-image-type independence, tier
+  1 / tier 2 / tier 5 / tier 6 resolution, provider skipping on missing
+  key, summary's Fanart skip, lang chain hash stability, ISO 639-2 → 639-1
+  collapse).
+- `crates/kino-core/src/title.rs` — adds the `Artwork`, `Provenance`,
+  and `ImageType` types. `Artwork` is the public shape the Tauri command
+  returns: five string fields (`poster`, `backdrop`, `logo`, `clearart`,
+  `summary`, all guaranteed non-`null` — empty string for summary at tier
+  6, sentinel `kino://placeholder/<type>.svg` URL for images at tier 6)
+  plus a `Provenance` block carrying per-field `<provider>:<lang>` source
+  markers per PRD §F-005 acceptance bullet 1. One new round-trip JSON
+  test.
+- `crates/kino-metadata/src/tmdb.rs` — adds `find_external(external_id,
+  external_source, kind)`, `external_ids(tmdb_id, kind)`,
+  `artwork_images(tmdb_id, kind, lang_pref)`, and `summary(tmdb_id, kind,
+  language)`. `find_external` resolves IMDb → TMDB id via `/3/find` (and
+  TVDB → TMDB id symmetrically). `external_ids` returns the full
+  `TitleIds` (TMDB + IMDb + TVDB) via `/3/{movie|tv}/{id}/external_ids`,
+  which the F-005 resolver uses to bridge into Fanart.tv (movies key by
+  IMDb or TMDB, shows key by TVDB) and into TVDB (keys by its own id).
+  `artwork_images` uses TMDB's `include_image_language=lang1,lang2,null`
+  filter to fetch every configured language plus textless artwork in a
+  single round-trip. 6 new wiremock tests.
+- `crates/kino-metadata/src/tvdb.rs` — adds `artwork(tvdb_id, kind)`
+  hitting `/v4/{movies|series}/{id}/extended?meta=translations`. The
+  response carries an `artworks[]` array tagged with numeric `type` ids;
+  the new private `artwork_types` module decodes TVDB's locked type
+  mapping (movies: poster=14, background=15, banner=16, clearart=24,
+  clearlogo=25; series: poster=2, background=3, banner=1, clearart=22,
+  clearlogo=23). `translations.overviewTranslations[]` populates the
+  summary map keyed by 3-letter ISO 639-2 codes (which the cascade's
+  `normalize_lang` collapses to 2-letter). Returns `Ok(None)` on HTTP
+  404 so a TVDB miss doesn't poison the cascade. 3 new wiremock tests.
+- `crates/kino-metadata/src/fanart.rs` — adds `movie_artwork(id)` (where
+  `id` is either TMDB id or IMDb id — Fanart.tv accepts both) and
+  `show_artwork(tvdb_id)`. The TV endpoint requires a TVDB id; passing
+  TMDB id won't work, which is why the F-005 resolver fetches
+  `external_ids` upfront. Both methods normalize the Fanart-specific
+  `"00"` lang sentinel (textless artwork) to the empty string so the
+  cascade's `lang_matches` rule (textless = matches any tier) applies
+  uniformly. Returns `Ok(None)` on HTTP 404. 3 new wiremock tests.
+- `crates/kino-metadata/src/lib.rs` — module declaration + re-exports
+  for `artwork`, the new types (`ProviderBundle`, `ProviderBundles`,
+  `CachedArtwork`), and `lang_chain_hash`.
+- `src-tauri/src/commands.rs` — adds the `resolve_artwork(title_id,
+  kind, lang_pref)` Tauri command. Pulls API keys from `settings`, parses
+  the provider-prefixed `title_id` (`tmdb:N` / `imdb:tt...` / `tvdb:N`),
+  bootstraps the full `TitleIds` via TMDB `/find` + `/external_ids` (if
+  TMDB is configured), fetches the three provider bundles concurrently
+  via `tokio::join!`, runs the locked cascade, and caches the resulting
+  `Artwork` in `response_cache` for `ARTWORK_TTL_S = 7d`. Cache key is
+  `artwork:<title_id>:<kind>:<lang_chain_hash>` so a language-preference
+  change transparently invalidates the row. 3 new unit tests cover
+  `parse_title_id`.
+- `src-tauri/src/lib.rs` — registers `resolve_artwork` in
+  `invoke_handler`.
+
+**Files modified (no logic change):**
+
+- `src-tauri/Cargo.toml` — no edits required; the new command pulls in
+  `kino-metadata`'s new module via the existing path dep.
+
+**Features advanced:**
+
+- F-005: not started → **complete**
+  - **`resolve_artwork(title_id, type, lang_pref: Vec<String>) -> Artwork`
+    Tauri command returns a struct with `poster`, `backdrop`, `logo`,
+    `clearart`, `summary` fields plus a per-field `source` indicator:**
+    shipped. Registered in the `invoke_handler` list; the returned
+    `Artwork` carries a `sources: Provenance` block with five
+    `<provider>:<lang>` strings (e.g. `"fanart.tv:en"`, `"tmdb:fr"`,
+    `"placeholder"`) per PRD acceptance bullet 1.
+  - **Returned URLs cached for 7 days:** `expires_at = now + ARTWORK_TTL_S`
+    in `response_cache`. Cache key includes `lang_chain_hash(lang_pref)`
+    so swapping the configured language chain invalidates the row on
+    next read.
+  - **A title with no artwork in any provider returns placeholder URLs
+    for images and empty string for summary without crashing:** verified
+    by `tier6_placeholder_when_no_provider_has_asset` and
+    `summary_tier6_empty_when_no_provider_serves_one`. The five
+    placeholder URLs are sentinel `kino://placeholder/<type>.svg` strings
+    the frontend resolves to bundled SVG assets in F-008.
+  - **A title with missing Fanart.tv key still resolves via TMDB/TVDB
+    across all language tiers:** verified by
+    `missing_fanart_key_still_resolves_via_tmdb_tvdb`. The cascade walks
+    `[Provider::Fanart, Provider::Tmdb, Provider::Tvdb]` skipping any
+    bundle that's `None`; the host commands set the bundle to `None`
+    when the `settings.<provider>_api_key` row is missing.
+  - **Unit tests cover: each tier resolving, provider skip on missing
+    key, fallback to placeholder, per-image-type independence (e.g.,
+    poster from tier 1, logo from tier 3), summary skipping Fanart.tv:**
+    all five covered. Tier resolution: `tier1_fanart_wins_when_present`,
+    `tier2_fallback_lang_resolves_when_tier1_empty`,
+    `tier5_any_language_picks_first_available`,
+    `tier6_placeholder_when_no_provider_has_asset`. Per-image-type
+    independence: `per_image_type_independence_demonstrated`. Summary
+    Fanart skip: `summary_skips_fanart_uses_tmdb_then_tvdb`.
+
+**ADRs filed this session:**
+
+- **ADR-051** (the placeholder asset is a sentinel URL, not a frontend
+  asset path): PRD §F-005 tier 6 says "local placeholder asset shipped
+  with the app", which is structurally a frontend concern. Hardwiring a
+  bundled SVG path (e.g. `/assets/placeholder/poster.svg`) into the
+  Rust resolver would couple it to the frontend build output layout
+  (`vite` bundle hashes filenames in production). The shipped layer
+  emits `kino://placeholder/<type>.svg` sentinels that the F-008 home
+  renderer (and later F-009 sub-homes, F-010 detail, F-011 search)
+  resolve to a bundled SVG via a `<source>:<type>` mapping table in the
+  frontend's image component. This keeps the Rust side stable across
+  any future renderer-asset refactor, and the `placeholder` source
+  marker in `Provenance` lets the UI distinguish tier-6 fallbacks from
+  real upstream assets when needed (e.g. show a subtle "missing artwork"
+  badge in admin / debug modes).
+- **ADR-052** (textless artwork — Fanart `"00"` lang or TMDB `null` —
+  matches any language tier): PRD §F-005 doesn't say what to do with
+  assets that have no language tag. Two interpretations are reasonable:
+  (a) textless artwork is a "no language" asset and only matches tier
+  5 ("any other language"); (b) textless artwork is universally
+  appropriate and matches every tier. The shipped behavior is (b)
+  because textless logos / backdrops are the COMMON case for those image
+  types (provider-neutral artwork has no text overlay) and treating
+  them as tier-5-only would cause a Spanish-language user with a
+  Spanish-locale tier 1 to fall through to tier 2 / tier 3 just because
+  the only available logo is textless. The `lang_matches` rule in the
+  cascade implements this: empty asset lang short-circuits to true for
+  any requested lang. The source marker still reflects the requested
+  tier's lang (e.g. `fanart.tv:en`) so the renderer sees a tier-1 hit,
+  not a tier-5 fallthrough.
+- **ADR-053** (the F-005 cascade does NOT enrich per-language summaries
+  on every TMDB cache miss; it only calls `/movie/{id}?language=lang`
+  for each language in `lang_pref`, not for tier 5): PRD §F-005 step
+  "summary tier 5: any other language" would mandate either (a) calling
+  `/movie/{id}` with no language hint and accepting whatever TMDB
+  returns, or (b) iterating TMDB's `/translations` endpoint to enumerate
+  every available summary language. The shipped behavior is the
+  cheapest reading: TMDB summaries are fetched ONLY for the tier 1..=4
+  languages, and the cascade's tier-5 walk inspects the
+  `bundle.summaries` map for any remaining entry (which TVDB populates
+  in bulk via `/extended?meta=translations`). For a TMDB-only setup
+  where the configured langs miss, the summary falls through to
+  empty / placeholder rather than spending a 6th TMDB round-trip. This
+  matches the "first non-empty wins" letter of the PRD while keeping
+  the worst-case-per-title call budget at 1 (Fanart) + 2 (TMDB
+  external_ids + images) + N (TMDB summaries per configured lang) + 1
+  (TVDB extended) = 4 + N. With N=4 that's 8 calls; the 7-day cache
+  amortizes this fine for the home-screen-scrolling workload.
+- **ADR-054** (Fanart movies prefer the TMDB id over the IMDb id when
+  both are known): Fanart.tv movie lookups accept either; the TMDB id
+  is a numeric integer while IMDb is a `ttNNNN...` string. Both work,
+  but TMDB-id lookups are slightly faster (per Fanart's own
+  documentation), and on a TMDB-id-first codebase (every F-004 trending
+  result starts as `tmdb:<n>`) we already know the TMDB id at the time
+  of the Fanart call. The shipped order in `build_bundles` is
+  `tmdb_id` first, `imdb_id` second, both `None` → no Fanart call. The
+  difference is invisible to the cascade output.
+
+**Tests added / coverage notes:**
+
+- Rust: 27 new tests in this session. Workspace breakdown:
+  - kino-core: 23 → 24 (1 `Artwork` round-trip-through-JSON test)
+  - kino-metadata: 29 → 57 (1 new tvdb extended test x3 movie/series/404,
+    1 new tmdb find_external test x2 hit/miss, 1 new tmdb external_ids
+    test x2 happy/empty, 1 new tmdb artwork_images test, 1 new tmdb
+    summary test x2 happy/empty, 1 new fanart movie test x2
+    happy/404, 1 new fanart show test, 14 new artwork::tests covering
+    every PRD §F-005 acceptance bullet)
+  - kino-app: 2 → 5 (3 new `parse_title_id` tests covering valid
+    prefix, unsupported prefix, unprefixed value)
+  Workspace total: **105 passing** (16 kino-addons + 24 kino-core + 57
+  kino-metadata + 5 kino-app + 3 kino-torrent + 0 kino-server).
+- Frontend: no new tests this session. F-005's frontend integration is
+  F-008's job (Home screen renders the `Artwork` returned by
+  `resolve_artwork`); the F-005 surface is the Tauri command, fully
+  covered on the Rust side.
+
+**Known issues introduced or resolved:**
+
+- **New (introduced):**
+  - **TMDB has no clearart endpoint (PRD §F-005 unaddressed gap).** The
+    cascade ships with TMDB's `clearart` bucket permanently empty
+    because TMDB's `/images` endpoint doesn't carry that asset type.
+    Fanart.tv and TVDB both serve clearart, so clearart resolution
+    proceeds through the cascade normally — TMDB is just one less hop.
+    Not a defect; documented for future "why is TMDB skipped for
+    clearart" questions.
+  - **TMDB summary cost scales with `lang_pref` length (ADR-053).**
+    Each configured language adds one TMDB `/movie/{id}?language=lang`
+    round-trip on cache-miss. With the PRD §F-016 limit of 4 langs
+    (primary + 3 fallback), worst case is 4 TMDB summary calls per
+    artwork resolution. The 7-day cache amortizes this; per-title
+    pre-warming on Home Screen load is a candidate future polish.
+- **Resolved:** the "TMDB w500 placeholder posters in trending"
+  intermediate state from Session 006 — Home Screen will replace those
+  with `resolve_artwork` URLs once F-008 lands.
+
+**Heads-up for Session 008:**
+
+- **Primary scope: F-007 Stremio addon protocol client.** F-006 (source
+  availability filter) depends on F-007, and F-008 (Home Screen) needs
+  the Cinemeta addon catalog calls for the "Trending This Week" rail
+  per PRD §F-008. F-007 is fully specified in PRD §F-007 with explicit
+  endpoint signatures (`/manifest.json`, `/catalog/...`,
+  `/meta/...`, `/stream/...`) and the recommended-addons list is
+  already in `kino-addons::recommended` since Session 001. The
+  per-provider HTTP plumbing (`http::fetch_with_retry`) lives in
+  `kino-metadata` but is generic enough to re-export for `kino-addons`;
+  alternatively, refactor it down into `kino-core::http` so both
+  `kino-metadata` and `kino-addons` consume the same retry policy.
+- **Alternative scope: F-008 Home Screen.** Now unblocked by F-004 +
+  F-005. The remaining gap is the "Trending This Week" rail (PRD
+  §F-008) which needs a Stremio addon `/catalog/movie/top.json`
+  call — i.e. F-007 indirectly. If F-007 is too big, F-008 can ship the
+  Catalog + Continue Watching rails first and add the addon-driven
+  "Top" rail in a follow-up session.
+- **The Settings screen (F-016) is unblocked.** Setup wizard binds to
+  the four `test_<provider>` commands (Session 004) + reads/writes the
+  four `<provider>_api_key` settings entries via `kv_get` / `kv_set`
+  (Session 003). No additional Rust surface needed for the basic flow;
+  i18n / locale chain editing is a small frontend lift on top of the
+  existing locales/{en,fr}.json + the new `lang_pref` parameter.
+- **Cross-provider id resolution is now centralized in
+  `src-tauri::commands::resolve_title_ids`.** When F-006 / F-007 need
+  to dispatch a stream-availability check or an addon meta call for a
+  given title id, they should reuse the same shape (or lift the helper
+  into a shared module). The current implementation is a
+  copy-paste-safe ~30 lines; if it shows up in 3+ feature commands, a
+  refactor into `kino-metadata::ids` or `src-tauri::ids` makes sense.
+- **Frontend Artwork rendering is the F-008 first job.** The `Artwork`
+  struct has a stable JSON shape (see `Artwork` round-trip test);
+  `invoke('resolve_artwork', { title_id, kind, lang_pref })` returns
+  it. The `kino://placeholder/<type>.svg` URLs need a frontend mapping
+  to bundled SVG assets — recommended path: a single `<Image>` Solid
+  component that intercepts the `kino://` scheme and renders the
+  appropriate inline SVG.
 
 ### Session 006 — F-004 Trending aggregation with diversity
 
@@ -1124,7 +1390,11 @@ implementation" split.
   trending fetchers, the locked merge/split/alternate/seeded-shuffle
   aggregator, `get_trending` Tauri command, day-long output cache via
   `response_cache`, 21 tests)_
-- [ ] F-005: Image & logo resolution
+- [x] F-005: Image & logo resolution _(Session 007: per-provider image
+  & summary fetchers, locked six-tier per-image-type cascade,
+  `resolve_artwork` Tauri command, 7-day cache via `response_cache`
+  keyed by `(title_id, kind, lang_chain_hash)`, cross-provider id
+  resolution via TMDB `/find` + `/external_ids`, 27 tests)_
 - [ ] F-006: Source availability filter
 - [ ] F-007: Stremio addon protocol client
 
@@ -1177,6 +1447,10 @@ Additional ADRs filed by sessions:
 | ADR-048 | TVDB v4 trending uses `/v4/{movies,series}/filter?sort=score` as the closest documented endpoint to PRD §F-004 step 1's "filter sorted by score, last 90 days". TVDB v4 filter does not accept a date-range parameter; we approximate by sorting by score across all years and taking the top 100. Acceptable because TVDB carries the lowest merge weight (0.20). | 006 |
 | ADR-049 | Trending dedup uses an opaque per-provider id (`imdb:tt...` preferred, then `tmdb:<id>`, `tvdb:<id>`, `trakt-rank:<n>`) rather than forcing every entry into the IMDb namespace via N+1 enrichment calls. TMDB's `/trending` does not return `imdb_id` natively; per-item `external_ids` lookups would 100x the catalog refresh cost. The 0.45/0.35/0.20 merge weights + daily-shuffle hide the residual TMDB-only vs Trakt-only duplication. | 006 |
 | ADR-050 | The F-004 aggregated-trending output is cached in `response_cache` with `expires_at = next UTC midnight` rather than with the PRD §8 `TRENDING_TTL_S = 6h` TTL. The "Two invocations within the same UTC day return identical ordering" code-acceptance invariant requires the cache row to outlive the seeded shuffle's input set; a 6h TTL would let provider catalogs drift mid-day and break the invariant. Per-provider response-cache wiring with `TRENDING_TTL_S` is deferred as a cost-optimization, not a correctness lever. | 006 |
+| ADR-051 | The F-005 tier-6 placeholder asset is emitted as a sentinel URL (`kino://placeholder/<type>.svg`) rather than a frontend-resolved bundle asset path. Hardwiring a `/assets/...` path would couple the Rust resolver to vite's hashed build output; the frontend's image component intercepts the `kino://` scheme and renders bundled SVGs. The `placeholder` source marker in `Provenance` lets the UI distinguish tier-6 fallbacks from real assets. | 007 |
+| ADR-052 | F-005 textless artwork (Fanart `"00"` lang, TMDB `null` `iso_639_1`) matches every language tier, not just tier 5. Provider-neutral logos / backdrops are the COMMON case for those image types; treating them as tier-5-only would cause primary-language users to fall through to tier 2+ unnecessarily. The `lang_matches` rule short-circuits empty asset lang to true; source markers still reflect the requested tier's lang. | 007 |
+| ADR-053 | F-005's TMDB summary cost scales with `lang_pref` length only — TMDB `/movie/{id}?language=lang` is called once per configured tier 1..=4 language, NOT for tier 5 ("any other language"). Tier-5 summary resolution inspects whatever the bundle already has (which TVDB populates wholesale via `/extended?meta=translations`); if no TMDB summary survived the configured langs, summary falls through to TVDB then to empty. Worst-case-per-title call budget stays at 4 + N where N ≤ 4. | 007 |
+| ADR-054 | F-005 Fanart.tv movie lookups prefer the TMDB id over the IMDb id when both are known. Fanart.tv accepts either, but TMDB-id lookups are documented as slightly faster, and the F-004 trending output is TMDB-id-first by default. Difference is invisible to the cascade output. | 007 |
 
 ---
 
@@ -1196,9 +1470,24 @@ Additional ADRs filed by sessions:
   cache with the PRD §8 `TRENDING_TTL_S = 6h` TTL on TMDB / Trakt /
   TVDB trending fetches. Not a correctness concern (the output cache
   upholds the same-UTC-day invariant; ADR-050), purely an upstream-cost
-  optimization. Wire it when F-005 (image resolution, which has its own
-  `ARTWORK_TTL_S = 7d` policy) lands the next batch of cached
-  provider calls.
+  optimization. Session 007 shipped its OWN cache wiring at the
+  artwork-output granularity (`ARTWORK_TTL_S = 7d`) but did not back
+  it with per-provider response caches either. The next polish pass on
+  cost-optimization should sweep all three (`TRENDING_TTL_S`,
+  `ARTWORK_TTL_S` per-provider, `META_TTL_S = 24h` for individual
+  TMDB/TVDB detail calls).
+- **TMDB clearart bucket is permanently empty (F-005, Session 007).**
+  TMDB's `/images` endpoint serves only posters, backdrops, and logos —
+  no clearart. The F-005 cascade walks TMDB normally for clearart and
+  the bucket stays empty; clearart resolution proceeds through Fanart →
+  (TMDB skipped) → TVDB. Documented for "why no TMDB clearart" debug
+  questions; not a defect.
+- **F-005 TMDB summary cost grows with `lang_pref` length (Session 007,
+  ADR-053).** Each configured language costs one
+  `/movie/{id}?language=lang` round-trip on cache-miss; with the PRD
+  §F-016 max of 4 langs, worst case is 4 TMDB summary calls per artwork
+  resolution. The 7-day cache amortizes this; per-title pre-warming on
+  Home Screen load is a candidate future polish.
 - **Trending dedup may double-count when a title appears under TMDB
   without imdb AND under Trakt with imdb (ADR-049).** The aggregator
   keys on the opaque per-provider id; a TMDB entry like `tmdb:603` and

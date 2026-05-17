@@ -66,6 +66,7 @@ pub fn run() {
             commands::test_tvdb,
             commands::test_fanart,
             commands::get_trending,
+            commands::resolve_artwork,
         ])
         .run(tauri::generate_context!())
         .expect("kino: error while running tauri application");
