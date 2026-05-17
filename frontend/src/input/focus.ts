@@ -126,6 +126,42 @@ export function getRegisteredIds(): readonly string[] {
 export function _resetForTests(): void {
   registry.clear();
   setFocusedIdInternal(null);
+  returnFocusStack.length = 0;
+}
+
+// PRD §F-010 "Back navigation returns focus to the originating tile":
+// before a tile activation navigates to a child route, the focus
+// manager remembers which id had focus; the child route's back-path
+// pops the saved id and re-focuses it on its way out. A stack handles
+// the (eventual) Detail → Detail jump case (e.g. clicking a related
+// title); v1 only navigates one level deep but the stack adds no
+// runtime cost.
+const returnFocusStack: string[] = [];
+
+/**
+ * Remember `id` so a future `popReturnFocus()` call (typically in a
+ * child route's back handler) can restore focus to it. Idempotent if
+ * called with the same id twice in a row (de-dupes consecutive
+ * duplicates).
+ */
+export function pushReturnFocus(id: string): void {
+  if (returnFocusStack[returnFocusStack.length - 1] === id) return;
+  returnFocusStack.push(id);
+}
+
+/**
+ * Pop the most recent saved return-focus id, or `null` if the stack is
+ * empty. Caller is responsible for setting the focus.
+ */
+export function popReturnFocus(): string | null {
+  return returnFocusStack.pop() ?? null;
+}
+
+/**
+ * Test-only accessor for the return-focus stack.
+ */
+export function _returnFocusStackForTests(): readonly string[] {
+  return [...returnFocusStack];
 }
 
 type Rect = { left: number; top: number; right: number; bottom: number; cx: number; cy: number };

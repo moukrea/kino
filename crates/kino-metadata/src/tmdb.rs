@@ -33,6 +33,40 @@ pub struct TitleIds {
     pub tvdb_id: Option<u64>,
 }
 
+/// Detail attributes for the PRD §F-010 title-detail view. Sourced from
+/// TMDB `/3/{movie,tv}/{id}` with `append_to_response=release_dates`
+/// (movie) / `content_ratings` (tv).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TmdbTitleDetails {
+    pub tmdb_id: u64,
+    pub kind: TitleKind,
+    /// BCP-47-ish language the overview is translated into.
+    pub language: String,
+    /// Movie: `runtime` (minutes). Series: first non-zero entry from
+    /// `episode_run_time[]`. `None` when neither is available.
+    pub runtime_minutes: Option<u32>,
+    /// US certification (movies: `release_dates.results[iso_3166_1=US]` →
+    /// `release_dates[0].certification`; series:
+    /// `content_ratings.results[iso_3166_1=US].rating`). `None` when not
+    /// known.
+    pub age_rating: Option<String>,
+    /// Genre names in TMDB's locale-translated form.
+    pub genres: Vec<String>,
+    /// Localized overview text; `None` when empty / missing.
+    pub overview: Option<String>,
+    /// TMDB user rating (`vote_average` on the 0-10 scale). `None` when
+    /// TMDB has no votes.
+    pub rating: Option<f64>,
+}
+
+/// One cast member, top-level for the PRD §F-010 cast row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmdbCastMember {
+    pub name: String,
+    pub character: Option<String>,
+    pub photo_url: Option<String>,
+}
+
 /// TMDB v3 API client.
 #[derive(Debug, Clone)]
 pub struct TmdbClient {
@@ -233,6 +267,114 @@ impl TmdbClient {
         Ok(body.overview.filter(|s| !s.is_empty()))
     }
 
+    /// Fetch detail attributes for the title-detail view (PRD §F-010):
+    /// runtime in minutes, age rating (US `release_dates` for movies, US
+    /// `content_ratings` for TV), genres, vote average, and the localized
+    /// overview. One round-trip per language; the caller does its own
+    /// caching at the `TitleDetail` granularity (`META_TTL_S = 24h`).
+    ///
+    /// `release_dates` / `content_ratings` are pulled in the same call via
+    /// `append_to_response`. Empty results yield `None` rather than an
+    /// empty string so the UI can elide missing fields cleanly.
+    pub async fn title_details(
+        &self,
+        tmdb_id: u64,
+        kind: TitleKind,
+        language: &str,
+    ) -> Result<TmdbTitleDetails, Error> {
+        let media = match kind {
+            TitleKind::Movie => "movie",
+            TitleKind::Series => "tv",
+        };
+        let append = match kind {
+            TitleKind::Movie => "release_dates",
+            TitleKind::Series => "content_ratings",
+        };
+        let url = format!("{}/3/{media}/{tmdb_id}", self.base_url);
+        let response = fetch_with_retry(
+            || {
+                self.client.get(&url).query(&[
+                    ("api_key", self.key.as_str()),
+                    ("language", language),
+                    ("append_to_response", append),
+                ])
+            },
+            &self.config,
+        )
+        .await?;
+        let body: TitleDetailResponse = response
+            .json()
+            .await
+            .map_err(|e| Error::Decode(format!("tmdb {media} title_details: {e}")))?;
+        let age_rating = match kind {
+            TitleKind::Movie => body
+                .release_dates
+                .and_then(|r| pick_us_certification_movie(&r.results)),
+            TitleKind::Series => body
+                .content_ratings
+                .and_then(|r| pick_us_certification_show(&r.results)),
+        };
+        let runtime_minutes = body
+            .runtime
+            .or_else(|| body.episode_run_time.iter().copied().find(|n| *n > 0));
+        Ok(TmdbTitleDetails {
+            tmdb_id,
+            kind,
+            language: language.to_string(),
+            runtime_minutes,
+            age_rating,
+            genres: body
+                .genres
+                .into_iter()
+                .map(|g| g.name)
+                .filter(|s| !s.is_empty())
+                .collect(),
+            overview: body.overview.filter(|s| !s.is_empty()),
+            rating: body.vote_average.filter(|n| *n > 0.0),
+        })
+    }
+
+    /// Fetch the cast credits for a title (PRD §F-010 cast row).
+    ///
+    /// Returns the cast roster in TMDB's own ordering (already ranked by
+    /// billing); the caller (`get_title_detail`) truncates to the top six
+    /// for display. Missing cast (e.g. a Stremio-only show TMDB doesn't
+    /// know about) yields an empty list, not an error.
+    pub async fn credits(
+        &self,
+        tmdb_id: u64,
+        kind: TitleKind,
+    ) -> Result<Vec<TmdbCastMember>, Error> {
+        let media = match kind {
+            TitleKind::Movie => "movie",
+            TitleKind::Series => "tv",
+        };
+        let url = format!("{}/3/{media}/{tmdb_id}/credits", self.base_url);
+        let response = fetch_with_retry(
+            || {
+                self.client
+                    .get(&url)
+                    .query(&[("api_key", self.key.as_str())])
+            },
+            &self.config,
+        )
+        .await?;
+        let body: CreditsResponse = response
+            .json()
+            .await
+            .map_err(|e| Error::Decode(format!("tmdb {media} credits: {e}")))?;
+        Ok(body
+            .cast
+            .into_iter()
+            .filter(|c| !c.name.is_empty())
+            .map(|c| TmdbCastMember {
+                name: c.name,
+                character: c.character.filter(|s| !s.is_empty()),
+                photo_url: c.profile_path.as_deref().map(tmdb_profile_url),
+            })
+            .collect())
+    }
+
     async fn fetch_trending(
         &self,
         media_type: &'static str,
@@ -418,6 +560,121 @@ struct ImageEntry {
 struct DetailResponse {
     #[serde(default)]
     overview: Option<String>,
+}
+
+/// Shape of `/3/{movie,tv}/{id}?append_to_response=...` narrowed to the
+/// fields F-010 reads. Unknown fields stay ignored (serde default) so
+/// TMDB schema growth doesn't break this client.
+#[derive(Debug, Deserialize)]
+struct TitleDetailResponse {
+    #[serde(default)]
+    overview: Option<String>,
+    /// Movies only. Minutes.
+    #[serde(default)]
+    runtime: Option<u32>,
+    /// TV only. Minutes per episode; TMDB sometimes carries an empty
+    /// array, a single entry, or a list (one per season).
+    #[serde(default)]
+    episode_run_time: Vec<u32>,
+    #[serde(default)]
+    vote_average: Option<f64>,
+    #[serde(default)]
+    genres: Vec<GenreEntry>,
+    /// Movies only — present when `append_to_response=release_dates`.
+    #[serde(default)]
+    release_dates: Option<ReleaseDatesEnvelope>,
+    /// TV only — present when `append_to_response=content_ratings`.
+    #[serde(default)]
+    content_ratings: Option<ContentRatingsEnvelope>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GenreEntry {
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseDatesEnvelope {
+    #[serde(default)]
+    results: Vec<ReleaseDatesEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseDatesEntry {
+    #[serde(default)]
+    iso_3166_1: String,
+    #[serde(default)]
+    release_dates: Vec<ReleaseDateRow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseDateRow {
+    #[serde(default)]
+    certification: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ContentRatingsEnvelope {
+    #[serde(default)]
+    results: Vec<ContentRatingEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ContentRatingEntry {
+    #[serde(default)]
+    iso_3166_1: String,
+    #[serde(default)]
+    rating: String,
+}
+
+/// Pick the first non-empty `release_dates[].certification` for the
+/// `US` region from TMDB's movie release-dates envelope. Other regions
+/// are intentionally ignored — the PRD §F-010 "age rating" is a single
+/// label; picking a single locked region keeps the UX consistent across
+/// titles. Future polish could fall back to the user's locale region
+/// when US has no rating.
+fn pick_us_certification_movie(entries: &[ReleaseDatesEntry]) -> Option<String> {
+    entries
+        .iter()
+        .find(|e| e.iso_3166_1.eq_ignore_ascii_case("US"))
+        .and_then(|e| {
+            e.release_dates
+                .iter()
+                .find(|r| !r.certification.is_empty())
+                .map(|r| r.certification.clone())
+        })
+}
+
+/// Pick the US `content_ratings.results[].rating` for a TV title.
+fn pick_us_certification_show(entries: &[ContentRatingEntry]) -> Option<String> {
+    entries
+        .iter()
+        .find(|e| e.iso_3166_1.eq_ignore_ascii_case("US") && !e.rating.is_empty())
+        .map(|e| e.rating.clone())
+}
+
+#[derive(Debug, Deserialize)]
+struct CreditsResponse {
+    #[serde(default)]
+    cast: Vec<CreditEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreditEntry {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    character: Option<String>,
+    #[serde(default)]
+    profile_path: Option<String>,
+}
+
+/// Build a TMDB profile-photo URL at the `w185` size — TMDB's lowest
+/// "human-readable" portrait tier, plenty for the 10-foot cast row.
+fn tmdb_profile_url(path: &str) -> String {
+    let trimmed = path.trim_start_matches('/');
+    format!("https://image.tmdb.org/t/p/w185/{trimmed}")
 }
 
 #[cfg(test)]
@@ -832,5 +1089,180 @@ mod tests {
             TmdbClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
         let text = client.summary(603, TitleKind::Movie, "ja").await.unwrap();
         assert!(text.is_none());
+    }
+
+    // ---- F-010: title_details & credits ----
+
+    #[tokio::test]
+    async fn title_details_parses_movie_payload_with_us_certification() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/3/movie/603"))
+            .and(query_param("api_key", "test-key"))
+            .and(query_param("language", "en"))
+            .and(query_param("append_to_response", "release_dates"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": 603,
+                "title": "The Matrix",
+                "overview": "A computer hacker learns from mysterious rebels.",
+                "runtime": 136,
+                "vote_average": 8.2,
+                "genres": [
+                    {"id": 28, "name": "Action"},
+                    {"id": 878, "name": "Science Fiction"}
+                ],
+                "release_dates": {
+                    "results": [
+                        {
+                            "iso_3166_1": "FR",
+                            "release_dates": [{"certification": "16"}]
+                        },
+                        {
+                            "iso_3166_1": "US",
+                            "release_dates": [
+                                {"certification": ""},
+                                {"certification": "R"}
+                            ]
+                        }
+                    ]
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TmdbClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let details = client
+            .title_details(603, TitleKind::Movie, "en")
+            .await
+            .unwrap();
+        assert_eq!(details.runtime_minutes, Some(136));
+        assert_eq!(details.age_rating.as_deref(), Some("R"));
+        assert_eq!(details.genres, vec!["Action", "Science Fiction"]);
+        assert_eq!(
+            details.overview.as_deref(),
+            Some("A computer hacker learns from mysterious rebels.")
+        );
+        assert_eq!(details.rating, Some(8.2));
+    }
+
+    #[tokio::test]
+    async fn title_details_uses_episode_run_time_for_series() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/3/tv/1399"))
+            .and(query_param("append_to_response", "content_ratings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": 1399,
+                "name": "Game of Thrones",
+                "overview": "Seven noble families fight.",
+                "episode_run_time": [60, 55],
+                "vote_average": 8.4,
+                "genres": [{"id": 10765, "name": "Sci-Fi & Fantasy"}],
+                "content_ratings": {
+                    "results": [
+                        {"iso_3166_1": "GB", "rating": "18"},
+                        {"iso_3166_1": "US", "rating": "TV-MA"}
+                    ]
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TmdbClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let details = client
+            .title_details(1399, TitleKind::Series, "en")
+            .await
+            .unwrap();
+        assert_eq!(details.runtime_minutes, Some(60));
+        assert_eq!(details.age_rating.as_deref(), Some("TV-MA"));
+        assert_eq!(details.genres, vec!["Sci-Fi & Fantasy"]);
+        assert_eq!(details.rating, Some(8.4));
+    }
+
+    #[tokio::test]
+    async fn title_details_handles_missing_optional_fields() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/3/movie/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": 42,
+                "title": "Sparse",
+                "overview": "",
+                "vote_average": 0.0
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TmdbClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let details = client
+            .title_details(42, TitleKind::Movie, "en")
+            .await
+            .unwrap();
+        assert!(details.runtime_minutes.is_none());
+        assert!(details.age_rating.is_none());
+        assert!(details.genres.is_empty());
+        assert!(details.overview.is_none());
+        assert!(details.rating.is_none());
+    }
+
+    #[tokio::test]
+    async fn credits_returns_cast_with_photo_urls() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/3/movie/603/credits"))
+            .and(query_param("api_key", "test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "cast": [
+                    {
+                        "name": "Keanu Reeves",
+                        "character": "Neo",
+                        "profile_path": "/4D0PpNI0kmP58hgrwGC3wCjxhnm.jpg"
+                    },
+                    {
+                        "name": "Laurence Fishburne",
+                        "character": "Morpheus",
+                        "profile_path": null
+                    },
+                    {
+                        "name": "",
+                        "character": "Crew",
+                        "profile_path": null
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TmdbClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let cast = client.credits(603, TitleKind::Movie).await.unwrap();
+        // Empty-name cast entry is filtered out.
+        assert_eq!(cast.len(), 2);
+        assert_eq!(cast[0].name, "Keanu Reeves");
+        assert_eq!(cast[0].character.as_deref(), Some("Neo"));
+        assert_eq!(
+            cast[0].photo_url.as_deref(),
+            Some("https://image.tmdb.org/t/p/w185/4D0PpNI0kmP58hgrwGC3wCjxhnm.jpg")
+        );
+        assert_eq!(cast[1].name, "Laurence Fishburne");
+        assert!(cast[1].photo_url.is_none());
+    }
+
+    #[tokio::test]
+    async fn credits_returns_empty_when_cast_missing() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/3/movie/603/credits"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TmdbClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let cast = client.credits(603, TitleKind::Movie).await.unwrap();
+        assert!(cast.is_empty());
     }
 }

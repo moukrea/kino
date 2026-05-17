@@ -2,14 +2,338 @@
 
 **PRD version:** 1.0 (locked)
 **Status:** features-in-progress
-**Last session:** 013
-**Next session:** 014
+**Last session:** 014
+**Next session:** 015
 
 ---
 
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 014 — F-010 Title detail view
+
+**Branch:** `claude/session-001-bootstrap-OW0NG`
+(Harness-supplied; see ADR-033.)
+
+**Scope chosen:** F-010 Title detail view end-to-end. New Tauri
+commands `get_title_detail(title_id, kind, lang_pref)` and
+`get_streams(title_id, kind, season, episode)`; new `TitleDetail`
+route (`/title/:id?kind=`) with backdrop, logo/title, year/runtime/
+age/genres metadata, IMDb/TMDB/Trakt ratings row, summary, top-6 cast
+row, Play/Resume + Mark Watched action bar, movie stream list with
+PRD-locked badges + sort, series season selector + episode list with
+per-episode progress bars, and back navigation that restores focus
+to the originating tile. Tile activation across Home/Movies/Series
+now navigates to the detail.
+
+All four PRD §F-010 §6A code-acceptance criteria shipped:
+
+1. Resume button only present when matching CW entry exists — backed
+   by the `apply_cw_to_payload` overlay populating
+   `resume_position_s` / `resume_video_id` only when a CW row matches.
+   Frontend renders `detail-resume-button` iff `resume_position_s !==
+   null`, else `detail-play-button`. Pinned by two TS tests covering
+   both branches.
+2. Stream parsing produces correct badges from §8 fixture filenames —
+   the `addon_stream_to_row` path runs `kino_addons::parse::parse`
+   over the concatenated `name`/`title`/`description` text. Rust test
+   `addon_stream_row_quality_badges_match_prd_fixtures` exercises all
+   three PRD-locked fixture filenames through the IPC shape; frontend
+   test `renders quality / HDR / audio / codec / seeders / size
+   badges per stream` pins the rendering.
+3. Episode list shows correct progress for partially-watched episodes
+   — `apply_cw_to_payload` stamps each `Episode.progress` from a
+   matching `(title_id, season, episode)` CW row. Rust test
+   `get_title_detail_per_episode_progress_from_cw`; frontend test
+   `renders series season selector + episode list with progress bars`
+   asserts `data-progress="0.500"` for the 50%-watched fixture.
+4. Back navigation returns focus to the originating tile — new
+   focus-restore stack in `input/focus.ts` (`pushReturnFocus` /
+   `popReturnFocus`). Tile `onActivate` (Home + sub-homes) pushes the
+   currently focused id; detail's `goBack` pops it and reapplies via
+   `setFocusedId`. Frontend tests `Home tile activation pushes the
+   focused id onto the return stack` and `pops the return-focus stack
+   and restores focus on Back click` pin both halves.
+
+**Files changed (summary):**
+
+- `crates/kino-metadata/src/tmdb.rs` — three new public methods +
+  types:
+  - `TmdbClient::title_details(tmdb_id, kind, language)` →
+    `TmdbTitleDetails` (runtime, US age rating, genres, overview,
+    vote_average). Calls `/3/{movie,tv}/{id}` with
+    `append_to_response=release_dates|content_ratings`; US
+    certification is picked via the existing
+    `pick_us_certification_movie` / `pick_us_certification_show`
+    helpers.
+  - `TmdbClient::credits(tmdb_id, kind)` → `Vec<TmdbCastMember>`.
+    Calls `/3/{movie,tv}/{id}/credits`, builds full TMDB profile URLs
+    (`tmdb_profile_url` helper for the `/t/p/w185` size), filters
+    out empty-name entries.
+  - `TmdbTitleDetails` and `TmdbCastMember` struct types, re-exported
+    from `kino_metadata::lib.rs`.
+  - 5 new wiremock tests pinning the parsing of all the new endpoints
+    plus the missing-optional-fields path.
+- `crates/kino-metadata/src/trakt.rs` — `TraktClient::title_rating(imdb,
+  kind)` → `Option<f64>`. Calls `/{movies,shows}/{imdb_id}/ratings`;
+  returns `None` on 404 OR when Trakt's `rating` field is 0.0
+  (uninvoted titles). 4 new wiremock tests.
+- `crates/kino-metadata/src/lib.rs` — re-exports `TmdbCastMember` and
+  `TmdbTitleDetails` alongside the existing `TmdbClient`.
+- `src-tauri/src/commands.rs` — new F-010 block at the end of the
+  feature commands section. Adds the `CastMember` / `Episode` /
+  `TitleDetail` / `StreamRow` IPC types, the `get_title_detail` and
+  `get_streams` Tauri commands, plus helpers
+  (`fetch_meta_for_title`, `apply_tmdb_details`, `apply_tmdb_cast`,
+  `apply_cw_to_payload`, `payload_from_cinemeta`,
+  `parse_runtime_minutes`, `truncate_to_chars`,
+  `validate_stream_request_shape`, `resolve_stremio_id`,
+  `build_stream_work`, `fetch_streams_for_addon`,
+  `addon_stream_to_row`, `stream_text_for_parse`, `pick_detail_line`,
+  `quality_rank`, `extract_seeders`, `extract_size_bytes`,
+  `TitleDetailPayload` cache shape). 22 new unit tests covering:
+  Cinemeta baseline payload, episode list ordering + season-0 dropped
+  + 120-char overview truncation, per-episode CW progress, resume
+  target picks the latest-played episode, movie CW resume, no-CW =
+  no-resume, cast truncation to top six, no-Cinemeta = empty payload,
+  PRD §8 fixture-filename badges through the IPC shape, Torrentio
+  seeders/size extraction, plain "Size: X GB" / "Seeders: N" shapes,
+  unparseable stream returns None badges, quality/seeders/size DESC
+  sort across two addons, series `imdb:S:E` stremio-id form, empty
+  result when no IMDb id resolvable, bad-shape rejection
+  (movie+season, series+no-episode), catalog-only addons receive zero
+  stream calls, seeder regex variants, size unit handling with comma
+  decimals, quality rank ordering, runtime parser, Unicode-safe
+  truncation.
+- `src-tauri/src/lib.rs` — adds `get_title_detail` + `get_streams` to
+  the `invoke_handler!` registry.
+- `src-tauri/Cargo.toml` — adds `regex = { workspace = true }` for
+  the seeders / filesize extraction (the §8 quality/HDR/audio/codec
+  regex set still lives in `kino-addons::parse`).
+- `frontend/src/lib/tauri.ts` — adds `CastMember`, `Episode`,
+  `TitleDetail`, `StreamQuality` / `StreamHdr` / `StreamAudio` /
+  `StreamCodec` / `StreamRow` TS types; `getTitleDetail`,
+  `getStreams`, `cwUpsert`, `cwDelete` typed wrappers.
+- `frontend/src/routes/TitleDetail.tsx` — new route. ~740 lines
+  covering the full F-010 layout: backdrop with bottom vignette,
+  logo-vs-stylized-title fallback, metadata chips, ratings row,
+  summary, cast row with photos, action bar with Resume/Play +
+  Mark Watched + Back, series season selector + episode list with
+  per-episode progress bars + thumbnails + 120-char overview + air
+  date, stream list with quality/HDR/audio/codec/source/seeders/size
+  badges, empty-state for streams. `getTitleDetail` and
+  `resolveArtwork` fire in parallel; `getStreams` re-fires when the
+  user picks a different episode. Back button + the F-017 `back`
+  Action both funnel through `goBack` which pops the focus-restore
+  stack and navigates `(-1)`. Component renamed
+  `TitleDetailRoute` so it doesn't collide with the imported
+  `TitleDetail` type (TS confused them otherwise — see ADR-078).
+- `frontend/src/routes/TitleDetail.test.tsx` — new file. 17 tests
+  covering all four §6A criteria plus metadata chips, ratings row,
+  summary, cast row, season switch, episode-click forwarding to
+  `getStreams`, parallel artwork fetch, kind=series URL parsing,
+  Mark Watched CW upsert.
+- `frontend/src/input/focus.ts` — new `pushReturnFocus(id)` /
+  `popReturnFocus()` / `_returnFocusStackForTests()` API. The
+  return-focus stack is module-level state cleared by
+  `_resetForTests` alongside the focus registry.
+- `frontend/src/input/index.ts` — re-exports the two new functions.
+- `frontend/src/routes/Home.tsx` — adds `activateTile(summary)` that
+  pushes the focused id to the return stack and navigates to
+  `/title/${encodeURIComponent(summary.id)}?kind=${summary.kind}`.
+  Passes `onActivate={activateTile}` to every `<Row>` (CW, trending,
+  hidden gems, weekly, addon catalogs).
+- `frontend/src/App.tsx` — adds `<Route path="/title/:id"
+  component={TitleDetail} />` (re-exported alias of
+  `TitleDetailRoute`).
+- `frontend/src/locales/{en,fr}.json` — new `detail.*` strings (back,
+  play, resume, markWatched, ratings, ratingImdb/Tmdb/Trakt, cast,
+  streams, noStreams, loadingStreams, seasons, seasonLabel, episodes,
+  episodeLabel, minutes, loading, error). French translations follow
+  the en.json structure 1:1.
+- `Cargo.lock` — regen from adding `regex` to `kino-app`'s direct
+  deps (already in the workspace dependency tree via `kino-addons`,
+  so no new transitive crates).
+
+**Features advanced:**
+
+- F-010: not started → **complete**. All four PRD §6A criteria covered
+  (see "Scope chosen" above for the per-criterion test mapping).
+
+**ADRs filed this session:**
+
+- **ADR-078**: F-010 frontend route component is exported as
+  `TitleDetailRoute` (not `TitleDetail`) to keep the value namespace
+  separate from the imported `TitleDetail` TS type. TypeScript got
+  confused by the same-named binding (the local `export const
+  TitleDetail` is a Component value, but TS's inference in
+  `<Show when={detailResource()} keyed>` was synthesizing types as
+  `TitleDetail | NonNullable<T>` — wrongly intersecting the local
+  Component-typed binding with the resource generic). Renaming the
+  component bypasses the collision; we keep a `TitleDetail` re-export
+  alias so consumers can use either name. The conditional approach
+  using `void focusedId` to satisfy unused-import lints was also
+  removed as part of this cleanup once the rename made the focus
+  manager imports natural.
+- **ADR-079**: F-010 walks ALL enabled meta-serving addons in
+  `display_order` (not just Cinemeta) and uses the first one that
+  returns a successful response. Cinemeta is the locked default
+  (lowest `display_order` after first-launch bootstrap), but any
+  addon that declares `meta` resource + the relevant `type` in its
+  manifest is a valid fallback (e.g. Trakt-backed addons,
+  community-meta clones). Rationale: testability (mocked meta
+  endpoints don't need to use the production CINEMETA_MANIFEST_URL)
+  AND robustness (a user who manually uninstalled Cinemeta and
+  installed an alternative isn't stuck without a detail view).
+  Transport failures on one addon do not abort the walk — we log
+  and move to the next. `Ok(None)` on full walk exhaustion lets the
+  detail render with whatever TMDB-only data is available.
+- **ADR-080**: F-010 detail cache is `meta:{title_id}:{kind}:{chain_hash}`
+  with `META_TTL_S = 24h`, but the CW-derived fields
+  (`resume_position_s`, `resume_video_id`, `resume_season`,
+  `resume_episode`, `resume_duration_s`, per-episode `progress`) are
+  marked `#[serde(skip_serializing)]` and re-derived on every read
+  via `apply_cw_to_payload(&db, &mut payload)`. The user's Continue
+  Watching state changes between detail visits as they finish or
+  start playback sessions; a 24h-stale Resume button (or stale
+  per-episode progress bars) would be net-negative UX. The trade-off
+  is one extra `cw_list()` SQL read per detail open, which is cheap
+  (sqlite, one tiny table, indexed on the WHERE columns we filter).
+- **ADR-081**: F-010 stream id resolution stays inside the same
+  `resolve_title_ids` helper F-005's `resolve_artwork` uses, but
+  with a different output shape. For movies the Stremio id is the
+  bare IMDb id (e.g. `tt0133093`); for series episodes it's
+  `imdb:S:E` (e.g. `tt0944947:1:1`). When the kino id is
+  TMDB-prefixed and no TMDB API key is configured, the helper
+  returns `Ok(None)` and the detail view shows the empty-state
+  ("No streams available"). Future polish: warn the user in the UI
+  that configuring a TMDB key would unlock stream fetching for the
+  affected titles.
+- **ADR-082**: F-010 stream sort is `quality DESC, seeders DESC,
+  size DESC` per PRD §F-010 — implemented via the
+  `quality_rank(Option<Quality>) -> u8` helper (4K=4, 1080p=3,
+  720p=2, SD=1, None=0) followed by a stable tuple compare on
+  `(seeders.unwrap_or(0), size_bytes.unwrap_or(0))`. The None
+  unwrap-to-zero biases unknown-seeders / unknown-size streams to
+  the bottom of their quality bucket, which is what we want — known
+  values are strictly more useful than unknown ones for the user's
+  pick.
+- **ADR-083**: F-010 Play / Resume button click does NOT yet pipe
+  through to the player (F-015 hasn't shipped). Clicking Resume
+  writes a fresh CW row with the existing position/duration so the
+  user gets a "I just touched this" hint on the home screen; Play
+  does nothing (visually) but stays clickable. Once F-015 lands,
+  these click handlers dispatch to the player; the CW-write side
+  effect on Resume becomes a no-op (the player itself owns the CW
+  position-poll loop). This avoids shipping the Play button as a
+  dead-end UI element while still surfacing the action bar in the
+  intended PRD-locked position. Mark Watched works fully (writes a
+  CW row at duration position so the F-012 sweep can age it out).
+
+**Tests added / coverage notes:**
+
+- Rust: **31 new tests**. Workspace Rust totals: **218 passing
+  (was 187)**.
+  - `kino-metadata`: 5 TMDB tests
+    (`title_details_parses_movie_payload_with_us_certification`,
+    `title_details_uses_episode_run_time_for_series`,
+    `title_details_handles_missing_optional_fields`,
+    `credits_returns_cast_with_photo_urls`,
+    `credits_returns_empty_when_cast_missing`) + 4 Trakt tests
+    (`title_rating_returns_value_for_movie`,
+    `title_rating_uses_shows_segment_for_series`,
+    `title_rating_returns_none_on_404`,
+    `title_rating_returns_none_when_value_zero`). 69 total
+    (was 60).
+  - `kino-app::commands::tests`: 22 new tests across two groups
+    (F-010 detail + F-010 streams). 54 total (was 32).
+- Frontend: **17 new tests** in `routes/TitleDetail.test.tsx`. 118
+  total (was 101). Coverage hits all four §6A code-acceptance
+  criteria plus the supporting UI rendering: title/year/runtime/
+  age/genres chips, three-rating display + "only when known"
+  filtering, summary, cast row with photo/character fallback,
+  Play vs Resume gating, stream badges (quality/HDR/audio/codec/
+  seeders/size), empty-state, series season selector + episode
+  list + per-episode progress bars, season-switch episode list
+  swap, episode-click → `getStreams(season, episode)` forwarding,
+  back-button focus restore, parallel artwork fetch, URL kind=
+  parsing, Mark Watched CW upsert with duration position.
+
+**Known issues introduced or resolved:**
+
+- **Resolved:** F-010 placeholder route was the Home's tile-click
+  dead-end (clicking a tile did nothing). Tiles now navigate to a
+  fully-rendered detail view with backdrop, metadata, ratings,
+  cast, action bar, and stream list (movies) or season-aware
+  episode list + stream list (series). The F-008 nav-rail / Home
+  composition is unchanged.
+- **New (introduced):** Play / Resume buttons are visually
+  functional but do NOT yet pipe through to a player (per ADR-083);
+  player integration is F-015's work. Clicking Mark Watched DOES
+  write a CW row (so the home-screen "Continue Watching" row reflects
+  the user's intent), and Resume writes a fresh CW row to refresh
+  the `last_played_at` timestamp.
+
+**Convention additions for future sessions:**
+
+- **Focus-restore stack for child route activations.** Any future
+  route that's reached via an "activate" action from a host route
+  MUST: (a) push the originating focus id via `pushReturnFocus(focusedId())`
+  before navigating, (b) pop via `popReturnFocus()` on its own back
+  path and re-focus the popped id via `setFocusedId`. The stack
+  supports multi-level navigation (Detail → Detail → ...) by
+  design but F-010 is the first consumer; the API is exposed from
+  `frontend/src/input/focus.ts` and re-exported through `input/index.ts`.
+- **Component-name vs imported-type-name disambiguation.** When a
+  route component renders data of a type with the same name (e.g.
+  `<TitleDetail>` rendering `TitleDetail` data), rename the
+  component (e.g. `TitleDetailRoute`) to avoid TypeScript's inference
+  confusion in `<Show>`-with-`keyed` patterns. Aliasing the type
+  import (`type TitleDetail as TitleDetailData`) is NOT sufficient
+  because TS reports type names using their original declaration
+  site, masking the alias.
+- **CW-derived fields skip the meta cache.** New backend commands
+  that return user-state-derived fields (CW, watched flags, etc.)
+  alongside cacheable metadata should follow the F-010 pattern:
+  serialize-skip the user-state fields and re-derive them post-cache-
+  read via a dedicated `apply_xxx_to_payload(&db, &mut payload)`
+  function. Prior art: `apply_cw_to_payload`. The cached payload
+  represents the addon/provider truth; the user-state overlay is
+  always live.
+
+**Verification:**
+
+- `cargo fmt --all --check` ✓
+- `cargo clippy --workspace --all-targets -- -D warnings` ✓
+- `cargo test --workspace` ✓ (218 passing; was 187)
+- `cargo build --workspace` ✓
+- `npm run lint` ✓
+- `npm run typecheck` ✓
+- `npm test` ✓ (118 passing; was 101)
+- `npm run build` ✓ (production bundle: 63.13 kB JS + 14.70 kB CSS,
+  gzip 21.99 + 3.55 kB — +16.78 kB JS / +2.95 kB CSS over Session
+  013 reflecting the new TitleDetail route surface area)
+- Full `cargo tauri build --target x86_64-unknown-linux-gnu` skipped:
+  Tauri config + bundle layout unchanged from Session 011 which
+  exercised the deb+rpm+AppImage bundlers; CI re-exercises the full
+  triple on every push.
+
+**Android note:** No Android-specific changes this session. The
+new commands are platform-neutral and link into the Android `cdylib`
+automatically via `src-tauri/src/lib.rs`'s shared `run()`.
+
+**Carryover for next session:** No carryover. The remaining UI
+features are F-011 Search and F-012 Continue Watching (auto-save /
+resume / auto-removal sweep), plus F-016 Settings screen. Streaming
+features F-013 / F-014 / F-015 are independent slices. Suggested
+next-session scope: F-011 Search — `/` keyboard shortcut already
+maps to the `search` action (F-017 done) and the route shell + nav
+rail entry already exist (F-008); the remaining work is the
+debounced live-query input, the TMDB/TVDB/Trakt fan-out, IMDb-id
+detection (`^tt\d+$` → jump to detail), recent searches persistence,
+and infinite scroll pagination. F-010's `pushReturnFocus` / detail
+route already handle the search → detail → search back-nav case.
 
 ### Session 013 — F-008 row 5 addon catalogs enumeration
 
@@ -3292,7 +3616,17 @@ implementation" split.
   row filter — "only catalogs whose addon manifest declares the
   matching type" — that this feature called out, now structurally
   observable via the new wiremock test.)_
-- [ ] F-010: Title detail view
+- [x] F-010: Title detail view _(Session 014: `get_title_detail` +
+  `get_streams` Tauri commands; new `TitleDetailRoute` with backdrop,
+  logo/title, year/runtime/age/genres, IMDb/TMDB/Trakt ratings, summary,
+  top-6 cast row with photos, Play/Resume + Mark Watched action bar,
+  series season selector + episode list with per-episode progress, stream
+  list with PRD-locked badges + sort. Focus-restore stack
+  (`pushReturnFocus`/`popReturnFocus`) wired through Home tile clicks
+  and the detail's back button so PRD §F-010 "Back navigation returns
+  focus to the originating tile" is satisfied. `TmdbClient::title_details`
+  + `TmdbClient::credits` + `TraktClient::title_rating` added.
+  31 new Rust tests + 17 new frontend tests.)_
 - [ ] F-011: Search
 - [ ] F-012: Continue Watching
 - [ ] F-016: Settings screen
@@ -3369,6 +3703,12 @@ Additional ADRs filed by sessions:
 | ADR-075 | Stremio addon catalog ids of the form `"tt0133093"` are coerced to `"imdb:tt0133093"` on the way into `TitleSummary` at the addon-protocol boundary (`coerce_catalog_id` in `kino-app::commands`). The rest of the workspace (F-005 `resolve_artwork`, F-004 aggregator, future F-010 detail) expects the provider-prefixed shape (`imdb:N` / `tmdb:N` / `tvdb:N`); coercing at the boundary keeps consumers free of "is this an IMDb id or a kino id?" branching. Already-prefixed ids (containing a `:`) pass through unchanged, so anime addons like Kitsu (`"kitsu:1234"`) survive intact — better to surface the addon's own id in the downstream "unsupported `title_id`" error than silently mangle it. | 013 |
 | ADR-076 | F-008 row 5 dispatch reuses the F-006 `AVAILABILITY_CONCURRENCY = 8` semaphore budget instead of introducing a separate `CATALOGS_CONCURRENCY` constant. The Home load fans out availability checks AND catalog fetches simultaneously against the same addon connection pool; a shared 8-permit ceiling matches the PRD §F-006 "8 concurrent stream queries" intent and avoids the worst-case 16 simultaneous outbound connections to one addon. If future Shield-on-slow-link testing surfaces contention, splitting the budget is a one-line change. | 013 |
 | ADR-077 | F-008 row 5 cache uses `SEARCH_TTL_S = 1h` rather than the trending command's "next UTC midnight" approach. Trending is determinism-locked (PRD §F-004 same-UTC-day invariant via the daily-shuffle seed); addon catalogs have no such invariant (Cinemeta's "Popular" ticks intra-day, Torrentio's "Trending" reshuffles on its own cadence). `SEARCH_TTL_S` is the PRD §8-locked TTL for live-list data — close enough to addons' typical `cacheMaxAge` hints to keep Home fresh without refetching on every navigation. Per-catalog response caching (honoring each addon's own `cacheMaxAge`) is a candidate future cost-optimization, not a correctness lever. | 013 |
+| ADR-078 | F-010 frontend route component is exported as `TitleDetailRoute`, not `TitleDetail`. The local `export const TitleDetail: Component` would shadow the imported `TitleDetail` TS type in TS's inference (the `<Show when={...} keyed>` overload picker synthesized `TitleDetail \| NonNullable<T>` types when both were in the same value/type namespace). Aliasing the type import doesn't help because TS reports types under their original declared name. Renaming the component (with a `TitleDetail` re-export alias for ergonomics) is the cheapest fix. | 014 |
+| ADR-079 | F-010 metadata baseline walks ALL enabled meta-serving addons in `display_order` (not just Cinemeta) and uses the first successful response. Cinemeta is the locked default (lowest `display_order` after the first-launch bootstrap), but any addon declaring `meta` resource + the relevant `type` is a valid fallback. Improves testability (mocked endpoints don't need the production CINEMETA_MANIFEST_URL) and robustness (a user who manually uninstalled Cinemeta isn't stuck without a detail view). Transport failures don't abort the walk; `Ok(None)` only after the full walk exhausts. | 014 |
+| ADR-080 | F-010 detail cache stores meta-shaped data (Cinemeta + TMDB + Trakt) for `META_TTL_S = 24h`, but the CW-derived fields (`resume_position_s` / `resume_video_id` / `resume_season` / `resume_episode` / `resume_duration_s` / per-episode `progress`) are `#[serde(skip_serializing)]` and re-derived on every read via `apply_cw_to_payload(&db, &mut payload)`. CW state changes between detail visits as the user finishes / starts playback; a 24h-stale Resume button or stale per-episode progress would be net-negative UX. Cost: one extra `cw_list()` SQL read per detail open (sqlite, indexed, cheap). | 014 |
+| ADR-081 | F-010 Stremio stream-id resolution reuses F-005's `resolve_title_ids` helper for the IMDb-id resolution step, then formats the addon path as bare IMDb id for movies (`tt0133093`) or `imdb:S:E` for series episodes (`tt0944947:1:1`). When the kino id is TMDB-prefixed and no TMDB API key is configured, the helper returns `Ok(None)` and the detail view shows the "No streams available" empty state. Future polish: surface a "configure TMDB key to unlock streams" hint in the UI. | 014 |
+| ADR-082 | F-010 stream sort is locked at `quality DESC, seeders DESC, size DESC` per PRD §F-010, implemented via `quality_rank(Option<Quality>) -> u8` (4K=4, 1080p=3, 720p=2, SD=1, None=0) followed by `seeders.unwrap_or(0)` and `size_bytes.unwrap_or(0)` tuple compares. Unknown seeders / unknown size bias to the bottom of their quality bucket; known values are strictly more useful than unknown ones for the user's pick. | 014 |
+| ADR-083 | F-010 Play / Resume button click does NOT yet pipe through to a player (F-015 hasn't shipped). Resume click writes a fresh CW row with existing position/duration so the home-screen "Continue Watching" row reflects the user touch; Play is a no-op visually. Mark Watched DOES write a CW row at duration position (so F-012's CW auto-removal sweep can age it out after 24h). Once F-015 lands, both click handlers dispatch to the player; the CW-write side effects become no-ops (the player owns the CW position-poll loop). This avoids shipping the Play button as a dead-end UI element while exposing the PRD-locked action bar in its intended position. | 014 |
 
 ---
 

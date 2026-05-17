@@ -21,6 +21,27 @@
     "hiddenGems": "Pépites cachées",
     "trendingThisWeek": "Tendances de la semaine"
   },
+  "detail": {
+    "back": "Retour",
+    "play": "Lire",
+    "resume": "Reprendre",
+    "markWatched": "Marquer comme vu",
+    "ratings": "Notes",
+    "ratingImdb": "IMDb",
+    "ratingTmdb": "TMDB",
+    "ratingTrakt": "Trakt",
+    "cast": "Distribution",
+    "streams": "Sources",
+    "noStreams": "Aucune source disponible.",
+    "loadingStreams": "Chargement des sources…",
+    "seasons": "Saisons",
+    "seasonLabel": "Saison {{n}}",
+    "episodes": "Épisodes",
+    "episodeLabel": "S{{season}}E{{episode}}",
+    "minutes": "{{n}} min",
+    "loading": "Chargement…",
+    "error": "Impossible de charger ce titre."
+  },
   "search": {
     "comingSoon": "La recherche arrive bientôt."
   },

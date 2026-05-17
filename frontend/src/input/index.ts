@@ -42,6 +42,8 @@ export {
   activateFocused,
   unregisterFocusable,
   getRegisteredIds,
+  pushReturnFocus,
+  popReturnFocus,
 } from "./focus";
 
 export {

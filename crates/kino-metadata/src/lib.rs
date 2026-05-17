@@ -33,7 +33,7 @@ pub use fanart::FanartClient;
 // re-exports are kept here so existing imports `kino_metadata::HttpConfig` /
 // `kino_metadata::USER_AGENT` continue to compile.
 pub use kino_core::http::{HttpConfig, USER_AGENT};
-pub use tmdb::TmdbClient;
+pub use tmdb::{TmdbCastMember, TmdbClient, TmdbTitleDetails};
 pub use trakt::TraktClient;
 pub use trending::{aggregate, aggregate_pools, ProviderItem, TrendingPools};
 pub use tvdb::TvdbClient;

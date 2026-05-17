@@ -74,6 +74,8 @@ pub fn run() {
             commands::get_trending_pools,
             commands::get_weekly_trending,
             commands::list_home_catalogs,
+            commands::get_title_detail,
+            commands::get_streams,
             commands::resolve_artwork,
             commands::check_availability,
             commands::get_recommended_addons,

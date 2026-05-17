@@ -129,3 +129,116 @@ export async function listHomeCatalogs(
 ): Promise<HomeCatalog[]> {
   return invoke<HomeCatalog[]>("list_home_catalogs", { kind, locale });
 }
+
+// ---- F-010: Title detail view -----------------------------------------
+
+export type CastMember = {
+  name: string;
+  character: string | null;
+  photo: string | null;
+};
+
+export type Episode = {
+  video_id: string;
+  season: number;
+  episode: number;
+  title: string;
+  air_date: string | null;
+  overview: string | null;
+  thumbnail: string | null;
+  /** Watch progress in `[0.0, 1.0]`; zero when no CW entry exists. */
+  progress: number;
+};
+
+export type TitleDetail = {
+  id: string;
+  kind: TitleKind;
+  title: string;
+  year: number | null;
+  runtime_minutes: number | null;
+  age_rating: string | null;
+  genres: string[];
+  summary: string | null;
+  imdb_rating: number | null;
+  tmdb_rating: number | null;
+  trakt_rating: number | null;
+  backdrop: string | null;
+  logo: string | null;
+  poster: string | null;
+  cast: CastMember[];
+  episodes: Episode[];
+  /** When present, the Resume button is shown (PRD §F-010 acceptance). */
+  resume_position_s: number | null;
+  resume_duration_s: number | null;
+  resume_season: number | null;
+  resume_episode: number | null;
+  resume_video_id: string | null;
+  stremio_id: string | null;
+};
+
+export type StreamQuality = "4K" | "1080p" | "720p" | "SD";
+export type StreamHdr = "DV" | "HDR10+" | "HDR10";
+export type StreamAudio =
+  | "ATMOS"
+  | "TRUEHD"
+  | "DTSHD"
+  | "DTSX"
+  | "EAC3"
+  | "AC3"
+  | "DTS";
+export type StreamCodec = "AV1" | "H265" | "H264";
+
+export type StreamRow = {
+  addon_id: string;
+  addon_name: string;
+  name: string;
+  detail: string | null;
+  quality: StreamQuality | null;
+  hdr: StreamHdr | null;
+  audio: StreamAudio | null;
+  codec: StreamCodec | null;
+  seeders: number | null;
+  size_bytes: number | null;
+  url: string | null;
+  info_hash: string | null;
+  file_idx: number | null;
+  sources: string[];
+};
+
+export async function getTitleDetail(
+  titleId: string,
+  kind: TitleKind,
+  langPref: string[],
+): Promise<TitleDetail> {
+  return invoke<TitleDetail>("get_title_detail", {
+    titleId,
+    kind,
+    langPref,
+  });
+}
+
+export async function getStreams(
+  titleId: string,
+  kind: TitleKind,
+  season: number | null,
+  episode: number | null,
+): Promise<StreamRow[]> {
+  return invoke<StreamRow[]>("get_streams", {
+    titleId,
+    kind,
+    season,
+    episode,
+  });
+}
+
+export async function cwUpsert(entry: ContinueWatching): Promise<void> {
+  return invoke<void>("cw_upsert", { entry });
+}
+
+export async function cwDelete(
+  titleId: string,
+  season: number,
+  episode: number,
+): Promise<number> {
+  return invoke<number>("cw_delete", { titleId, season, episode });
+}

@@ -29,6 +29,7 @@ import { Movies } from "./routes/Movies";
 import { Series } from "./routes/Series";
 import { Search } from "./routes/Search";
 import { Settings } from "./routes/Settings";
+import { TitleDetail } from "./routes/TitleDetail";
 
 /**
  * Layout shared by every route: a fixed-width nav rail on the left,
@@ -59,6 +60,7 @@ const App: Component = () => (
     <Route path="/series" component={Series} />
     <Route path="/search" component={Search} />
     <Route path="/settings" component={Settings} />
+    <Route path="/title/:id" component={TitleDetail} />
   </Router>
 );
 

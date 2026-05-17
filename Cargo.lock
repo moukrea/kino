@@ -1973,6 +1973,7 @@ dependencies = [
  "kino-addons",
  "kino-core",
  "kino-metadata",
+ "regex",
  "serde",
  "serde_json",
  "tauri",
