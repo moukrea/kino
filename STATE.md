@@ -2,14 +2,106 @@
 
 **PRD version:** 1.0 (locked)
 **Status:** features-in-progress
-**Last session:** 011
-**Next session:** 012
+**Last session:** 012
+**Next session:** 013
 
 ---
 
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 012 — F-009 Movies and Series sub-homes
+
+**Branch:** `claude/session-001-bootstrap-K6JA2`
+(Harness-supplied; see ADR-033.)
+
+**Scope chosen:** F-009 Movies and Series sub-homes — end to end. The
+Session 011 `HomeView` was already parameterized by `kind`, so the
+real work this session is: (a) replace the Session 011 "Home defaults
+to movies-only" punt with a mixed (movies + series interleaved) feed
+when `kind=null`, (b) add a `data-kind` hook on the Tile so tests can
+verify the F-009 "no movie tile in Series; no series tile in Movies"
+acceptance, and (c) ship a parameterized `HomeView` test suite that
+covers the three kind variants plus the per-kind filtered CW empty
+state. The addon-catalogs row (ADR-068 carryover) stays a labeled
+placeholder for this session and becomes Session 013's primary scope.
+F-010 / F-011 / F-012 / F-016 remain out of scope.
+
+**Files changed (summary):**
+
+- `frontend/src/routes/Home.tsx` — `HomeView` now handles `kind=null`
+  by firing both `getTrendingPools("movie", loc)` and
+  `getTrendingPools("series", loc)` in parallel (same for weekly)
+  and interleaving the results via the new `interleaveByKind` helper
+  exported from the same module. The Session 011 `trendingKind()`
+  fallback to `"movie"` is removed; the per-kind resource argument
+  is now `[props.kind, locale()]` (typed as `[TitleKind | null,
+  string]`). CW filtering by `props.kind` is unchanged. The
+  file-header comment is rewritten to document the mixed-Home
+  reading and the ADR-068 carryover (addon catalogs row still a
+  labeled placeholder).
+- `frontend/src/routes/Movies.tsx` / `Series.tsx` — comments
+  upgraded from "placeholder for F-009's own session" to "F-009
+  sub-home, shared with `HomeView`". Implementations are
+  byte-equivalent (`<HomeView kind="movie" />` / `kind="series"`).
+- `frontend/src/components/Tile.tsx` — one new attribute on the
+  Tile button: `data-kind={props.summary.kind}`. F-009 §6A "no
+  movie tile in Series" is now structurally assertable from tests
+  without scraping aria-labels or other indirect signals; the
+  attribute is also handy for any future per-kind styling.
+- `frontend/src/routes/HomeView.test.tsx` — new file. 11 tests
+  covering: Movies sub-home renders only movie tiles, Series
+  sub-home renders only series tiles, unfiltered Home renders both
+  kinds (interleaved), Movies calls `getTrendingPools` /
+  `getWeeklyTrending` with `kind="movie"` only, unfiltered Home
+  fires both kinds in parallel, filtered CW empty-state hides the
+  row in the Movies sub-home, filtered CW with matching-kind
+  entries renders the row with only the matching tile, plus 4
+  `interleaveByKind` unit tests (equal-length, shorter-list, empty
+  inputs). Uses `vi.mock("../lib/tauri", ...)` to override
+  `hasTauri()` → true and stub the four data functions per test.
+
+**Files NOT touched:**
+
+- `src-tauri/src/commands.rs` and the Rust workspace are unchanged.
+  F-009 is purely a frontend composition concern — the per-kind
+  Tauri commands (`get_trending_pools`, `get_weekly_trending`,
+  `cw_list`) were already kind-parameterized by Session 011 /
+  Session 006.
+
+**Features advanced:**
+
+- F-009: not started → complete
+
+**ADRs filed:** ADR-072 (mixed Home interleaves both kinds 1:1 by
+index granularity; alternative interpretations rejected). Logged in
+the ADR table below.
+
+**Verification:**
+
+- `cargo fmt --check` ✓ (no diff)
+- `cargo clippy --workspace --all-targets -- -D warnings` ✓
+- `cargo test --workspace` ✓ (all crates green, no count delta —
+  F-009 added no Rust code)
+- `cargo build --workspace` ✓
+- `frontend/npm run lint` ✓
+- `frontend/npm run typecheck` ✓
+- `frontend/npm test` ✓ (95 tests pass — 84 from Session 011 + 11
+  new in `HomeView.test.tsx`)
+- `frontend/npm run build` ✓ (production bundle: 46.39 kB JS +
+  11.75 kB CSS, gzip 17.57 + 3.01 kB)
+- Full `cargo tauri build --target x86_64-unknown-linux-gnu`
+  skipped — frontend-only changes; the Session 011 bundle config
+  and Rust surface are unchanged.
+
+**Carryover for next session:** ADR-068 — Session 013's primary
+scope is the F-008 row-5 addon catalogs enumeration (new Tauri
+command surfacing per-addon catalog previews, a frontend per-row
+loop honoring addon `display_order` then catalog order within each
+addon, kind-filtered when the active sub-home filters by kind).
+F-010 Title detail view and F-011 Search are the next two UI
+features after that.
 
 ### Session 011 — F-008 Home screen (10-foot UI)
 
@@ -2897,7 +2989,13 @@ implementation" split.
   `get_weekly_trending`, `aggregate_pools` lifted from
   `kino-metadata::trending`. 19 frontend tests + 3 Rust trending
   tests added. The CW row hides when empty per PRD acceptance.)_
-- [ ] F-009: Movies and Series sub-homes
+- [x] F-009: Movies and Series sub-homes _(Session 012: `HomeView`
+  parameterized by `kind`; Movies / Series routes filter trending +
+  weekly + CW to the matching kind; unfiltered Home interleaves
+  both kinds via `interleaveByKind`; `data-kind` Tile attribute
+  unlocks the "no movie tile in Series" §6A test; 11 new
+  `HomeView.test.tsx` tests. Addon catalogs row still deferred per
+  ADR-068.)_
 - [ ] F-010: Title detail view
 - [ ] F-011: Search
 - [ ] F-012: Continue Watching
@@ -2969,6 +3067,7 @@ Additional ADRs filed by sessions:
 | ADR-069 | F-008 Tile sizing is `width: clamp(140px, 18vw, 240px); aspect-ratio: 2/3` rather than a hardcoded 240×360. The upper bound matches the PRD §F-008 reference, the `18vw` middle yields ~8 tiles per 1920px row (Stremio / Plex 10-foot UI feel), and the 140px floor stops tile collapse on a 360px-wide phone. The PRD's "scaled responsively" wording is satisfied; the empirical sweep on Shield + 4K TV is a §6B-3 human-verification concern. | 011 |
 | ADR-070 | F-008 row virtualization uses a monotonic in-DOM window (`INITIAL_WINDOW = 12`, `WINDOW_STEP = 6`, `TAIL_TRIGGER = 3`) rather than a third-party virtual-list library. ~50 lines of code, zero new deps, plays naturally with the F-017 focus manager (Focusables outside the window simply don't exist), satisfies PRD §F-008 "rows lazy-load tiles beyond viewport (virtualization)". The window doesn't shrink — once a tile is rendered it stays in the DOM for the lifetime of the row, so backward navigation is smooth and there's no flicker. A future polish pass could add an upper bound + recycling if Shield TV memory pressure surfaces. | 011 |
 | ADR-071 | F-008 trending-pool aggregation reuses the F-004 fetch + dedup + score + split pipeline (`merge_by_id` + `split_pools`) but skips the alternation step. New public `aggregate_pools(...)` returns `TrendingPools { top_trending, hidden_gems }`; existing `aggregate(...)` unchanged. Each pool gets its own `ChaCha20Rng::from_seed(SHA256(date || install_id))` instance so the gems ordering doesn't depend on `top.len()` — same-day same-install determinism is preserved per pool independently. | 011 |
+| ADR-072 | F-009 unfiltered Home (`kind = null`) renders a mixed movies + series feed by firing both `getTrendingPools` / `getWeeklyTrending` calls in parallel and interleaving the two lists 1:1 at index granularity via `interleaveByKind`. This matches PRD §F-009's "Movies and Series are filtered variants of Home", which positions Home as the unfiltered superset. Two rejected alternatives: (a) "default Home to movies-only" (the Session 011 punt — leaves series invisible on the top-level route, contradicting the F-009 framing) and (b) "concat movies then series" (visually unbalanced — series tiles would only appear after the user scrolls past 20+ movie tiles, defeating the mixed-feed intent). The 1:1 interleave caps the per-row item count at the sum of both pools (PRD §F-004 `TRENDING_RESULT_COUNT = 50` per kind → up to 100 mixed); the F-008 row virtualization handles the larger window without rendering all of them. | 012 |
 
 ---
 
