@@ -20,14 +20,14 @@ import {
   type Component,
   type JSX,
 } from "solid-js";
-import { Router, Route } from "@solidjs/router";
+import { Router, Route, useNavigate, useLocation } from "@solidjs/router";
 
 import { NavRail } from "./components/NavRail";
-import { installInputSubsystem } from "./input";
+import { installInputSubsystem, onAction } from "./input";
 import { Home } from "./routes/Home";
 import { Movies } from "./routes/Movies";
 import { Series } from "./routes/Series";
-import { Search } from "./routes/Search";
+import { Search, SEARCH_INPUT_TEST_ID } from "./routes/Search";
 import { Settings } from "./routes/Settings";
 import { TitleDetail } from "./routes/TitleDetail";
 
@@ -37,9 +37,33 @@ import { TitleDetail } from "./routes/TitleDetail";
  * height so the route can own its own scroll behavior.
  */
 const Shell: Component<{ children?: JSX.Element }> = (props) => {
+  const navigate = useNavigate();
+  const location = useLocation();
+
   onMount(() => {
     const uninstall = installInputSubsystem();
-    onCleanup(uninstall);
+    // PRD §F-011: `/` on keyboard and Y on gamepad focus search "from
+    // anywhere". Both inputs collapse to the `search` Action at the
+    // F-017 layer; the shell listens once and routes to /search
+    // (focusing the input is the route's `onMount` responsibility).
+    const unsubscribe = onAction((action) => {
+      if (action !== "search") return;
+      if (location.pathname !== "/search") {
+        navigate("/search");
+        return;
+      }
+      // Already on /search — re-focus the input via its test-id so the
+      // shortcut still snaps focus back if the user has navigated to a
+      // result tile.
+      const el = document.querySelector<HTMLInputElement>(
+        `[data-testid="${SEARCH_INPUT_TEST_ID}"]`,
+      );
+      el?.focus();
+    });
+    onCleanup(() => {
+      uninstall();
+      unsubscribe();
+    });
   });
 
   return (

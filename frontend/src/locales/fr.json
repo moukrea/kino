@@ -43,6 +43,14 @@
     "error": "Impossible de charger ce titre."
   },
   "search": {
+    "title": "Recherche",
+    "placeholder": "Rechercher films et séries…",
+    "recentTitle": "Recherches récentes",
+    "recentClear": "Effacer l’historique",
+    "loading": "Recherche en cours…",
+    "empty": "Aucun titre trouvé.",
+    "loadMore": "Charger plus",
+    "hint": "Appuyez sur / pour activer la recherche, ou collez un identifiant IMDb (tt1234567).",
     "comingSoon": "La recherche arrive bientôt."
   },
   "settings": {

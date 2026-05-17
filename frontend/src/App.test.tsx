@@ -77,4 +77,25 @@ describe("App", () => {
     ) as HTMLElement | null;
     expect(moviesItem?.dataset.focused).toBe("true");
   });
+
+  it("the '/' search shortcut navigates to /search from another route (PRD §F-011)", async () => {
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    setOverride("kbm");
+    dispose = render(() => <App />, host);
+
+    // Start on Home (default route). Press "/" — F-017 maps it to the
+    // `search` Action; App.tsx's onAction handler navigates to /search.
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "/" }));
+    // Solid commits the route change synchronously, but the route's
+    // `onMount` autofocus is deferred via queueMicrotask.
+    await Promise.resolve();
+    await Promise.resolve();
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(host.querySelector('[data-testid="search-route"]')).not.toBeNull();
+    // Home title gone, search title in.
+    expect(host.querySelector('[data-testid="home-title"]')).toBeNull();
+    expect(host.querySelector('[data-testid="search-title"]')).not.toBeNull();
+  });
 });

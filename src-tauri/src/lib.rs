@@ -82,6 +82,10 @@ pub fn run() {
             commands::install_addon,
             commands::uninstall_addon,
             commands::set_addon_order,
+            commands::search,
+            commands::recent_searches_list,
+            commands::recent_searches_upsert,
+            commands::recent_searches_clear,
         ])
         .run(tauri::generate_context!())
         .expect("kino: error while running tauri application");

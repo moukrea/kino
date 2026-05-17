@@ -242,3 +242,65 @@ export async function cwDelete(
 ): Promise<number> {
   return invoke<number>("cw_delete", { titleId, season, episode });
 }
+
+// ---- F-011: Search ---------------------------------------------------
+
+/**
+ * IMDb-id shortcut hit. Present on the search response when the typed
+ * query matches `^tt\d+$` and TMDB `/find?external_source=imdb_id`
+ * resolves it to a movie or series. The UI MUST navigate to the
+ * `/title/:id` route immediately rather than render the result list
+ * (PRD §F-011 acceptance: "Pasting `tt1234567` opens the corresponding
+ * title detail directly").
+ */
+export type SearchDirectMatch = {
+  /** Provider-prefixed kino id (`imdb:ttN`). Use as-is in the route. */
+  id: string;
+  /** Detected kind so the detail route knows which IPC to issue. */
+  kind: TitleKind;
+};
+
+export type SearchResponse = {
+  direct: SearchDirectMatch | null;
+  results: TitleSummary[];
+  /** True when at least one extra candidate exists past this page. */
+  has_more: boolean;
+};
+
+/**
+ * `search(query, page, locale)` — PRD §F-011. Returns aggregated,
+ * deduped, availability-filtered results. Empty / whitespace-only
+ * queries resolve to an empty response (the UI surfaces recent
+ * searches via `recentSearchesList` in that case).
+ */
+export async function search(
+  query: string,
+  page: number,
+  locale: string,
+): Promise<SearchResponse> {
+  return invoke<SearchResponse>("search", { query, page, locale });
+}
+
+/**
+ * `recent_searches_list()` — newest first, up to RECENT_SEARCHES_MAX
+ * (10) entries.
+ */
+export async function recentSearchesList(): Promise<string[]> {
+  return invoke<string[]>("recent_searches_list");
+}
+
+/**
+ * `recent_searches_upsert(query)` — refresh the entry's timestamp.
+ * Idempotent. Skipped server-side for empty queries.
+ */
+export async function recentSearchesUpsert(query: string): Promise<void> {
+  return invoke<void>("recent_searches_upsert", { query });
+}
+
+/**
+ * `recent_searches_clear()` — remove every recent-searches row.
+ * Returns the number of rows removed.
+ */
+export async function recentSearchesClear(): Promise<number> {
+  return invoke<number>("recent_searches_clear");
+}

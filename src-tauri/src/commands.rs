@@ -2507,6 +2507,450 @@ fn extract_size_bytes(text: &str) -> Option<u64> {
     Some(n)
 }
 
+// ---- F-011: Search ---------------------------------------------------
+//
+// `search(query, page, locale)` (PRD §F-011) — debounced live search
+// across TMDB / TVDB / Trakt with IMDb-id detection. Pages results at
+// `SEARCH_PAGE_SIZE = 20`, deduped by IMDb id (TMDB id as fallback),
+// with F-006 availability filtering applied so the UI only surfaces
+// items the user can actually stream.
+//
+// Recent searches: `recent_searches_list` / `recent_searches_upsert` /
+// `recent_searches_clear` ride the F-002 persistence layer (the
+// `recent_searches` table was scaffolded in migration 0001). Empty
+// queries surface the most-recent N entries; non-empty queries are
+// recorded only when the live search resolves to at least one result
+// (no point persisting typos).
+//
+// IMDb-id shortcut: a query that matches `^tt\d+$` is resolved server-
+// side via TMDB `/find?external_source=imdb_id` so the frontend can
+// navigate directly to `/title/imdb:{id}?kind={kind}` without guessing
+// which side the title lives on. Failure modes (no TMDB key, no match)
+// fall through to the normal multi-provider search so a typo doesn't
+// dead-end the UX.
+
+/// Direct IMDb-id match returned alongside a normal search response.
+/// When present the frontend MUST navigate immediately to the title
+/// detail rather than render the result list — PRD §F-011 "Pasting
+/// `tt1234567` opens the corresponding title detail directly".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SearchDirectMatch {
+    /// Provider-prefixed kino id (`imdb:tt...`). Use this exact string
+    /// when building the `/title/:id?kind=` URL so the detail route's
+    /// `parse_title_id` accepts it.
+    pub id: String,
+    /// Detected kind so the detail route knows which IPC to issue.
+    pub kind: TitleKind,
+}
+
+/// Aggregated search response. Either `direct` is `Some(...)` (IMDb-id
+/// hit; the UI navigates directly) OR `results` carries the deduped /
+/// availability-filtered page. The two are intentionally returned in
+/// the same shape so the frontend can dispatch on `direct`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SearchResponse {
+    /// IMDb-id shortcut hit. Present only when the query matches
+    /// `^tt\d+$` and TMDB `/find` resolves it to a movie or series.
+    pub direct: Option<SearchDirectMatch>,
+    /// Result page (≤ [`SEARCH_PAGE_SIZE`] items). Empty for direct
+    /// matches.
+    pub results: Vec<TitleSummary>,
+    /// `true` when the upstream providers returned at least one extra
+    /// candidate past this page — the UI uses this to gate "load more".
+    pub has_more: bool,
+}
+
+/// `recent_searches_list()` (PRD §F-011 "empty query: 'Recent
+/// searches'"). Returns the last [`RECENT_SEARCHES_MAX`] queries,
+/// newest first.
+#[tauri::command]
+pub async fn recent_searches_list(db: State<'_, Db>) -> Result<Vec<String>, String> {
+    db.recent_searches_list(kino_core::constants::RECENT_SEARCHES_MAX)
+        .await
+        .map_err(ipc)
+}
+
+/// `recent_searches_upsert(query)`. Refreshes the entry's
+/// `searched_at` to now and prunes the table past
+/// [`RECENT_SEARCHES_MAX`]. Idempotent.
+#[tauri::command]
+pub async fn recent_searches_upsert(db: State<'_, Db>, query: String) -> Result<(), String> {
+    db.recent_searches_upsert(&query, kino_core::constants::RECENT_SEARCHES_MAX)
+        .await
+        .map_err(ipc)
+}
+
+/// `recent_searches_clear()`. Removes every entry — surfaced for the
+/// Settings → Privacy "clear history" action (F-016).
+#[tauri::command]
+pub async fn recent_searches_clear(db: State<'_, Db>) -> Result<u64, String> {
+    db.recent_searches_clear().await.map_err(ipc)
+}
+
+/// Per-provider base URLs the search orchestrator dials. Production uses
+/// the locked PRD §F-003 endpoints (the [`Default`] impl); the unit
+/// tests swap each one for a `wiremock::MockServer::uri()`.
+#[derive(Debug, Clone)]
+struct SearchProviderUrls {
+    tmdb: String,
+    trakt: String,
+    tvdb: String,
+}
+
+impl Default for SearchProviderUrls {
+    fn default() -> Self {
+        Self {
+            tmdb: kino_metadata::tmdb::TMDB_BASE_URL.to_string(),
+            trakt: kino_metadata::trakt::TRAKT_BASE_URL.to_string(),
+            tvdb: kino_metadata::tvdb::TVDB_BASE_URL.to_string(),
+        }
+    }
+}
+
+/// `search(query, page, locale)` (PRD §F-011).
+///
+/// Issues parallel TMDB / TVDB / Trakt search requests, dedups by `IMDb` id
+/// (then TMDB id), applies F-006 availability filtering, and returns up
+/// to [`SEARCH_PAGE_SIZE`] items. Empty / whitespace-only queries return
+/// the empty response — the UI surfaces recent searches via
+/// [`recent_searches_list`] instead.
+///
+/// The `^tt\d+$` shortcut path runs first: when the query matches, TMDB
+/// `/find?external_source=imdb_id` resolves the kind in one call and
+/// the response's `direct` field carries the id for direct navigation.
+#[tauri::command]
+pub async fn search(
+    db: State<'_, Db>,
+    query: String,
+    page: u32,
+    locale: String,
+) -> Result<SearchResponse, String> {
+    search_with_config(
+        &db,
+        &query,
+        page,
+        &locale,
+        &HttpConfig::default(),
+        &SearchProviderUrls::default(),
+    )
+    .await
+}
+
+/// Cache-bypassing core of [`search`]. Exists so the unit tests can
+/// drive the orchestration path with [`HttpConfig::for_test`] (zero
+/// backoffs, short timeout) and wiremock-supplied base URLs without
+/// going through the production `HttpConfig::default()` retry schedule.
+#[allow(clippy::similar_names)] // PRD-locked provider names (tmdb / tvdb).
+async fn search_with_config(
+    db: &Db,
+    query: &str,
+    page: u32,
+    locale: &str,
+    http_config: &HttpConfig,
+    urls: &SearchProviderUrls,
+) -> Result<SearchResponse, String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Ok(SearchResponse {
+            direct: None,
+            results: Vec::new(),
+            has_more: false,
+        });
+    }
+
+    let tmdb_key = db.kv_get(TMDB_API_KEY).await.map_err(ipc)?;
+    let trakt_key = db.kv_get(TRAKT_API_KEY).await.map_err(ipc)?;
+    let tvdb_key = db.kv_get(TVDB_API_KEY).await.map_err(ipc)?;
+
+    // IMDb-id shortcut: `^tt\d+$`. Resolve via TMDB /find. If TMDB has no
+    // mapping, fall through to the regular search so the user still gets
+    // a result list.
+    if is_imdb_id_query(trimmed) {
+        if let Some(direct) =
+            resolve_imdb_shortcut(trimmed, tmdb_key.as_deref(), http_config, &urls.tmdb).await?
+        {
+            return Ok(SearchResponse {
+                direct: Some(direct),
+                results: Vec::new(),
+                has_more: false,
+            });
+        }
+    }
+
+    // Fan out across providers. TMDB is the only required signal; Trakt
+    // and TVDB are optional (PRD §F-003: TMDB is the primary; the others
+    // enrich) — without their keys we still produce TMDB-only results.
+    let (tmdb_items, trakt_items, tvdb_items) = fetch_search_providers(
+        trimmed,
+        page,
+        locale,
+        tmdb_key.as_deref(),
+        trakt_key.as_deref(),
+        tvdb_key.as_deref(),
+        http_config,
+        urls,
+    )
+    .await?;
+
+    // Stable provider order: TMDB → Trakt → TVDB so dedup keeps the
+    // TMDB-shaped row when the same title comes back from multiple
+    // providers (TMDB carries the most metadata).
+    let mut merged: Vec<TitleSummary> =
+        Vec::with_capacity(tmdb_items.len() + trakt_items.len() + tvdb_items.len());
+    merged.extend(tmdb_items);
+    merged.extend(trakt_items);
+    merged.extend(tvdb_items);
+    let deduped = dedup_search_results(merged);
+
+    // F-006 availability filter. We split the candidate set into the
+    // first 2 × page_size items (so dropouts from availability still
+    // leave room for a full page); items past the window are kept aside
+    // and surfaced only if availability dropped too many. This caps
+    // worst-case availability dispatch at 40 items per search call.
+    let page_size = kino_core::constants::SEARCH_PAGE_SIZE;
+    let availability_window = page_size.saturating_mul(2).min(deduped.len());
+    let (head, tail) = deduped.split_at(availability_window);
+    let head_filtered = apply_availability_filter(db, head, http_config).await?;
+    let filtered_count = head_filtered.len();
+    let take_from_head = filtered_count.min(page_size);
+    let mut page_items: Vec<TitleSummary> =
+        head_filtered.into_iter().take(take_from_head).collect();
+    let mut has_more = filtered_count > take_from_head || !tail.is_empty();
+    // Pad with unchecked tail items if availability dropped too many
+    // from the head. This preserves PRD "page size 20" while staying
+    // within the 40-item availability budget — the alternative would
+    // be a recursive top-up across providers which is way more code.
+    if page_items.len() < page_size {
+        let needed = page_size - page_items.len();
+        for item in tail.iter().take(needed).cloned() {
+            page_items.push(item);
+        }
+        if tail.len() > needed {
+            has_more = true;
+        }
+    }
+
+    if !page_items.is_empty() {
+        // Persist the query only when it produced results — typos /
+        // empty matches don't pollute the recents list. Failure to
+        // persist is non-fatal (DB write errors get logged).
+        if let Err(e) = db
+            .recent_searches_upsert(trimmed, kino_core::constants::RECENT_SEARCHES_MAX)
+            .await
+        {
+            tracing::warn!(error = %e, "failed to upsert recent_searches");
+        }
+    }
+
+    Ok(SearchResponse {
+        direct: None,
+        results: page_items,
+        has_more,
+    })
+}
+
+/// Detect the `^tt\d+$` shape (PRD §F-011: "if query matches `^tt\d+$`,
+/// resolve via TMDB `/find`"). Tolerates surrounding whitespace via the
+/// caller's `.trim()`.
+fn is_imdb_id_query(s: &str) -> bool {
+    s.len() > 2 && s.starts_with("tt") && s[2..].bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Resolve an IMDb-id shortcut via TMDB `/find`. Tries movie first, then
+/// TV. Returns `None` when TMDB has no mapping for either kind, OR when
+/// the user has no TMDB key configured. The caller falls through to
+/// the regular multi-provider search in either case.
+async fn resolve_imdb_shortcut(
+    imdb_id: &str,
+    tmdb_key: Option<&str>,
+    http_config: &HttpConfig,
+    tmdb_base_url: &str,
+) -> Result<Option<SearchDirectMatch>, String> {
+    let Some(key) = tmdb_key else {
+        tracing::debug!(
+            imdb = %imdb_id,
+            "no TMDB key configured; skipping IMDb-id shortcut and falling through to multi-provider search"
+        );
+        return Ok(None);
+    };
+    let client = TmdbClient::with_options(key, http_config.clone(), tmdb_base_url.to_string())
+        .map_err(ipc)?;
+    // Movie first — IMDb ids are usually films when ambiguous.
+    if let Some(_id) = client
+        .find_external(imdb_id, "imdb_id", TitleKind::Movie)
+        .await
+        .map_err(ipc)?
+    {
+        return Ok(Some(SearchDirectMatch {
+            id: format!("imdb:{imdb_id}"),
+            kind: TitleKind::Movie,
+        }));
+    }
+    if let Some(_id) = client
+        .find_external(imdb_id, "imdb_id", TitleKind::Series)
+        .await
+        .map_err(ipc)?
+    {
+        return Ok(Some(SearchDirectMatch {
+            id: format!("imdb:{imdb_id}"),
+            kind: TitleKind::Series,
+        }));
+    }
+    Ok(None)
+}
+
+/// Fan out search calls in parallel across the three configured
+/// providers. Each provider's absence (no key) yields an empty list
+/// rather than an error so TMDB-only installs still produce results.
+#[allow(clippy::similar_names, clippy::too_many_arguments)] // PRD-locked provider names (tmdb / tvdb).
+async fn fetch_search_providers(
+    query: &str,
+    page: u32,
+    locale: &str,
+    tmdb_key: Option<&str>,
+    trakt_key: Option<&str>,
+    tvdb_key: Option<&str>,
+    http_config: &HttpConfig,
+    urls: &SearchProviderUrls,
+) -> Result<(Vec<TitleSummary>, Vec<TitleSummary>, Vec<TitleSummary>), String> {
+    // Build clients up front; client-construction failures surface before
+    // any network I/O.
+    let tmdb = match tmdb_key {
+        Some(k) => {
+            Some(TmdbClient::with_options(k, http_config.clone(), urls.tmdb.clone()).map_err(ipc)?)
+        }
+        None => None,
+    };
+    let trakt = match trakt_key {
+        Some(k) => Some(
+            TraktClient::with_options(k, http_config.clone(), urls.trakt.clone()).map_err(ipc)?,
+        ),
+        None => None,
+    };
+    let tvdb = match tvdb_key {
+        Some(k) => {
+            Some(TvdbClient::with_options(k, http_config.clone(), urls.tvdb.clone()).map_err(ipc)?)
+        }
+        None => None,
+    };
+
+    let limit_u32 = u32::try_from(kino_core::constants::SEARCH_PAGE_SIZE).unwrap_or(u32::MAX);
+    let tmdb_fut = async move {
+        let Some(c) = tmdb else { return Ok(Vec::new()) };
+        c.search_multi(query, locale, page).await
+    };
+    let trakt_fut = async move {
+        let Some(c) = trakt else {
+            return Ok(Vec::new());
+        };
+        c.search(query, page, limit_u32).await
+    };
+    // TVDB v4 search doesn't accept a page parameter; we only ask for
+    // page 1 and let the host's per-page slicing fall back on TMDB /
+    // Trakt for deeper pages. Repeating the TVDB call on every page
+    // would only re-yield the same items.
+    let tvdb_fut = async move {
+        if page > 1 {
+            return Ok(Vec::new());
+        }
+        let Some(c) = tvdb else { return Ok(Vec::new()) };
+        c.search(query, limit_u32).await
+    };
+
+    let (tmdb_res, trakt_res, tvdb_res) = tokio::join!(tmdb_fut, trakt_fut, tvdb_fut);
+    // TMDB failure is recoverable here (unlike trending; F-011 doesn't
+    // make TMDB strictly mandatory because the user might be relying on
+    // a TVDB-only or addon-catalog driven setup). Log + treat as empty.
+    let tmdb_items = tmdb_res.unwrap_or_else(|e| {
+        tracing::warn!(provider = "tmdb", error = %e, "search fetch failed; skipping");
+        Vec::new()
+    });
+    let trakt_items = trakt_res.unwrap_or_else(|e| {
+        tracing::warn!(provider = "trakt", error = %e, "search fetch failed; skipping");
+        Vec::new()
+    });
+    let tvdb_items = tvdb_res.unwrap_or_else(|e| {
+        tracing::warn!(provider = "tvdb", error = %e, "search fetch failed; skipping");
+        Vec::new()
+    });
+    Ok((tmdb_items, trakt_items, tvdb_items))
+}
+
+/// Dedup a merged search result list by the `IMDb` id (when present in
+/// the kino id) then by the raw provider id. Preserves input order so
+/// the TMDB-shaped row wins over Trakt / TVDB shapes when the same
+/// title surfaces from multiple providers.
+fn dedup_search_results(items: Vec<TitleSummary>) -> Vec<TitleSummary> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<TitleSummary> = Vec::with_capacity(items.len());
+    for item in items {
+        // Key derivation: kino ids come in `tmdb:N` / `imdb:ttN` / `tvdb:N`
+        // / bare `ttN` (Trakt fallback path) shapes. Coerce to a canonical
+        // `imdb:ttN` when we can detect IMDb so cross-provider duplicates
+        // collapse on the strongest signal.
+        let key = if item.id.starts_with("tt")
+            && item.id.len() > 2
+            && item.id[2..].bytes().all(|b| b.is_ascii_digit())
+        {
+            // PRD §F-011 dedups by IMDb id; same kind + same imdb collapses.
+            format!("{}:imdb:{}", item.kind.as_str(), item.id)
+        } else if let Some(rest) = item.id.strip_prefix("imdb:") {
+            format!("{}:imdb:{}", item.kind.as_str(), rest)
+        } else {
+            // Fall back to (kind, raw id) — distinct providers with no
+            // imdb mapping stay separate rows.
+            format!("{}:{}", item.kind.as_str(), item.id)
+        };
+        if seen.insert(key) {
+            out.push(item);
+        }
+    }
+    out
+}
+
+/// Apply the F-006 availability filter to a candidate slice. Items with
+/// `available = false` are dropped. When no stream-serving addon is
+/// installed every item passes through unchanged — PRD §F-006 already
+/// returns "every item unavailable" in that case, which would zero-out
+/// search; we honor F-011's "F-006 availability filter applied" wording
+/// but also preserve usefulness when no addon is wired (the search
+/// surface stays browseable, and the title-detail screen will surface
+/// the "no streams" empty state).
+async fn apply_availability_filter(
+    db: &Db,
+    items: &[TitleSummary],
+    http_config: &HttpConfig,
+) -> Result<Vec<TitleSummary>, String> {
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Short-circuit when no addon serves streams. PRD §F-006's
+    // `check_availability` already handles this case, but doing it here
+    // means we don't pay the cache + dispatch overhead for the common
+    // no-addons-yet first-launch UX.
+    let stream_addons = load_stream_addons(db).await?;
+    if stream_addons.is_empty() {
+        return Ok(items.to_vec());
+    }
+    let requests: Vec<AvailabilityRequest> = items
+        .iter()
+        .map(|s| AvailabilityRequest {
+            title_id: s.id.clone(),
+            kind: s.kind,
+        })
+        .collect();
+    let avail = check_availability_with_config(db, requests, http_config).await?;
+    let mut keep: Vec<bool> = vec![false; items.len()];
+    for (i, r) in avail.iter().enumerate() {
+        keep[i] = r.available;
+    }
+    Ok(items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, item)| if keep[i] { Some(item.clone()) } else { None })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4332,5 +4776,518 @@ mod tests {
         let mut s = "héllo wörld".to_string();
         truncate_to_chars(&mut s, 4);
         assert_eq!(s, "héll…");
+    }
+
+    // ---- F-011: Search ------------------------------------------------
+
+    #[test]
+    fn is_imdb_id_query_accepts_tt_then_digits() {
+        assert!(is_imdb_id_query("tt0133093"));
+        assert!(is_imdb_id_query("tt1234567"));
+        assert!(is_imdb_id_query("tt1"));
+    }
+
+    #[test]
+    fn is_imdb_id_query_rejects_non_imdb_shapes() {
+        assert!(!is_imdb_id_query(""));
+        assert!(!is_imdb_id_query("tt"));
+        assert!(!is_imdb_id_query("the matrix"));
+        assert!(!is_imdb_id_query("tt0133093x"));
+        assert!(!is_imdb_id_query("ttabc"));
+        assert!(!is_imdb_id_query("Tt0133093")); // case-sensitive
+        assert!(!is_imdb_id_query("imdb:tt0133093"));
+    }
+
+    #[test]
+    fn dedup_search_results_collapses_imdb_duplicates_across_providers() {
+        let movie_imdb = TitleSummary {
+            id: "tmdb:603".into(),
+            kind: TitleKind::Movie,
+            title: "The Matrix (TMDB)".into(),
+            year: Some(1999),
+            poster: None,
+            rating: None,
+        };
+        let trakt_imdb = TitleSummary {
+            // Trakt id surfaces as bare `tt...`.
+            id: "tt0133093".into(),
+            kind: TitleKind::Movie,
+            title: "The Matrix (Trakt)".into(),
+            year: Some(1999),
+            poster: None,
+            rating: None,
+        };
+        let tvdb_imdb = TitleSummary {
+            // TVDB surfaces IMDb-shape via remote_ids resolution.
+            id: "tt0133093".into(),
+            kind: TitleKind::Movie,
+            title: "The Matrix (TVDB)".into(),
+            year: Some(1999),
+            poster: None,
+            rating: None,
+        };
+        let prefixed = TitleSummary {
+            // Same IMDb id but in `imdb:tt...` form — should still collapse.
+            id: "imdb:tt0133093".into(),
+            kind: TitleKind::Movie,
+            title: "Matrix (kino-shape)".into(),
+            year: Some(1999),
+            poster: None,
+            rating: None,
+        };
+        // First row by IMDb-id key collapses; tmdb:603 has no imdb mapping
+        // in this scenario so it stays distinct.
+        let out = dedup_search_results(vec![movie_imdb.clone(), trakt_imdb, tvdb_imdb, prefixed]);
+        assert_eq!(out.len(), 2);
+        // Order preserved: TMDB first, Trakt's IMDb-row second.
+        assert_eq!(out[0].id, "tmdb:603");
+        assert_eq!(out[1].id, "tt0133093");
+    }
+
+    #[test]
+    fn dedup_search_results_keeps_distinct_kinds_with_same_imdb() {
+        let m = TitleSummary {
+            id: "tt0000001".into(),
+            kind: TitleKind::Movie,
+            title: "Same".into(),
+            year: None,
+            poster: None,
+            rating: None,
+        };
+        let s = TitleSummary {
+            id: "tt0000001".into(),
+            kind: TitleKind::Series,
+            title: "Same".into(),
+            year: None,
+            poster: None,
+            rating: None,
+        };
+        let out = dedup_search_results(vec![m, s]);
+        assert_eq!(out.len(), 2);
+    }
+
+    // wiremock URLs need a base; build the urls struct pointed at one
+    // server. Per-provider routes are namespaced by path so a single
+    // MockServer is enough.
+    fn search_test_config() -> HttpConfig {
+        HttpConfig::for_test()
+    }
+
+    async fn seed_api_keys(db: &Db) {
+        db.kv_set(TMDB_API_KEY, "test-tmdb-key").await.unwrap();
+        db.kv_set(TRAKT_API_KEY, "test-trakt-key").await.unwrap();
+        db.kv_set(TVDB_API_KEY, "test-tvdb-key").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn search_empty_query_returns_empty_response() {
+        let db = Db::open_in_memory().await.unwrap();
+        let urls = SearchProviderUrls::default();
+        let res = search_with_config(&db, "  ", 1, "en-US", &search_test_config(), &urls)
+            .await
+            .unwrap();
+        assert!(res.direct.is_none());
+        assert!(res.results.is_empty());
+        assert!(!res.has_more);
+        // No recent_searches row recorded for an empty query.
+        assert!(db.recent_searches_list(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_imdb_shortcut_resolves_movie_via_tmdb_find() {
+        let tmdb = MockServer::start().await;
+        // /find returns a movie hit on the first attempt.
+        Mock::given(method("GET"))
+            .and(path("/3/find/tt0133093"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"movie_results": [{"id": 603}], "tv_results": []}"#),
+            )
+            .expect(1)
+            .mount(&tmdb)
+            .await;
+
+        let db = Db::open_in_memory().await.unwrap();
+        seed_api_keys(&db).await;
+        let urls = SearchProviderUrls {
+            tmdb: tmdb.uri(),
+            trakt: "http://unused".into(),
+            tvdb: "http://unused".into(),
+        };
+        let res = search_with_config(&db, "tt0133093", 1, "en-US", &search_test_config(), &urls)
+            .await
+            .unwrap();
+        let direct = res.direct.expect("expected direct match");
+        assert_eq!(direct.id, "imdb:tt0133093");
+        assert_eq!(direct.kind, TitleKind::Movie);
+        assert!(res.results.is_empty());
+        assert!(!res.has_more);
+    }
+
+    #[tokio::test]
+    async fn search_imdb_shortcut_falls_back_to_series_when_movie_misses() {
+        let tmdb = MockServer::start().await;
+        // First call (movie kind) returns no match; second (tv) returns hit.
+        Mock::given(method("GET"))
+            .and(path("/3/find/tt0944947"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"movie_results": [], "tv_results": [{"id": 1399}]}"#),
+            )
+            .expect(2)
+            .mount(&tmdb)
+            .await;
+
+        let db = Db::open_in_memory().await.unwrap();
+        seed_api_keys(&db).await;
+        let urls = SearchProviderUrls {
+            tmdb: tmdb.uri(),
+            trakt: "http://unused".into(),
+            tvdb: "http://unused".into(),
+        };
+        let res = search_with_config(&db, "tt0944947", 1, "en-US", &search_test_config(), &urls)
+            .await
+            .unwrap();
+        let direct = res.direct.expect("expected direct match");
+        assert_eq!(direct.id, "imdb:tt0944947");
+        assert_eq!(direct.kind, TitleKind::Series);
+    }
+
+    #[tokio::test]
+    async fn search_imdb_shortcut_falls_through_when_no_tmdb_key() {
+        // Without TMDB key the shortcut is skipped entirely and we fall
+        // through to a multi-provider search. With no Trakt/TVDB keys either
+        // the response is empty.
+        let db = Db::open_in_memory().await.unwrap();
+        // No api keys seeded.
+        let urls = SearchProviderUrls::default();
+        let res = search_with_config(&db, "tt0133093", 1, "en-US", &search_test_config(), &urls)
+            .await
+            .unwrap();
+        assert!(res.direct.is_none());
+        assert!(res.results.is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::similar_names)] // PRD-locked provider names (tmdb / tvdb).
+    async fn search_multi_provider_aggregates_and_dedups() {
+        let tmdb = MockServer::start().await;
+        let trakt = MockServer::start().await;
+        let tvdb = MockServer::start().await;
+        // TMDB returns The Matrix as a tmdb-id row (no imdb mapping here).
+        Mock::given(method("GET"))
+            .and(path("/3/search/multi"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"results":[
+                    {"id":603,"media_type":"movie","title":"The Matrix",
+                     "release_date":"1999-03-31","vote_average":8.2}
+                ]}"#,
+            ))
+            .expect(1)
+            .mount(&tmdb)
+            .await;
+        // Trakt returns The Matrix with IMDb id; this dedups against TMDB
+        // ONLY if both rows carry imdb form. Since TMDB row above has the
+        // tmdb shape, both survive in this scenario.
+        Mock::given(method("GET"))
+            .and(path("/search/movie,show"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"[{"type":"movie","movie":{"title":"The Matrix","year":1999,
+                 "ids":{"imdb":"tt0133093"}}}]"#,
+            ))
+            .expect(1)
+            .mount(&trakt)
+            .await;
+        // TVDB v4 login then search (one row, dedup-distinct).
+        Mock::given(method("POST"))
+            .and(path("/v4/login"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"status":"success","data":{"token":"tok"}}"#),
+            )
+            .expect(1)
+            .mount(&tvdb)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v4/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"data":[
+                    {"tvdb_id":"271124","name":"Matrix",
+                     "type":"series","year":"1993","remote_ids":[]}
+                ]}"#,
+            ))
+            .expect(1)
+            .mount(&tvdb)
+            .await;
+
+        let db = Db::open_in_memory().await.unwrap();
+        seed_api_keys(&db).await;
+        let urls = SearchProviderUrls {
+            tmdb: tmdb.uri(),
+            trakt: trakt.uri(),
+            tvdb: tvdb.uri(),
+        };
+        let res = search_with_config(&db, "matrix", 1, "en-US", &search_test_config(), &urls)
+            .await
+            .unwrap();
+        assert!(res.direct.is_none());
+        assert_eq!(res.results.len(), 3);
+        // Order locked: TMDB first, Trakt second, TVDB third.
+        assert_eq!(res.results[0].id, "tmdb:603");
+        assert_eq!(res.results[1].id, "tt0133093");
+        assert_eq!(res.results[2].id, "tvdb:271124");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::similar_names)] // PRD-locked provider names (tmdb / tvdb).
+    async fn search_drops_duplicates_by_imdb_id_across_trakt_and_tvdb() {
+        let tmdb = MockServer::start().await;
+        let trakt = MockServer::start().await;
+        let tvdb = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/3/search/multi"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"results":[]}"#))
+            .expect(1)
+            .mount(&tmdb)
+            .await;
+        // Trakt yields tt0133093.
+        Mock::given(method("GET"))
+            .and(path("/search/movie,show"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"[{"type":"movie","movie":{"title":"Matrix Trakt","year":1999,
+                 "ids":{"imdb":"tt0133093"}}}]"#,
+            ))
+            .expect(1)
+            .mount(&trakt)
+            .await;
+        // TVDB also yields tt0133093 via remote_ids → IMDb-id form.
+        Mock::given(method("POST"))
+            .and(path("/v4/login"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"status":"success","data":{"token":"tok"}}"#),
+            )
+            .expect(1)
+            .mount(&tvdb)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v4/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"data":[
+                    {"tvdb_id":"169","name":"Matrix TVDB","type":"movie","year":"1999",
+                     "remote_ids":[{"id":"tt0133093","sourceName":"IMDB"}]}
+                ]}"#,
+            ))
+            .expect(1)
+            .mount(&tvdb)
+            .await;
+
+        let db = Db::open_in_memory().await.unwrap();
+        seed_api_keys(&db).await;
+        let urls = SearchProviderUrls {
+            tmdb: tmdb.uri(),
+            trakt: trakt.uri(),
+            tvdb: tvdb.uri(),
+        };
+        let res = search_with_config(&db, "matrix", 1, "en-US", &search_test_config(), &urls)
+            .await
+            .unwrap();
+        assert_eq!(res.results.len(), 1);
+        // Trakt came first in the merge, so the Trakt-shaped row survives.
+        assert_eq!(res.results[0].title, "Matrix Trakt");
+    }
+
+    #[tokio::test]
+    async fn search_persists_recent_search_when_results_present() {
+        let tmdb = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/3/search/multi"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"results":[{"id":1,"media_type":"movie","title":"Real",
+                 "release_date":"2020","vote_average":5.0}]}"#,
+            ))
+            .expect(1)
+            .mount(&tmdb)
+            .await;
+        let db = Db::open_in_memory().await.unwrap();
+        seed_api_keys(&db).await;
+        // Only TMDB configured here — the other two clients fail with
+        // wiremock-no-match, get caught by the per-provider try/log/empty
+        // fallback, and don't sabotage the test.
+        let urls = SearchProviderUrls {
+            tmdb: tmdb.uri(),
+            trakt: "http://127.0.0.1:1".into(),
+            tvdb: "http://127.0.0.1:1".into(),
+        };
+        let res = search_with_config(&db, "real", 1, "en-US", &search_test_config(), &urls)
+            .await
+            .unwrap();
+        assert_eq!(res.results.len(), 1);
+        let recent = db.recent_searches_list(10).await.unwrap();
+        assert_eq!(recent, vec!["real".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn search_does_not_persist_recent_search_when_zero_results() {
+        let tmdb = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/3/search/multi"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"results":[]}"#))
+            .expect(1)
+            .mount(&tmdb)
+            .await;
+        let db = Db::open_in_memory().await.unwrap();
+        seed_api_keys(&db).await;
+        let urls = SearchProviderUrls {
+            tmdb: tmdb.uri(),
+            trakt: "http://127.0.0.1:1".into(),
+            tvdb: "http://127.0.0.1:1".into(),
+        };
+        let res = search_with_config(&db, "zzz", 1, "en-US", &search_test_config(), &urls)
+            .await
+            .unwrap();
+        assert!(res.results.is_empty());
+        assert!(db.recent_searches_list(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_availability_filter_drops_unavailable_items_when_addons_present() {
+        let tmdb = MockServer::start().await;
+        let stream_server = MockServer::start().await;
+        // TMDB returns three results, all imdb-form via "tt..." TMDB ids
+        // would be unusual; instead use TMDB-shaped ids and rely on the
+        // stream addon dispatching by raw id.
+        Mock::given(method("GET"))
+            .and(path("/3/search/multi"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"results":[
+                    {"id":1,"media_type":"movie","title":"Avail","release_date":"2020"},
+                    {"id":2,"media_type":"movie","title":"Gone","release_date":"2021"},
+                    {"id":3,"media_type":"movie","title":"Empty","release_date":"2022"}
+                ]}"#,
+            ))
+            .expect(1)
+            .mount(&tmdb)
+            .await;
+        // Stream addon: tmdb:1 has streams, tmdb:2 returns 404, tmdb:3
+        // returns empty array.
+        Mock::given(method("GET"))
+            .and(path("/stream/movie/tmdb:1.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"{"streams":[{"url":"u"}]}"#),
+            )
+            .mount(&stream_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/stream/movie/tmdb:2.json"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&stream_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/stream/movie/tmdb:3.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"streams":[]}"#))
+            .mount(&stream_server)
+            .await;
+        let db = Db::open_in_memory().await.unwrap();
+        seed_api_keys(&db).await;
+        let manifest_url = format!("{}/manifest.json", stream_server.uri());
+        install_stream_addon(&db, "addon-a", &manifest_url, true).await;
+        let urls = SearchProviderUrls {
+            tmdb: tmdb.uri(),
+            trakt: "http://127.0.0.1:1".into(),
+            tvdb: "http://127.0.0.1:1".into(),
+        };
+        let res = search_with_config(&db, "avail", 1, "en-US", &search_test_config(), &urls)
+            .await
+            .unwrap();
+        let titles: Vec<&str> = res.results.iter().map(|s| s.title.as_str()).collect();
+        // Only "Avail" survives: "Gone" 404'd, "Empty" returned no streams.
+        assert_eq!(titles, vec!["Avail"]);
+    }
+
+    #[tokio::test]
+    async fn search_availability_filter_passes_through_when_no_addons_installed() {
+        let tmdb = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/3/search/multi"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"results":[
+                    {"id":1,"media_type":"movie","title":"One","release_date":"2020"}
+                ]}"#,
+            ))
+            .expect(1)
+            .mount(&tmdb)
+            .await;
+        let db = Db::open_in_memory().await.unwrap();
+        seed_api_keys(&db).await;
+        // No addons installed at all.
+        let urls = SearchProviderUrls {
+            tmdb: tmdb.uri(),
+            trakt: "http://127.0.0.1:1".into(),
+            tvdb: "http://127.0.0.1:1".into(),
+        };
+        let res = search_with_config(&db, "one", 1, "en-US", &search_test_config(), &urls)
+            .await
+            .unwrap();
+        assert_eq!(res.results.len(), 1);
+        assert_eq!(res.results[0].title, "One");
+    }
+
+    #[tokio::test]
+    async fn search_has_more_true_when_more_than_one_page_returned() {
+        use std::fmt::Write as _;
+        let tmdb = MockServer::start().await;
+        // Construct 25 results so dedup keeps 25 and only the first 20
+        // surface (has_more = true).
+        let mut results = String::new();
+        for i in 1..=25 {
+            if i > 1 {
+                results.push(',');
+            }
+            write!(
+                results,
+                r#"{{"id":{i},"media_type":"movie","title":"T{i}","release_date":"2020"}}"#
+            )
+            .unwrap();
+        }
+        let body = format!(r#"{{"results":[{results}]}}"#);
+        Mock::given(method("GET"))
+            .and(path("/3/search/multi"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .expect(1)
+            .mount(&tmdb)
+            .await;
+        let db = Db::open_in_memory().await.unwrap();
+        seed_api_keys(&db).await;
+        let urls = SearchProviderUrls {
+            tmdb: tmdb.uri(),
+            trakt: "http://127.0.0.1:1".into(),
+            tvdb: "http://127.0.0.1:1".into(),
+        };
+        let res = search_with_config(&db, "t", 1, "en-US", &search_test_config(), &urls)
+            .await
+            .unwrap();
+        assert_eq!(res.results.len(), kino_core::constants::SEARCH_PAGE_SIZE);
+        assert!(res.has_more);
+    }
+
+    #[tokio::test]
+    async fn recent_searches_commands_round_trip_through_db() {
+        let db = Db::open_in_memory().await.unwrap();
+        db.recent_searches_upsert("alpha", kino_core::constants::RECENT_SEARCHES_MAX)
+            .await
+            .unwrap();
+        let listed = db
+            .recent_searches_list(kino_core::constants::RECENT_SEARCHES_MAX)
+            .await
+            .unwrap();
+        assert_eq!(listed, vec!["alpha".to_string()]);
+        let removed = db.recent_searches_clear().await.unwrap();
+        assert_eq!(removed, 1);
+        assert!(db
+            .recent_searches_list(kino_core::constants::RECENT_SEARCHES_MAX)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }
