@@ -191,6 +191,71 @@ jobs:
             target/x86_64-unknown-linux-gnu/release/bundle/**/*
           if-no-files-found: warn
 
-  # build-android lands in the session that wires up the Tauri Android
-  # scaffold (NDK + targets + cargo tauri android init + signing). Tracked in
-  # STATE.md Feature Tracker under F-001 / F-018.
+  build-android:
+    name: build-android (cargo tauri android build --apk)
+    runs-on: ubuntu-24.04
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # PRD §F-018 Android build parameters: NDK 27.x. The android-actions
+      # setup pulls the platform-tools + cmdline-tools, and we install the
+      # exact platforms/build-tools/NDK pin separately so the version is
+      # explicit in this file rather than implicit in the action's defaults.
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "platforms;android-34 build-tools;34.0.0 ndk;27.0.12077973 platform-tools"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            src-tauri/gen/android/app/build
+            src-tauri/gen/android/.gradle
+          key: ${{ runner.os }}-cargo-build-android-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml', 'src-tauri/gen/android/**/*.gradle*') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-android-
+            ${{ runner.os }}-cargo-
+
+      - name: Install tauri-cli
+        run: cargo install tauri-cli --version "^2.0.0" --locked
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: cargo tauri android build (universal APK, signed with committed keystore)
+        env:
+          NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
+        run: cargo tauri android build --apk
+        working-directory: src-tauri
+
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: kino-android-universal-debug-build
+          path: |
+            src-tauri/gen/android/app/build/outputs/apk/universal/release/*.apk
+          if-no-files-found: warn

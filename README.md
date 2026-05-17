@@ -56,10 +56,15 @@ Prerequisites:
 - A stable Rust toolchain (the project pins one via `rust-toolchain.toml`)
 - Node.js 22+
 - `cargo-tauri` (`cargo install tauri-cli --version "^2.0.0" --locked`)
-- For Android (deferred to a later session): Java 17+, Android SDK + NDK
 - For Linux desktop: WebKit2GTK 4.1 and friends (`libwebkit2gtk-4.1-dev`,
   `libxdo-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev` on Ubuntu
-  24.04)
+  24.04). The AppImage bundle step additionally needs `libfuse2t64`,
+  `patchelf`, and `squashfs-tools`.
+- For Android: JDK 17+, Android command-line tools, `platforms;android-34`,
+  `build-tools;34.0.0`, `ndk;27.0.12077973`, the four Rust android targets
+  (`aarch64-linux-android armv7-linux-androideabi i686-linux-android
+  x86_64-linux-android`), and the `ANDROID_HOME` + `NDK_HOME` env vars
+  pointing at the SDK / NDK roots respectively.
 
 ```sh
 # Rust workspace (lint, test, build the crates)
@@ -78,7 +83,11 @@ cd ..
 
 # Full app
 cargo tauri build --target x86_64-unknown-linux-gnu   # Linux desktop
-cargo tauri android build                              # Android (later)
+cd src-tauri && cargo tauri android build --apk       # Android (universal,
+                                                       #   signed APK at
+                                                       #   src-tauri/gen/android/app/
+                                                       #   build/outputs/apk/
+                                                       #   universal/release/)
 ```
 
 Build artifacts produced by CI for tagged releases are listed in PRD §F-018.

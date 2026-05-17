@@ -21,8 +21,35 @@ yarn-error.log*
 
 # Tauri
 src-tauri/target/
-src-tauri/gen/
 src-tauri/WixTools/
+
+# Tauri generated mobile scaffolds: the project tree (Gradle + Kotlin shim) is
+# committed because CI's `build-android` job depends on it being there without
+# a regenerate step. Per-build outputs (Gradle caches, Tauri's per-invocation
+# config drop, generated Rust JNI bindings) are excluded individually below;
+# Tauri's own nested .gitignore files inside `src-tauri/gen/android/` cover
+# the same paths, but the root .gitignore mirrors them so a developer who has
+# not yet run `cargo tauri android init` doesn't accidentally stage them.
+src-tauri/gen/android/.gradle/
+src-tauri/gen/android/.tauri/
+src-tauri/gen/android/build/
+src-tauri/gen/android/local.properties
+src-tauri/gen/android/key.properties
+src-tauri/gen/android/keystore.properties
+src-tauri/gen/android/tauri.settings.gradle
+src-tauri/gen/android/app/build/
+src-tauri/gen/android/app/src/main/jniLibs/*/*.so
+src-tauri/gen/android/app/src/main/assets/tauri.conf.json
+src-tauri/gen/android/app/src/main/**/generated/
+src-tauri/gen/android/app/tauri.build.gradle.kts
+src-tauri/gen/android/app/tauri.properties
+src-tauri/gen/android/app/proguard-tauri.pro
+src-tauri/gen/android/buildSrc/.kotlin/
+src-tauri/gen/apple/
+# Tauri regenerates these capability/permission schemas every `cargo build`
+# from the installed plugin versions; committing them would force noise
+# diffs on every Tauri minor bump.
+src-tauri/gen/schemas/
 
 # Android
 android/app/build/

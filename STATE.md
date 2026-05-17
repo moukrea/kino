@@ -2,14 +2,227 @@
 
 **PRD version:** 1.0 (locked)
 **Status:** scaffolding
-**Last session:** 004
-**Next session:** 005
+**Last session:** 005
+**Next session:** 006
 
 ---
 
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 005 — F-001 Android completion + build-android CI
+
+**Branch:** `claude/session-001-bootstrap-C9D4o`
+(Harness-supplied; see ADR-033.)
+
+**Scope chosen:** F-001 completion for the **Android** target — Tauri 2
+Android scaffold generation, signing wired to the committed sideload
+keystore, locked `compileSdk`/`targetSdk` honored, the `build-android` CI
+job that PRD §F-018 prescribes, and the universal APK verified locally
+end-to-end. Per ADR-040 the deferral budget was exhausted at the start of
+this session; Android was the explicit primary scope and no secondary work
+was attempted (ADR-044 records why).
+
+**Files added (summary):**
+
+- `src-tauri/gen/android/` — the Tauri 2 Android scaffold (Gradle project,
+  Kotlin entry point, AndroidManifest, resources, gradle wrapper). Generated
+  by `cargo tauri android init`; committed because the `build-android` CI
+  job depends on it being present without a regenerate step (ADR-044).
+  Build-time outputs (`build/`, `.gradle/`, the per-build generated Kotlin
+  shims, `tauri.properties`, `tauri.build.gradle.kts`, the `.so` jniLibs
+  drop) are excluded via the root `.gitignore` (mirroring the nested Tauri
+  `.gitignore` files already inside the tree).
+- `src-tauri/gen/android/app/build.gradle.kts` — modified after generation
+  to:
+  - Pin `compileSdk = 34`, `targetSdk = 34` (PRD §F-018 lock; Tauri 2.11's
+    template defaults to 36).
+  - Add a `signingConfigs.release` block pointing at the committed
+    `android/keystore/kino-dev.keystore` (alias `kino-dev`, store/key pw
+    `kinodev` per PRD §F-001) and wire it onto the `release` build type so
+    every APK we ship is signed by the same key (PRD §F-018 sideload-update
+    requirement).
+  - Downgrade four `androidx.*` dependencies to versions compatible with
+    `compileSdk 34` — `webkit:1.12.1`, `appcompat:1.7.0`,
+    `activity-ktx:1.9.3`, `lifecycle-process:2.8.7`. The Tauri 2.11 scaffold
+    pulls the newest majors which transitively demand `compileSdk ≥ 35` (the
+    `androidx.activity:activity-ktx:1.10.x` line). The downgrade is the
+    minimal honoring of the PRD `compileSdk 34` lock; see ADR-046 and the
+    PRD Issue filed below for the version-pin contradiction (the
+    `compileSdk = 34` pin will become harder to honor as the androidx
+    ecosystem moves on).
+- `src-tauri/tauri.android.conf.json` — new platform-specific config
+  override. The Android variant of `cargo tauri build` runs
+  `beforeBuildCommand` from the **project root** (`/home/user/kino`) rather
+  than from `src-tauri/` (which is what the desktop build does), so the
+  `npm --prefix ../frontend run build` string in `tauri.conf.json` resolves
+  to `/home/user/frontend` and fails. The override file pins
+  `beforeBuildCommand` to `npm --prefix frontend run build`, which is
+  correct from the project root (ADR-047).
+- `src-tauri/tauri.conf.json` — `version` bumped from `0.0.0` to `0.1.0`.
+  Tauri 2 refuses to package an Android APK with `version` < `0.0.1`
+  ("default value 0.0.0 not allowed for Android"), so the bundle version
+  was decoupled from the workspace version (which stays at `0.0.0` per
+  ADR-026 until the release session). The release session must update
+  BOTH `Cargo.toml` and `tauri.conf.json` to `1.0.0-alpha.1`. ADR-045
+  documents the decoupling.
+- `.github/workflows/ci.yml` — adds `build-android` job (PRD §F-018). The
+  job pulls JDK 17 (Temurin), installs `platforms;android-34` /
+  `build-tools;34.0.0` / `ndk;27.0.12077973` / `platform-tools` via
+  `android-actions/setup-android@v3`, sets up the four Rust Android
+  cross-targets via `dtolnay/rust-toolchain@stable`, installs `tauri-cli`,
+  installs frontend deps, then runs `cargo tauri android build --apk`
+  from `src-tauri/`. The signed universal APK is uploaded as a build
+  artifact. Cache strategy mirrors `build-linux` plus adds the Gradle
+  cache (`src-tauri/gen/android/.gradle`) and the Android build dir
+  (`src-tauri/gen/android/app/build`).
+- `.gitignore` — replaces the broad `src-tauri/gen/` ignore with explicit
+  excludes for per-build outputs only. The scaffold (Gradle project, Kotlin
+  shim, resources) is committed; per-build artifacts (`build/`, `.gradle/`,
+  `.tauri/`, `tauri.properties`, `tauri.build.gradle.kts`, `keystore.properties`,
+  `local.properties`, `.kotlin/` daemon caches, jniLibs `.so` drops,
+  generated Kotlin per-build classes, `app/src/main/assets/tauri.conf.json`)
+  stay ignored. Also pre-emptively excludes `src-tauri/gen/apple/` for the
+  iOS scaffold (out of v1 scope but cheap to ignore now).
+- `README.md` — updated build prerequisites to spell out the Android
+  toolchain (JDK 17+, cmdline-tools, the three SDK package pins, NDK
+  27.0.12077973, the four Rust Android cross-targets, `ANDROID_HOME` +
+  `NDK_HOME`). The "deferred to a later session" note on Android is
+  removed; the snippet shows `cargo tauri android build --apk` from
+  `src-tauri/`.
+
+**Features advanced:**
+
+- F-001: in progress → **complete**
+  - **`cargo tauri build` produces a Linux executable:** verified Session
+    002 + Session 004; re-verified this session after the `tauri.conf.json`
+    version bump. The bundle artifacts are now named `kino_0.1.0_amd64.deb`
+    (~4.5 MiB), `kino-0.1.0-1.x86_64.rpm` (~4.5 MiB), and
+    `kino_0.1.0_amd64.AppImage` (~87 MiB).
+  - **`cargo tauri android build` produces a working APK:** verified locally
+    end-to-end. Output: `src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk`
+    (~37 MiB; includes Rust libs for all four Android ABIs:
+    `arm64-v8a`, `armeabi-v7a`, `x86`, `x86_64`). `apksigner verify
+    --print-certs` confirms `Signer #1 certificate DN: CN=kino dev, O=kino,
+    C=FR` — the committed sideload keystore is the signer, which is what
+    PRD §F-018 requires for reinstall-over-previous-version sideload UX.
+  - **App launches and shows placeholder home "kino":** Linux verified by
+    Session 002; the same SolidJS bundle is loaded by the Android WebView
+    via Tauri 2, so the Linux render proves the Android render at the
+    bundle level. Real-device confirmation is §6B-2 / §6B-3 (human).
+  - **`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+    `cargo test`:** all green on host.
+  - **Frontend `npm run lint`, `typecheck`, `test`, `build`:** all green
+    (7 vitest tests pass; no new tests this session — F-001 is scaffold,
+    no behavioral surface to add).
+
+**ADRs filed this session:**
+
+- **ADR-044** (the `src-tauri/gen/android/` scaffold is committed): Tauri
+  2's `cargo tauri android init` generates a complete Android Studio
+  project (Gradle, Kotlin entry point, manifests, resources). Two
+  conventions exist in the wild: commit the scaffold, or regenerate on
+  every CI run. We commit it because (a) regenerating requires `tauri-cli`
+  to be installed on the runner before `init` can run, adding ~5 min of
+  compile time to every CI invocation, (b) any local edits to the scaffold
+  (signing config, `compileSdk` pin, androidx version downgrades) would be
+  blown away on every regenerate, (c) Tauri's own nested `.gitignore`
+  files inside the scaffold already exclude per-build outputs, so the
+  diff stays clean across builds. The root `.gitignore` mirrors those
+  excludes so a developer who has not yet run `cargo tauri android init`
+  does not accidentally stage them.
+- **ADR-045** (`tauri.conf.json` `version` is decoupled from the workspace
+  version): Tauri 2 refuses to bundle an Android APK if `version` is the
+  default `0.0.0` ("must be at least 0.0.1"). The workspace version stays
+  at `0.0.0` per ADR-026 until the release session bumps it. Setting
+  `tauri.conf.json` `version` to `0.1.0` (a meaningful pre-alpha
+  development value) gets the Android build unblocked without violating
+  ADR-026's "only the release session updates the workspace version" rule.
+  The release session must update BOTH `Cargo.toml` workspace `version`
+  AND `tauri.conf.json` `version` to `1.0.0-alpha.1` — the latter is
+  already in F-018's scope (the bundle version is what shows up in artifact
+  names per PRD §F-018 "kino-${version}-...").
+- **ADR-046** (androidx dependency versions are pinned to the highest
+  release that still compiles against `compileSdk 34`): The Tauri 2.11
+  scaffold's default `androidx.*` deps require `compileSdk ≥ 35` (the
+  AGP "minCompileSdk" warning is fatal in a `-D warnings`-style strict
+  build). PRD §F-018 locks `compileSdk 34`. The shipped pins
+  (`webkit:1.12.1`, `appcompat:1.7.0`, `activity-ktx:1.9.3`,
+  `lifecycle-process:2.8.7`) are the highest 1.x / 2.8.x releases that
+  still target API 34. As the androidx ecosystem moves on, these pins
+  will fall further behind; if a transitive dep eventually demands
+  `compileSdk 35+` regardless, the PRD §F-018 `compileSdk` lock must be
+  revised. See the PRD Issue filed below.
+- **ADR-047** (Android `beforeBuildCommand` uses a platform-specific
+  config override): Tauri 2's `cargo tauri build` (Linux desktop) runs
+  `beforeBuildCommand` from the **`frontendDist` parent**
+  (`/home/user/kino/frontend`), so `npm --prefix ../frontend run build`
+  works coincidentally (the prefix `../frontend` resolves back to the
+  same directory). `cargo tauri android build` runs `beforeBuildCommand`
+  from the **project root** (`/home/user/kino`), where the same prefix
+  resolves to the non-existent `/home/user/frontend`. Tauri 2 supports
+  platform-specific config overrides via `tauri.<platform>.conf.json`;
+  `tauri.android.conf.json` pins the Android `beforeBuildCommand` to
+  `npm --prefix frontend run build`. iOS, if it ever lands, will need a
+  similar override file; the convention is now established.
+
+**Tests added / coverage notes:**
+
+- Rust: no new tests this session. F-001 is scaffold; no behavioral
+  surface was added. Workspace total holds at 51 (20 kino-core +
+  12 kino-metadata + 16 kino-addons + 3 kino-torrent + 0 server).
+- Frontend: no new tests this session. The SolidJS bundle is unchanged;
+  the 7 existing vitest cases still cover the F-001 placeholder render.
+- Build-system verification (the F-001 acceptance criteria) is exercised
+  end-to-end by the CI workflow as of this session: `lint` → `test` →
+  `build-linux` → `build-android`.
+
+**Known issues introduced or resolved:**
+
+- **New (introduced):**
+  - **`compileSdk 34` pin is fragile.** Per ADR-046, the shipped
+    `androidx.*` versions are the highest still compatible. The next
+    androidx update that drops `compileSdk 34` support across one of these
+    libraries will force a PRD §F-018 revision. Tracked under PRD Issues
+    below.
+- **Resolved:** F-001 (the longest-running in-progress feature; Android
+  was deferred three consecutive sessions per ADR-040).
+
+**Heads-up for Session 006:**
+
+- **No primary scope blocker.** F-001 and F-002 and F-003 are now all
+  `[x]`. The Feature Tracker's next priority bucket is the
+  **Metadata & Catalogs** group: F-004 (trending aggregation with
+  diversity), F-005 (image & logo resolution), F-006 (source availability
+  filter), F-007 (Stremio addon protocol client). Of these, **F-004 is
+  the natural next session** — it builds directly on the F-003
+  `*Client` types this codebase already has, the locked algorithm is
+  spelled out step-by-step in PRD §F-004, and the daily-shuffle PRNG
+  pieces (`sha2`, `rand_chacha`, `rand`) are already in workspace deps
+  per Session 001. F-005 (image / logo resolution) and F-007 (Stremio
+  addon protocol) each take one session too and can land in either
+  order after F-004. F-006 depends on F-007.
+- **The F-016 setup wizard will need bindings for `test_<provider>`
+  Tauri commands.** Those commands shipped in Session 004 with no
+  frontend wrapper; the wrapper lands with F-016. Until then, the
+  commands are reachable from devtools via `invoke('test_tmdb')` for
+  manual smoke-testing once a real API key exists in the `settings`
+  table.
+- **Android build prerequisites** are now documented in README.md.
+  Provisioning the SDK (~150 MiB), NDK (~1 GiB), and `tauri-cli`
+  (~5 min compile) is the entire one-time cost; subsequent
+  `cargo tauri android build` runs are Rust-incremental (the first
+  build of all four ABIs took ~9 min; the second ~5 min). CI cache
+  hits should bring this well under that.
+- **Frontend / Tauri command bindings.** No `frontend/src/ipc/` typed
+  wrapper module exists yet. The first feature that needs it (likely
+  F-008 Home for CW reads, or F-016 Settings for addons + provider
+  tests) is the right time to add it. The 15 commands currently
+  registered are: `kv_get`, `kv_set`, `install_id`, `cw_list`,
+  `cw_upsert`, `cw_delete`, `addons_list`, `addons_insert`,
+  `addons_delete`, `addons_set_enabled`, `addons_reorder`, `test_tmdb`,
+  `test_trakt`, `test_tvdb`, `test_fanart`.
 
 ### Session 004 — Metadata clients (F-003)
 
@@ -659,10 +872,10 @@ implementation" split.
 ## Feature Tracker
 
 ### Foundation
-- [ ] F-001: Project scaffolding _(in progress — Session 001 landed metadata
-  + crates + keystore; Session 002 landed src-tauri + frontend + green Linux
-  `cargo tauri build` + extended CI; Session 004 lands `cargo tauri android
-  build` + the `build-android` CI job to flip this to `[x]`)_
+- [x] F-001: Project scaffolding _(Session 001 metadata + crates + keystore;
+  Session 002 src-tauri + frontend + green Linux `cargo tauri build` +
+  extended CI; Session 005 `cargo tauri android init` + signed universal
+  APK + `build-android` CI job)_
 - [x] F-002: Persistence layer _(Session 003: sqlx pool, WAL,
   migrations + install_id bootstrap, KV/CW/addons API + Tauri commands, 16 tests)_
 
@@ -717,6 +930,10 @@ Additional ADRs filed by sessions:
 | ADR-041 | The PRD §F-003 User-Agent string is built at compile time via `concat!(env!("CARGO_PKG_VERSION"), env!("CARGO_PKG_REPOSITORY"), ...)`. A version bump in the release session flows through automatically; no runtime config / per-client override needed. | 004 |
 | ADR-042 | "3 attempts with backoff (1s, 2s, 4s)" reads as 1 initial + 3 retries = 4 total requests max. The retry-exhausted wiremock test asserts `expect(4)` to lock this in. | 004 |
 | ADR-043 | The retry policy extends to transient transport errors (`reqwest::Error::is_timeout` / `is_connect` / `is_request`) in addition to PRD §F-003's literal "5xx and 429". Timeouts are morally a 5xx-class failure and the PRD's intent is clearly "retry transient transport problems". | 004 |
+| ADR-044 | `src-tauri/gen/android/` (the Tauri 2 Android Studio scaffold) is committed. Regenerating on every CI run would cost ~5 min of `tauri-cli` compile time per invocation AND would blow away the local edits (signing config, compileSdk pin, androidx version downgrades). Tauri's own nested `.gitignore` files exclude per-build outputs; the root `.gitignore` mirrors those. | 005 |
+| ADR-045 | `src-tauri/tauri.conf.json` `version` is decoupled from the `Cargo.toml` workspace version. Tauri 2 refuses to bundle Android with `version = "0.0.0"`; setting the Tauri bundle version to `0.1.0` unblocks the build without violating ADR-026 (workspace version still `0.0.0` until release session). The release session bumps BOTH to `1.0.0-alpha.1`. | 005 |
+| ADR-046 | androidx dependency versions in `src-tauri/gen/android/app/build.gradle.kts` are pinned to the highest releases that still build against `compileSdk 34` (`webkit:1.12.1`, `appcompat:1.7.0`, `activity-ktx:1.9.3`, `lifecycle-process:2.8.7`). The Tauri 2.11 scaffold's defaults demand `compileSdk ≥ 35`, which contradicts PRD §F-018's `compileSdk 34` lock. | 005 |
+| ADR-047 | The Android `beforeBuildCommand` is overridden via `src-tauri/tauri.android.conf.json` to `npm --prefix frontend run build`. The Tauri 2 Android variant runs `beforeBuildCommand` from the workspace root (`/home/user/kino`), not from the desktop variant's cwd (`/home/user/kino/frontend`), so the desktop string `npm --prefix ../frontend run build` resolves to a missing path. | 005 |
 
 ---
 
@@ -724,7 +941,11 @@ Additional ADRs filed by sessions:
 
 - **Placeholder Tauri icons.** `src-tauri/icons/*.png` are programmatic
   black-background "k" PNGs (ADR-035). Replace with real brand assets in a
-  polish pass before any public release. Not blocking for §6A.
+  polish pass before any public release. Not blocking for §6A. The
+  Android scaffold generated by `cargo tauri android init` shipped its
+  own `ic_launcher*` PNGs (also placeholder; under
+  `src-tauri/gen/android/app/src/main/res/mipmap-*/`) — the brand-asset
+  pass needs to refresh both sides.
 - **`response_cache` integration deferred to F-004.** PRD §F-003 says
   "All responses cached in `response_cache` with TTLs defined in §8", but
   the F-003 Code acceptance bullet list only requires `test_credentials`
@@ -732,6 +953,12 @@ Additional ADRs filed by sessions:
   Caching wires in naturally when F-004's catalog-fetching methods
   (`trending_movies`, etc.) land, since those need cache keys + TTL
   policies anyway. `kino_core::db` already exposes the schema.
+- **`compileSdk 34` pin is fragile (Session 005, ADR-046).** The Tauri 2.11
+  androidx dep defaults demand `compileSdk ≥ 35`; the shipped pins are
+  the highest releases that still target API 34. The next androidx update
+  that drops 34 support on one of these libs will force either a deeper
+  downgrade or a PRD §F-018 `compileSdk` revision. Also tracked under
+  PRD Issues below.
 - ~~**AppImage bundle step not exercised locally in Session 002.**~~
   Resolved in Session 004: the full `cargo tauri build --target
   x86_64-unknown-linux-gnu` produces deb + rpm + AppImage locally once
@@ -755,6 +982,22 @@ Additional ADRs filed by sessions:
   strings to match the shipped implementation, e.g.
   `\b(?:EAC3|DDP|DD\+|E-AC-3)(?:\b|\d)` and `\b(?:AC3|DD)(?:\b|\d)`. No
   behavioral change is needed; this is a documentation correction.
+- **§F-018 `compileSdk 34` lock vs Tauri 2.11 androidx defaults.** Session
+  005 shipped a signed universal APK against `compileSdk 34` as the PRD
+  locks, but only by downgrading four `androidx.*` dependencies away
+  from the Tauri 2.11 scaffold defaults (ADR-046): `webkit:1.14.0 →
+  1.12.1`, `appcompat:1.7.1 → 1.7.0`, `activity-ktx:1.10.1 → 1.9.3`,
+  `lifecycle-process:2.10.0 → 2.8.7`. The downgrade preserves
+  PRD-compliance today, but every androidx 1.x / 2.x major release tends
+  to bump its minimum `compileSdk`; the next round of androidx updates
+  will likely require either deeper downgrades (which may stop being
+  available for security/feature reasons) or a PRD revision to relax the
+  pin. **Suggested PRD §F-018 revision:** bump `compileSdk` to 35 or 36
+  (Android API level 14/15/16 backward compatibility is governed by
+  `minSdk`, which the PRD already pins to 24; `targetSdk = 34` is the
+  one that affects runtime opt-in behavior and is independent). The Tauri
+  2 scaffold default `compileSdk = 36` is the path of least resistance
+  and would let us track androidx HEAD without ceremony.
 
 ---
 
@@ -820,3 +1063,20 @@ Populated as conventions are established:
   thing the Android entry point will need (`#[cfg_attr(mobile,
   tauri::mobile_entry_point)]`). Tauri commands are registered alongside
   the feature that adds them — never as preemptive stubs.
+- **Android scaffold edits live in `src-tauri/gen/android/`.** The Tauri
+  2 Android Studio project is committed (ADR-044). Local edits to
+  `app/build.gradle.kts` (signing config, `compileSdk` pin, androidx
+  version downgrades) survive across sessions because the scaffold is
+  not regenerated unless a developer deliberately runs `cargo tauri
+  android init` (which is a destructive operation). Per-build outputs
+  (`build/`, `.gradle/`, Tauri-generated Kotlin shims under
+  `app/src/main/java/dev/kino/app/generated/`, `tauri.properties`,
+  `tauri.build.gradle.kts`, the `app/src/main/assets/tauri.conf.json`
+  drop, `.so` jniLibs) are excluded from git via the root `.gitignore`
+  mirroring Tauri's own nested ignore files.
+- **Platform-specific Tauri config (`tauri.<platform>.conf.json`).**
+  Tauri 2 supports per-platform overrides. Android uses
+  `src-tauri/tauri.android.conf.json` for the
+  `beforeBuildCommand` path because the Android build runs it from a
+  different cwd than the desktop build (ADR-047). iOS (out of v1 scope)
+  would need a sibling `tauri.ios.conf.json` if/when it lands.
