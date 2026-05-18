@@ -36,6 +36,7 @@ import { Series } from "./routes/Series";
 import { Search, SEARCH_INPUT_TEST_ID } from "./routes/Search";
 import { Settings } from "./routes/Settings";
 import { TitleDetail } from "./routes/TitleDetail";
+import { Player } from "./routes/Player";
 
 const INPUT_OVERRIDE_VALUES: readonly InputProfileOverride[] = [
   "auto",
@@ -124,6 +125,7 @@ const App: Component = () => (
     <Route path="/search" component={Search} />
     <Route path="/settings" component={Settings} />
     <Route path="/title/:id" component={TitleDetail} />
+    <Route path="/player" component={Player} />
   </Router>
 );
 

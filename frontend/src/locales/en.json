@@ -200,5 +200,28 @@
     "eta": "Time left: {{eta}}",
     "ratePerSecond": "{{n}}/s",
     "etaUnknown": "unknown"
+  },
+  "player": {
+    "loading": "Loading…",
+    "preparing": "Preparing stream…",
+    "play": "Play",
+    "pause": "Pause",
+    "back": "Back",
+    "seekBackward": "Back 10s",
+    "seekForward": "Forward 10s",
+    "audioTrack": "Audio",
+    "subtitleTrack": "Subtitles",
+    "subtitleOff": "Off",
+    "trackUntitled": "Track {{id}}",
+    "trackForced": "(forced)",
+    "trackDefault": "(default)",
+    "info": "Info",
+    "infoHide": "Hide info",
+    "ended": "Playback ended.",
+    "error": "Playback error: {{message}}",
+    "errorGeneric": "Playback error.",
+    "noStream": "No stream selected.",
+    "ariaLabelControls": "Player controls",
+    "ariaLabelSeekBar": "Seek bar"
   }
 }

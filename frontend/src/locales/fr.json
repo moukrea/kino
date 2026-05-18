@@ -200,5 +200,28 @@
     "eta": "Temps restant : {{eta}}",
     "ratePerSecond": "{{n}}/s",
     "etaUnknown": "inconnu"
+  },
+  "player": {
+    "loading": "Chargement…",
+    "preparing": "Préparation du flux…",
+    "play": "Lire",
+    "pause": "Pause",
+    "back": "Retour",
+    "seekBackward": "Reculer 10s",
+    "seekForward": "Avancer 10s",
+    "audioTrack": "Audio",
+    "subtitleTrack": "Sous-titres",
+    "subtitleOff": "Désactivés",
+    "trackUntitled": "Piste {{id}}",
+    "trackForced": "(forcés)",
+    "trackDefault": "(par défaut)",
+    "info": "Infos",
+    "infoHide": "Masquer les infos",
+    "ended": "Lecture terminée.",
+    "error": "Erreur de lecture : {{message}}",
+    "errorGeneric": "Erreur de lecture.",
+    "noStream": "Aucun flux sélectionné.",
+    "ariaLabelControls": "Contrôles du lecteur",
+    "ariaLabelSeekBar": "Barre de progression"
   }
 }

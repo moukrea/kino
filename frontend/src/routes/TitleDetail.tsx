@@ -40,17 +40,20 @@ import { locale } from "../i18n";
 import { t } from "../i18n";
 import {
   cwRecordPosition,
-  cwUpsert,
   getStreams,
   getTitleDetail,
   hasTauri,
   resolveArtwork,
+  startPlayback,
   type Artwork,
   type Episode,
+  type PlaybackSource,
+  type PlayerCwContext,
   type StreamRow,
   type TitleDetail as TitleDetailData,
   type TitleKind,
 } from "../lib/tauri";
+import { setPlayerSession, type PlayerSessionState } from "../lib/playerSession";
 
 /**
  * Convert a 0..10 rating into a fixed-decimal label or `null` for the
@@ -264,44 +267,110 @@ export const TitleDetailRoute: Component = () => {
     });
   });
 
-  // ---- Play / Resume / Mark Watched action handlers ----
+  // ---- Play / Resume / Mark Watched / stream-pick handlers ----
 
-  const playOrResume = (resume: boolean) => {
+  /**
+   * Convert a Stremio stream row to the {@link PlaybackSource}
+   * discriminator [`startPlayback`] expects. Torrent rows are dispatched
+   * via the engine using a synthesized magnet (PRD §F-013); raw HTTP
+   * rows use the `directUrl` branch. Returns `null` when the row has
+   * neither an info hash nor a URL — those rows are unplayable.
+   */
+  const streamToSource = (stream: StreamRow): PlaybackSource | null => {
+    if (stream.info_hash) {
+      const magnet = `magnet:?xt=urn:btih:${stream.info_hash}`;
+      return {
+        kind: "magnet",
+        url: magnet,
+        fileIndex: stream.file_idx,
+      };
+    }
+    if (stream.url) {
+      return {
+        kind: "directUrl",
+        url: stream.url,
+        mime: null,
+        fileName: null,
+      };
+    }
+    return null;
+  };
+
+  /**
+   * Spin up the embedded torrent engine (or pass through the direct URL)
+   * for the selected stream, then navigate to `/player` with the session
+   * state. The Player route boots the F-015 driver from there.
+   */
+  const launchStream = async (stream: StreamRow): Promise<void> => {
     const data: TitleDetailData | null | undefined = detailResource();
-    if (!data) return;
-    // v1 limit: clicking Play / Resume opens the detail's stream list
-    // and does not yet pipe through to the player (F-015). Once F-013 /
-    // F-014 / F-015 land, this dispatches to the player; for now the
-    // user picks from the stream list rendered below.
-    //
-    // We still update the CW row on Resume click so the user gets a
-    // "I just touched this" hint on the home screen even before the
-    // player wires up; for Play (no prior CW) we leave the table alone.
-    if (
-      resume &&
-      hasTauri() &&
-      data.resume_position_s !== null &&
-      data.resume_duration_s !== null &&
-      data.stremio_id !== null
-    ) {
-      const season = data.resume_season ?? 0;
-      const episode = data.resume_episode ?? 0;
-      cwUpsert({
-        title_id: data.stremio_id,
+    if (!data || data.stremio_id === null) return;
+    if (!hasTauri()) return;
+    const source = streamToSource(stream);
+    if (!source) {
+      console.warn("stream has neither url nor info_hash; skipping");
+      return;
+    }
+    try {
+      const handle = await startPlayback(source);
+      const season = data.kind === "series" ? selectedSeason() : 0;
+      const episode = data.kind === "series" ? selectedEpisode() : 0;
+      const episodes: [number, number][] =
+        data.kind === "series"
+          ? data.episodes.map((ep) => [ep.season, ep.episode] as [number, number])
+          : [];
+      const meta = {
+        title: data.title,
+        year: data.year,
+        poster: data.poster,
+        rating: data.imdb_rating,
+      };
+      const cwContext: PlayerCwContext = {
+        titleId: data.stremio_id,
         kind: data.kind,
         season,
         episode,
-        position_s: data.resume_position_s,
-        duration_s: data.resume_duration_s,
-        last_played_at: Math.floor(Date.now() / 1000),
-        meta_json: {
-          title: data.title,
-          year: data.year,
-          poster: data.poster,
-          rating: data.imdb_rating,
-        },
-      }).catch((e) => console.warn("cw_upsert failed", e));
+        metaJson: meta,
+        episodes,
+      };
+      const resumePositionS =
+        data.resume_position_s !== null &&
+        data.resume_season === season &&
+        data.resume_episode === episode
+          ? data.resume_position_s
+          : 0;
+      const durationHintS =
+        data.runtime_minutes !== null ? data.runtime_minutes * 60 : null;
+      const sessionState: PlayerSessionState = {
+        token: handle.token,
+        url: handle.url,
+        resumePositionS,
+        fileName: handle.fileName,
+        durationHintS,
+        cwContext,
+        displayTitle: data.title,
+      };
+      setPlayerSession(sessionState);
+      navigate("/player");
+    } catch (e) {
+      console.warn("startPlayback failed", e);
     }
+  };
+
+  /**
+   * Play / Resume action-bar handler. Picks the first stream in the
+   * sort-locked list (PRD §F-010: `quality DESC, seeders DESC, size DESC`)
+   * and dispatches it via [`launchStream`]. When no streams are loaded
+   * yet the button is a no-op — the user can still pick from the list
+   * directly. Resume position is derived inside [`launchStream`] from
+   * the CW row regardless of which button the user pressed, so there's
+   * no per-button branch here.
+   */
+  const playOrResume = (): void => {
+    const streams = streamsResource();
+    if (!streams || streams.length === 0) {
+      return;
+    }
+    void launchStream(streams[0]!);
   };
 
   const markWatched = () => {
@@ -533,12 +602,7 @@ export const TitleDetailRoute: Component = () => {
                   class="flex flex-wrap gap-3"
                   data-testid="detail-action-bar"
                 >
-                  <Focusable
-                    id="detail-play"
-                    onActivate={() =>
-                      playOrResume(detail.resume_position_s !== null)
-                    }
-                  >
+                  <Focusable id="detail-play" onActivate={playOrResume}>
                     {({ ref, showRing, onClick }) => (
                       <button
                         ref={ref as (el: HTMLButtonElement) => void}
@@ -770,9 +834,7 @@ export const TitleDetailRoute: Component = () => {
                             {(s, idx) => (
                               <Focusable
                                 id={`detail-stream-${idx()}`}
-                                onActivate={() => {
-                                  /* F-015 will pipe to the player. */
-                                }}
+                                onActivate={() => void launchStream(s)}
                               >
                                 {({ ref, showRing, onClick }) => (
                                   <li
