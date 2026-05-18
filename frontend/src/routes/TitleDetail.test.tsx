@@ -42,6 +42,7 @@ vi.mock("../lib/tauri", async (importOriginal) => {
     getStreams: vi.fn(),
     resolveArtwork: vi.fn(),
     cwUpsert: vi.fn(async () => undefined),
+    cwRecordPosition: vi.fn(async (entry) => entry),
     cwList: vi.fn(async () => []),
     getTrendingPools: vi.fn(async () => ({
       top_trending: [],
@@ -489,12 +490,12 @@ describe("TitleDetailRoute (F-010)", () => {
     );
   });
 
-  it("clicking Mark Watched posts a CW row at duration position", async () => {
+  it("clicking Mark Watched posts a CW row at duration position via cw_record_position (F-012)", async () => {
     mockedGetTitleDetail.mockResolvedValue(
       detail({ runtime_minutes: 100, stremio_id: "tt0133093" }),
     );
-    const cwUpsertMock = vi.mocked(tauri.cwUpsert);
-    cwUpsertMock.mockClear();
+    const cwRecordMock = vi.mocked(tauri.cwRecordPosition);
+    cwRecordMock.mockClear();
     host = document.createElement("div");
     document.body.appendChild(host);
     dispose = mountDetail(host);
@@ -504,11 +505,61 @@ describe("TitleDetailRoute (F-010)", () => {
     );
     mark!.click();
     await flush();
-    expect(cwUpsertMock).toHaveBeenCalledTimes(1);
-    const arg = cwUpsertMock.mock.calls[0]![0];
-    expect(arg.title_id).toBe("tt0133093");
-    expect(arg.position_s).toBe(6000); // 100 min * 60 s
-    expect(arg.duration_s).toBe(6000);
+    // Mark Watched routes through the F-012 canonical writer so the
+    // locked completion + next-episode rules apply server-side.
+    expect(cwRecordMock).toHaveBeenCalledTimes(1);
+    const [entry, episodes] = cwRecordMock.mock.calls[0]!;
+    expect(entry.title_id).toBe("tt0133093");
+    expect(entry.position_s).toBe(6000); // 100 min * 60 s
+    expect(entry.duration_s).toBe(6000);
+    // Movie → empty episode list (next-episode rule does not apply).
+    expect(episodes).toEqual([]);
+  });
+
+  it("Mark Watched on a series passes the episode list so cw_record_position can advance to next (F-012)", async () => {
+    mockedGetTitleDetail.mockResolvedValue({
+      ...detail({ runtime_minutes: 60, stremio_id: "tt0944947" }),
+      kind: "series",
+      episodes: [
+        {
+          video_id: "tt0944947:1:1",
+          season: 1,
+          episode: 1,
+          title: "Episode 1",
+          air_date: null,
+          overview: null,
+          thumbnail: null,
+          progress: 0,
+        },
+        {
+          video_id: "tt0944947:1:2",
+          season: 1,
+          episode: 2,
+          title: "Episode 2",
+          air_date: null,
+          overview: null,
+          thumbnail: null,
+          progress: 0,
+        },
+      ],
+    });
+    const cwRecordMock = vi.mocked(tauri.cwRecordPosition);
+    cwRecordMock.mockClear();
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    dispose = mountDetail(host);
+    await flush();
+    const mark = host.querySelector<HTMLButtonElement>(
+      '[data-testid="detail-mark-watched-button"]',
+    );
+    mark!.click();
+    await flush();
+    expect(cwRecordMock).toHaveBeenCalledTimes(1);
+    const [, episodes] = cwRecordMock.mock.calls[0]!;
+    expect(episodes).toEqual([
+      [1, 1],
+      [1, 2],
+    ]);
   });
 });
 

@@ -44,6 +44,7 @@ import { locale } from "../i18n";
 import { t } from "../i18n";
 import {
   cwList,
+  cwRemoveTitle,
   getTrendingPools,
   getWeeklyTrending,
   hasTauri,
@@ -54,6 +55,7 @@ import {
   type TitleKind,
   type TrendingPools,
 } from "../lib/tauri";
+import { cwTileBadge } from "../lib/cw";
 
 /**
  * PRD §F-008 acceptance "Home composition (locked row order)" — the
@@ -124,18 +126,33 @@ export const HomeView: Component<HomeViewProps> = (props) => {
     );
   };
 
-  const [cwResource] = createResource<ContinueWatching[]>(async () => {
-    if (!hasTauri()) return [];
-    try {
-      const rows = await cwList();
-      return props.kind === null
-        ? rows
-        : rows.filter((r) => r.kind === props.kind);
-    } catch (e) {
-      console.warn("cw_list failed", e);
-      return [];
-    }
-  });
+  const [cwResource, { refetch: refetchCw }] =
+    createResource<ContinueWatching[]>(async () => {
+      if (!hasTauri()) return [];
+      try {
+        const rows = await cwList();
+        return props.kind === null
+          ? rows
+          : rows.filter((r) => r.kind === props.kind);
+      } catch (e) {
+        console.warn("cw_list failed", e);
+        return [];
+      }
+    });
+
+  /**
+   * PRD §F-012 manual remove. Wipes every CW row for `titleId`
+   * (Y / Menu / right-click / long-press) and refetches so the row
+   * disappears immediately — the PRD requires "immediate and persisted"
+   * behavior. Errors log + the user sees no change; the operation is
+   * idempotent so a stuck-on tile resolves on next refresh.
+   */
+  const removeCwTitle = (summary: TitleSummary) => {
+    if (!hasTauri()) return;
+    cwRemoveTitle(summary.id)
+      .then(() => refetchCw())
+      .catch((e) => console.warn("cw_remove_title failed", e));
+  };
 
   const [poolsResource] = createResource<
     TrendingPools,
@@ -208,9 +225,9 @@ export const HomeView: Component<HomeViewProps> = (props) => {
   );
 
   // CW summaries are rendered as Tiles so we coerce the cw rows into
-  // TitleSummary shape (the existing meta_json field can carry the
-  // poster / year / title when CW upsert happens — F-012's session
-  // owns that wire-up).
+  // TitleSummary shape (the existing meta_json field carries poster /
+  // year / title via the F-010 Resume / Mark-Watched writes and the
+  // future F-015 player position writes).
   const cwAsSummaries = (): TitleSummary[] => {
     const rows = cwResource() ?? [];
     return rows.map((r) => {
@@ -229,6 +246,23 @@ export const HomeView: Component<HomeViewProps> = (props) => {
         rating: typeof meta.rating === "number" ? meta.rating : null,
       };
     });
+  };
+
+  /**
+   * Look up the CW row backing a tile summary (by `title_id`) so the
+   * Tile badge ("Resume Sxx Eyy" / "Up next: Sxx Eyy") can be
+   * formatted from the live `(season, episode, position_s,
+   * duration_s)` state. Returns `null` for non-CW rows (defensive —
+   * the Home only wires this on the CW row, so the lookup never
+   * misses in practice).
+   */
+  const cwBadgeForSummary = (summary: TitleSummary): string | null => {
+    const rows = cwResource() ?? [];
+    const match = rows.find(
+      (r) => r.title_id === summary.id && r.kind === summary.kind,
+    );
+    if (!match) return null;
+    return cwTileBadge(match);
   };
 
   const [initialFocusClaimed, setInitialFocusClaimed] = createSignal(false);
@@ -279,6 +313,8 @@ export const HomeView: Component<HomeViewProps> = (props) => {
           focusIdPrefix="row-cw"
           items={cwAsSummaries()}
           onActivate={activateTile}
+          onContext={removeCwTitle}
+          itemBadge={(summary) => cwBadgeForSummary(summary)}
           testId="row-continue-watching"
         />
       </Show>

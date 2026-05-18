@@ -19,7 +19,11 @@
     "continueWatching": "Reprendre",
     "trendingNow": "Tendances",
     "hiddenGems": "Pépites cachées",
-    "trendingThisWeek": "Tendances de la semaine"
+    "trendingThisWeek": "Tendances de la semaine",
+    "cwResumeMovie": "Reprendre",
+    "cwResumeEpisode": "Reprendre S{{season}}E{{episode}}",
+    "cwUpNextEpisode": "À suivre : S{{season}}E{{episode}}",
+    "cwRemoveAction": "Retirer de Reprendre"
   },
   "detail": {
     "back": "Retour",

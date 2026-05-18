@@ -247,6 +247,24 @@ impl Db {
         Ok(res.rows_affected())
     }
 
+    /// Delete every Continue Watching row that belongs to `title_id`,
+    /// regardless of `(season, episode)`. Used by PRD §F-012 in two
+    /// places: the manual-remove action on the home CW row (which
+    /// targets the whole title, not a single episode), and the series
+    /// next-episode rule when the user finishes the final episode of a
+    /// series.
+    ///
+    /// Returns the number of rows removed (0 if the title had no CW
+    /// rows). The frontend always treats absent as a no-op, so an
+    /// already-empty title is not an error.
+    pub async fn cw_delete_all_for_title(&self, title_id: &str) -> Result<u64, DbError> {
+        let res = sqlx::query("DELETE FROM continue_watching WHERE title_id = ?")
+            .bind(title_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
     // ---- addons -------------------------------------------------------
 
     /// List installed addons ordered by `display_order`, then insertion order.
@@ -773,6 +791,47 @@ mod tests {
         db.cw_upsert(&ep).await.unwrap();
         let rows = db.cw_list().await.unwrap();
         assert_eq!(rows.len(), 2, "two distinct episodes must coexist");
+    }
+
+    #[tokio::test]
+    async fn cw_delete_all_for_title_wipes_every_episode() {
+        let db = Db::open_in_memory().await.unwrap();
+        let mut ep = ContinueWatching {
+            title_id: "tt_series".into(),
+            kind: TitleKind::Series,
+            season: 1,
+            episode: 1,
+            position_s: 5.0,
+            duration_s: 60.0,
+            last_played_at: 10,
+            meta_json: serde_json::json!({}),
+        };
+        db.cw_upsert(&ep).await.unwrap();
+        ep.season = 1;
+        ep.episode = 2;
+        db.cw_upsert(&ep).await.unwrap();
+        ep.season = 2;
+        ep.episode = 1;
+        db.cw_upsert(&ep).await.unwrap();
+        // Another series should NOT be touched.
+        let other = ContinueWatching {
+            title_id: "tt_other".into(),
+            ..ep.clone()
+        };
+        db.cw_upsert(&other).await.unwrap();
+        let removed = db.cw_delete_all_for_title("tt_series").await.unwrap();
+        assert_eq!(removed, 3);
+        let remaining: Vec<String> = db
+            .cw_list()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.title_id)
+            .collect();
+        assert_eq!(remaining, vec!["tt_other"]);
+        // Absent title is a 0-row no-op, not an error.
+        let again = db.cw_delete_all_for_title("tt_series").await.unwrap();
+        assert_eq!(again, 0);
     }
 
     #[tokio::test]
