@@ -1,9 +1,9 @@
 # kino — Agent State
 
 **PRD version:** 1.0 (locked)
-**Status:** v1.0.0-alpha.1 released
-**Last session:** 024 (release session — tag v1.0.0-alpha.1)
-**Next session:** none required — §6A complete pending green release CI; §6B is the human's checklist
+**Status:** v1.0.0-alpha.1 staged on main; release tag push BLOCKED by harness git proxy (see PRD Issues)
+**Last session:** 024 (release session — workspace version bump + STATE.md tag-push blocker note)
+**Next session:** none required from the agent — human pushes `v1.0.0-alpha.1` tag from a directly-authenticated machine or cuts the release via the GitHub UI (see PRD Issues entry "§F-018 release tag push blocked by harness Git proxy"). If a future session needs to add a `workflow_dispatch:` trigger to `release.yml`, that's the highest-priority scope.
 
 ---
 
@@ -172,6 +172,38 @@ Step 14 State C, items 6-10):**
 If release CI passed: no further action required from the agent
 (§6B is the human's checklist). If it failed: the next session
 addresses the failure as the highest-priority scope.
+
+**ACTUAL OUTCOME (post-merge, Session 024 follow-up):**
+
+After PR #25 merged at commit `495cba4`, `main` was synced locally
+and `git tag -a v1.0.0-alpha.1 -m "Release v1.0.0-alpha.1"` was
+created on that commit. The subsequent `git push origin
+v1.0.0-alpha.1` returned `HTTP 403` from the harness git proxy at
+`http://127.0.0.1:35557/git/moukrea/kino` with the body `ERR Unable
+to parse branch information from push data`. Multiple variants
+(explicit refspec, atomic push alongside a branch ref) all
+returned the same 403. The proxy is built for branch-based pushes
+only; tag pushes are structurally rejected. Direct
+`api.github.com` access is anonymous and rate-limit-exhausted,
+and the GitHub MCP tool set has no `create_release` / `create_tag`
+/ `create_ref` surface. The release workflow at
+`.github/workflows/release.yml` therefore cannot be auto-fired by
+the agent.
+
+Action taken: this session amended STATE.md to file a "PRD Issues"
+entry titled "§F-018 release tag push blocked by harness Git
+proxy" with workarounds for the human (direct git push from a
+developer machine, GitHub web-UI tag creation, or a
+`workflow_dispatch:` follow-up PR). The amended STATE.md was
+shipped via a small follow-up PR (#26) on the same harness branch
+since the agent must not push to `main` directly.
+
+`F-018` stays `[x]` because the release pipeline itself is
+code-complete; only the human-side trigger is outstanding. §6A
+condition 4 ("Tag v1.0.0-alpha.1 exists on main and has produced
+a GitHub Release with all 9 artifacts") is NOT yet satisfied,
+so Step 15 prints the "§6A not yet complete" branch and does
+NOT declare `PRD COMPLETE`.
 
 ### Session 023 — F-015 Android player plugin (PlayerActivity + ExoPlayer + Tauri 2 mobile plugin)
 
@@ -6257,6 +6289,59 @@ Additional ADRs filed by sessions:
   one that affects runtime opt-in behavior and is independent). The Tauri
   2 scaffold default `compileSdk = 36` is the path of least resistance
   and would let us track androidx HEAD without ceremony.
+- **§F-018 release tag push blocked by harness Git proxy (Session 024).**
+  After Session 024's merge to `main` (workspace version bumped to
+  `1.0.0-alpha.1`), `git tag -a v1.0.0-alpha.1` was created locally and
+  `git push origin v1.0.0-alpha.1` was attempted per AGENT_PROMPT
+  Step 14 State C item 6. The remote proxy at
+  `http://127.0.0.1:35557/git/moukrea/kino` rejected the push with
+  HTTP 403 and the body `ERR Unable to parse branch information from
+  push data`. The proxy was clearly designed for branch-based pushes
+  (the system prompt's "Git Operations" guidance only ever talks
+  about `git push -u origin <branch-name>`); tag refs aren't a
+  recognized push shape. Variants tried — `git push origin
+  refs/tags/v1.0.0-alpha.1:refs/tags/v1.0.0-alpha.1`,
+  `git push --atomic origin main refs/tags/...`,
+  `git push origin <branch> refs/tags/...` — all return the same 403.
+  Direct GitHub API access (`api.github.com`) is anonymous-rate-
+  limited (60/hr, exhausted) and the GitHub MCP tool set exposed to
+  the agent (`mcp__github__*`) has no `create_release` /
+  `create_tag` / `create_ref` surface — only `get_*` / `list_*` /
+  `create_pull_request` / `create_branch` / `create_or_update_file`
+  / `merge_pull_request` / etc. The release workflow at
+  `.github/workflows/release.yml` therefore cannot be auto-fired
+  by the agent in this environment. **Workarounds for the human:**
+  - (Recommended) push the tag from a developer machine that has
+    direct (non-proxied) write auth on the repo:
+    ```
+    git fetch origin
+    git tag -a v1.0.0-alpha.1 495cba4 -m "Release v1.0.0-alpha.1"
+    git push origin v1.0.0-alpha.1
+    ```
+    where `495cba4` is the squash-merge commit from PR #25 on
+    `main`. The release workflow will then fire and produce the
+    9 PRD-locked artifacts.
+  - (Alternative) cut the release via the GitHub web UI at
+    `https://github.com/moukrea/kino/releases/new`, picking
+    `main` as the target and `v1.0.0-alpha.1` as the new tag.
+    GitHub creates the tag and fires the `on: push: tags` trigger
+    in the same operation.
+  - (Future-proofing) a small follow-up PR could augment
+    `.github/workflows/release.yml` with a `workflow_dispatch:`
+    trigger (and a `version` input the workflow respects in place
+    of `github.ref_name`) so future releases can be cut from the
+    Actions UI without a tag push. PRD §F-018 wording (`Triggered
+    on tag matching v*`) would be additive, not contradicted.
+  **Impact on §6A:** condition 4 ("Tag v1.0.0-alpha.1 exists on
+  main and has produced a GitHub Release with all 9 artifacts")
+  is NOT satisfied until the tag push lands. The agent therefore
+  does NOT declare `PRD COMPLETE`; Step 15 prints the "§6A not
+  yet complete" branch instead. Once the human pushes the tag
+  and the workflow produces the 9 artifacts, no further agent
+  session is required — Step 15's compliance check will pass
+  whoever runs it next (human or agent). The F-018 Feature
+  Tracker entry stays `[x]` because the release pipeline itself
+  is code-complete; only the human-side trigger is outstanding.
 
 ---
 
