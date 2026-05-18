@@ -1,9 +1,9 @@
 # kino — Agent State
 
 **PRD version:** 1.0 (locked)
-**Status:** v1.0.0-alpha.1 release pipeline shipped, BUT a Session 027 §6A audit (human-requested, documentation-only) found that six features marked `[x]` have unmet PRD-locked code-acceptance criteria, and three §5 non-functional requirements (panic hook, frontend ErrorBoundary, advanced-logging toggle) are not implemented. `F-003`, `F-006`, `F-013`, `F-014`, `F-015`, `F-016` have been flipped back to `[ ]`. **§6A is no longer claimable.** The PRD North Star is not yet honored. Sessions 028+ must close the gaps listed under the new "§6A Code-Acceptance Regressions" section below before the next release pass. See ADR-118.
-**Last session:** 027 (§6A audit — documentation-only; re-opened F-003 / F-006 / F-013 / F-014 / F-015 / F-016; filed §6A Code-Acceptance Regressions section; ADR-118 locks the audit's interpretation of §6A condition 2)
-**Next session:** 028 — pick the highest-impact §6A regression from the list below. Recommended order: (1) F-006 frontend availability filter (entire UI surface missing), (2) §5 reliability bundle (panic hook + ErrorBoundary + advanced-logging toggle — small, all three together fit one session), (3) F-016 directory picker + license-text accessor, (4) F-003 ETag handling, (5) F-015 Android DV decoder selector, (6) F-013 / F-014 librqbit-blocked items (require either an upstream PR, a fork, or a human PRD revision — file as PRD Issue if blocked).
+**Status:** v1.0.0-alpha.1 release pipeline shipped, BUT Session 027's §6A audit found six features re-opened and three §5 non-functional reliability/logging items missing. **Session 028 closes the §5 reliability bundle** (Rust panic hook, frontend root `<ErrorBoundary>`, runtime-reloadable `tracing` filter wired to the new `display.advanced_logging` toggle). The six §6A feature regressions (F-003, F-006, F-013, F-014, F-015, F-016) remain open. **§6A is still not claimable.** See ADR-119 + ADR-120.
+**Last session:** 028 (§5 reliability bundle — Rust panic hook installed; SolidJS root `<ErrorBoundary>` wrapping `<Router>`; `tracing_subscriber::reload::Layer` + new `display.advanced_logging` setting flipping `info`↔`debug` at runtime via `settings_set`; ADR-119 + ADR-120)
+**Next session:** 029 — recommended order from the §6A Code-Acceptance Regressions section: (1) F-006 frontend availability filter (entire UI surface missing — single largest gap), (2) F-016 directory picker + license-text accessor (~55 LOC total), (3) F-003 ETag handling, (4) F-015 Android DV decoder selector (~60 LOC), (5) F-013 / F-014 librqbit-blocked items (need an upstream PR, a fork, or a human PRD revision — file under "PRD Issues" if blocked).
 
 ---
 
@@ -68,6 +68,186 @@ a hard requirement.
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 028 — §5 reliability bundle (panic hook + ErrorBoundary + advanced logging)
+
+**Branch:** `claude/session-001-bootstrap-cVpJE` (harness-supplied;
+see ADR-033 — the harness reuses a single branch name across all
+sessions for this checkout, the branch name does NOT track the session
+number).
+
+**Scope chosen:** the three §5 non-functional items the Session 027
+audit found missing — Rust panic hook, frontend root
+`<ErrorBoundary>`, and the runtime-reloadable `tracing` filter wired
+to a new `display.advanced_logging` toggle. Picked over the larger
+F-006 frontend availability surface (Session 027's recommended #1)
+because the §5 bundle clears **three** §6A regressions in one
+session at ~90 LOC total with three independent atomic changes —
+higher leverage per session and lower failure risk than the
+single-feature F-006 path. Session 027's "Next session" guidance
+called the bundle out as fitting one session; this session is the
+realization of that plan.
+
+**Implementation (one item per §6A regression entry):**
+
+1. **Rust panic hook** (`src-tauri/src/lib.rs::install_panic_hook`).
+   Called at the **very top** of `run()` so a panic during bootstrap
+   — before `tauri::Builder::default()` runs — is still captured via
+   the chained default hook (stderr + backtrace). Once
+   `install_subscriber()` lands inside `setup()`, the same hook ALSO
+   writes to the rolling daily log file. Hook captures
+   `std::backtrace::Backtrace::force_capture()`, decodes the panic
+   payload from `&'static str` / `String` / `Box<dyn Any>`, and
+   emits via `tracing::error!(location, payload, backtrace)` before
+   chaining to the original `take_hook()` return so the process
+   still exits with the standard unhandled-panic signature and exit
+   code. PRD §5: "Panic hook installed in Rust; panics logged with
+   backtrace before exit" — **satisfied**.
+
+2. **Reload-aware `tracing` filter + `display.advanced_logging`
+   setting.** The old single-shot `EnvFilter` boot at
+   `lib.rs:194-195` is replaced with
+   `tracing_subscriber::reload::Layer::new(EnvFilter::new("info"))`
+   so the filter handle survives subscriber init. A type-erased
+   applier closure (`commands::LogFilterApplier =
+   Box<dyn Fn(&str) -> Result<(), String> + Send + Sync>`) wraps the
+   reload handle and is stashed as managed Tauri state via
+   `commands::LogFilterHandle::new(...)`. The boot-time path reads
+   `display.advanced_logging` from the KV table immediately after
+   the db opens and applies the `debug` level when the setting is
+   `true`. The `settings_set` Tauri command grew a
+   `State<'_, LogFilterHandle>` extractor and, after a successful
+   write to the KV table for the `display.advanced_logging` key,
+   flips the live filter to `debug` or `info` to match the new
+   value — so the toggle takes effect WITHOUT a restart. The
+   `settings_reset_defaults` command also resets the filter to
+   `info` after wiping the KV row, because the on-disk state is
+   what reset means. New setting key
+   `crate::settings::DISPLAY_ADVANCED_LOGGING_KEY =
+   "display.advanced_logging"` is appended to `KNOWN_SETTINGS_KEYS`
+   so reset-to-defaults wipes it. New `DisplayView.advanced_logging:
+   bool` (default `false`) on both Rust and TS sides; new
+   `SETTING_KEYS.displayAdvancedLogging` constant in
+   `frontend/src/lib/tauri.ts`; new `Toggle` widget in
+   `DisplaySection` of `Settings.tsx` with the new `settings.display.
+   advancedLogging` i18n key in both `en.json` ("Advanced logging
+   (debug)") and `fr.json` ("Journalisation avancée (debug)"). PRD
+   §5 Logging: "INFO default, DEBUG when 'advanced logging' toggle
+   is on in settings" — **satisfied**.
+
+3. **Frontend root `<ErrorBoundary>`** (`frontend/src/App.tsx`).
+   Wraps the SolidJS `<Router>` in a SolidJS core `<ErrorBoundary>`
+   with a fallback that paints a centered alert surface (testid
+   `app-error-boundary`), shows the error message inside a `<pre>`
+   (testid `app-error-message`), exposes a "Try again" button
+   (testid `app-error-retry`) that calls the boundary's `reset()`,
+   and emits the error via `console.error` inside a `createEffect`
+   so re-throws after `reset()` re-log. PRD §5 Reliability:
+   "Frontend errors caught at root error boundary and logged" —
+   **satisfied**. (The Tauri webview's stderr is plumbed into the
+   `tracing` rolling-file appender installed in `setup()`, so the
+   `console.error` line lands in the same `kino.log.YYYY-MM-DD`
+   file the user can ship via Export Logs.)
+
+**Files changed:**
+
+- `src-tauri/src/lib.rs` — `install_panic_hook()` added and called
+  before the Tauri builder; `install_subscriber()` rewritten to use
+  `reload::Layer` and to publish a type-erased applier under
+  `LogFilterHandle`; `setup()` block reads `display.advanced_logging`
+  after db open and flips the filter to `debug` when on.
+- `src-tauri/src/commands.rs` — `LogFilterApplier` /
+  `LogFilterHandle` types added; `settings_set` extractor gained
+  `log_filter: State<'_, LogFilterHandle>` and applies the toggle
+  side-effect; `settings_reset_defaults` resets the live filter to
+  `info` after wiping the KV row.
+- `src-tauri/src/settings.rs` — `DISPLAY_ADVANCED_LOGGING_KEY`
+  added; appended to `KNOWN_SETTINGS_KEYS`; new
+  `DisplayView.advanced_logging` field (`#[allow(
+  clippy::struct_excessive_bools)]` mirroring the existing
+  `PlayerView` pattern); `load_view` reads the default `false`;
+  `validate_setting` accepts the key in the boolean-normalization
+  arm; two new unit tests
+  (`load_view_reads_persisted_advanced_logging` +
+  `validate_setting_normalizes_advanced_logging`).
+- `frontend/src/App.tsx` — `ErrorBoundary` import; new
+  `RootErrorFallback` component (exported for unit testing); App
+  wraps `<Router>` in `<ErrorBoundary fallback={...}>`.
+- `frontend/src/App.test.tsx` — new test "the root ErrorBoundary
+  catches render errors and renders the fallback (PRD §5
+  Reliability)" mounting an `<ErrorBoundary>` with the exported
+  fallback around a throwing component, asserting the fallback
+  paints + the error message is rendered + `console.error` was
+  called with the boom.
+- `frontend/src/lib/tauri.ts` — `DisplayView.advanced_logging`
+  field added; `SETTING_KEYS.displayAdvancedLogging` constant
+  added.
+- `frontend/src/routes/Settings.tsx` — `DEFAULT_VIEW.display`
+  gained `advanced_logging: false`; `DisplaySection` gained a new
+  `<Toggle id="settings-section-display-advancedlogging"
+  labelKey="settings.display.advancedLogging" ...>` after the
+  high-contrast toggle.
+- `frontend/src/routes/Settings.test.tsx` — `defaultView()` shape
+  updated with the new field; new test "persists the PRD §5
+  advanced-logging toggle via settingsSet" that clicks the new
+  toggle and asserts `mockedSet` is called with
+  `("display.advanced_logging", "true")`.
+- `frontend/src/locales/en.json` — `app.errorTitle` / `app.errorBody`
+  / `app.errorRetry` (ErrorBoundary fallback) +
+  `settings.display.advancedLogging`.
+- `frontend/src/locales/fr.json` — French translations for the same
+  four keys.
+
+**Features advanced:** No `F-XXX` toggles in this session — the §5
+items live as their own entries in the "§6A Code-Acceptance
+Regressions" section, not in the Feature Tracker. The three §6A
+Code-Acceptance Regressions entries
+("§5 Reliability / Rust panic hook", "§5 Reliability / Frontend
+root `<ErrorBoundary>`", "§5 Logging / Advanced logging toggle")
+are flipped to **RESOLVED** below.
+
+**ADRs filed:** ADR-119 (runtime-reloadable `tracing` filter via
+`reload::Layer` + type-erased applier closure stored under
+`LogFilterHandle`; side-effect lives on the Rust side via
+`settings_set`, no second IPC round-trip) and ADR-120 (panic hook
+installed at the **top** of `run()`, before the Tauri builder,
+rather than inside `setup()` — so bootstrap panics also chain
+through the captured default hook to stderr with a backtrace).
+
+**Tests added:**
+
+- Rust: 2 (`settings::tests::load_view_reads_persisted_advanced_logging`,
+  `settings::tests::validate_setting_normalizes_advanced_logging`)
+- TypeScript: 2 ("the root ErrorBoundary catches render errors and
+  renders the fallback (PRD §5 Reliability)",
+  "persists the PRD §5 advanced-logging toggle via settingsSet")
+- `Settings.test.tsx::defaultView()` fixture updated to include
+  the new `advanced_logging` field so every existing test that
+  passes a default view still type-checks.
+
+**Verification:**
+
+- `cargo fmt --check` ✓
+- `cargo clippy --workspace --all-targets -- -D warnings` ✓
+- `cargo test --workspace` ✓ (107 kino-app tests including the 2
+  new settings tests; 62 + 80 + 52 + 25 + 13 + 29 + 26 + others
+  in the rest of the workspace; total ~399 unit tests across all
+  crates pass)
+- `npm run typecheck` ✓
+- `npm run lint` ✓ (0 errors, 0 warnings)
+- `npm test -- --run` ✓ (217 tests across 20 files, including the
+  2 new ones)
+- `npm run build` ✓ (`tsc --noEmit && vite build` clean)
+- `cargo tauri build` / `cargo tauri android build` not run locally
+  per the Standing Authorizations (build matrix is CI's job; merge
+  gate is `lint` + `test` only).
+
+**Known follow-ups / future sessions:** F-006 (largest single §6A
+regression remaining), F-016 picker + license, F-003 ETag, F-015
+Android DV selector, F-013 + F-014 librqbit-blocked items. Order is
+documented in the top preamble's "Next session" guidance.
+
+---
 
 ### Session 027 — §6A audit re-opens F-003 / F-006 / F-013 / F-014 / F-015 / F-016
 
@@ -6648,6 +6828,8 @@ Additional ADRs filed by sessions:
 | ADR-116 | `release.yml` accepts a `workflow_dispatch:` trigger alongside the PRD §F-018 `on: push: tags: v*` trigger. The agent cannot push tag refs through the harness Git proxy (Session 024 PRD Issues entry — HTTP 403 `ERR Unable to parse branch information from push data`); rather than chase the harness fix (out of scope) or wait on a human-side tag push, the workflow gains a `version` string input and creates the tag at the run's commit via `gh release create --target ${{ github.sha }}` whenever `github.event_name == workflow_dispatch`. Both triggers feed the same `version` → `build-*` → `release` DAG; the only per-trigger code is the `extract` step's event-name branch and the `gh release create` `--target` flag. PRD §F-018 wording ("Triggered on tag matching v*") is preserved — the new trigger is additive, not a replacement. Rejected alternatives: keep the workflow tag-only and add a "create tag via PR" mechanism (commit a tagged ref to a `.tags/` directory + a workflow that consumes it — more moving parts, leaks tag state into the file tree); rewrite the harness proxy to accept tag refs (out of this repo's scope). | 025 |
 | ADR-117 | Kotlin does not expose inherited Java static fields through subclass references. `JSObject.NULL` does NOT resolve to `JSONObject.NULL` even though `JSObject extends JSONObject` and Java would inherit the static. Two acceptable fixes: (a) `import org.json.JSONObject` and reference `JSONObject.NULL` directly, or (b) omit the key entirely on null values and rely on the Rust contract's missing-field default. This codebase picks (b) for the player plugin because the Rust `tracks` types use `Option<T>` with serde's missing-field-defaults-to-None behaviour; an omitted JSON key is bit-for-bit equivalent to a JSON null for the wire contract. Future Kotlin code in the plugin module should not reach for `JSObject.NULL` — either import `JSONObject` explicitly or omit. Documents the cause of the §6B regression filed in Session 023 and fixed in Session 026. | 026 |
 | ADR-118 | **§6A condition 2 is interpreted strictly: an ADR that defers a PRD-locked code-acceptance criterion does NOT entitle the owning `F-XXX` to remain `[x]`.** PRD §6A.2 reads "Every code-acceptance criterion within each F-XXX is verifiably satisfied by code on `main`" — without an "or documented as deferred via ADR" escape clause. Prior sessions filed ADR-095 (directory picker as text input), ADR-103 (no `max_connections_per_torrent`), ADR-106 (no piece-priority window assignment), and ADR-108 (Linux mpv subprocess instead of in-window GL) framing each as "acceptable v1 polish gap"; the audit re-classifies all four as §6A regressions and flips their owning checkboxes (F-016, F-013, F-014, F-015) back to `[ ]`. Resolution options when an ADR-blocked criterion is genuinely unreachable inside the workspace's current dependency surface: (a) upstream PR + version bump, (b) fork the dependency, (c) swap the dependency, (d) file under "PRD Issues" with a concrete revision proposal so the human can amend the PRD. Picking (a)-(c) closes the regression; picking (d) only closes it once the human-edited PRD lands. This ADR does not retroactively invalidate any other ADR — ADRs 095 / 103 / 106 / 108 remain valid records of what shipped — but it does establish that "shipped behind an ADR" is NOT a substitute for the PRD-locked acceptance criterion at the §6A door. | 027 |
+| ADR-119 | **Runtime-reloadable `tracing` filter via `tracing_subscriber::reload::Layer` + type-erased applier closure stored under `commands::LogFilterHandle`.** PRD §5 Logging locks "INFO default, DEBUG when 'advanced logging' toggle is on in settings"; satisfying this without a process restart requires the filter layer to be mutable at runtime. `tracing_subscriber::reload::Layer::new(filter)` returns a `(layer, handle)` pair where `handle.modify(\|f\| *f = new_filter)` swaps the filter live. The handle's type carries the surrounding subscriber stack (`reload::Handle<L, S>`), which makes direct storage in Tauri-managed state cumbersome — `install_subscriber()` builds two different stacks depending on whether the rolling-file appender installs successfully. Solution: erase the type behind a `LogFilterApplier = Box<dyn Fn(&str) -> Result<(), String> + Send + Sync>` closure that captures the reload handle by move and accepts an `EnvFilter` directive string. Tauri-managed state stores the same applier type in both subscriber-stack branches, and the side-effect lives entirely on the Rust side: `settings_set` watches the `display.advanced_logging` key and flips the filter to `debug` / `info` after the KV write succeeds — no second IPC round-trip needed. Rejected alternatives: (a) a separate `set_log_level` Tauri command + frontend-driven dual-write, which doubles the IPC cost and risks the live filter drifting from persisted state on partial failure; (b) an `Arc<RwLock<EnvFilter>>` shared with a custom `Filter` impl, which would require re-implementing what `reload::Layer` already provides. Boot-time path reads `display.advanced_logging` from the KV table directly after `Db::open` and applies the persisted level once; `settings_reset_defaults` resets the live filter to `info` after wiping the KV row so the live process matches the just-reset on-disk state by construction. | 028 |
+| ADR-120 | **The Rust panic hook is installed at the top of `run()`, BEFORE `tauri::Builder::default()`, rather than inside the `setup()` closure that hosts `install_subscriber()`.** PRD §5 Reliability locks "Panic hook installed in Rust; panics logged with backtrace before exit". Installing inside `setup()` was the obvious place but loses any panic that happens during Tauri builder construction (window-init crashes, plugin-init failures). Installing at the top of `run()` means: (a) the chained default hook is always available, so even a panic with no tracing subscriber yet still prints to stderr with a backtrace; (b) once `install_subscriber()` runs inside `setup()`, the same hook also writes to the rolling daily log file the user can ship via Export Logs; (c) the hook captures `std::backtrace::Backtrace::force_capture()` regardless of `RUST_BACKTRACE` env so a §6B field crash always lands with a backtrace artifact. Payload decoding tries `&'static str` → `String` → `"Box<dyn Any>"` fallback so library panics with custom payload types still log something useful. | 028 |
 
 ---
 
@@ -6738,44 +6920,22 @@ Additional ADRs filed by sessions:
   need an Android emulator or instrumented test runner in CI. Not
   blocking for §6A; the §6B human-verification path covers
   rendering-correctness today.
-- **§5 Reliability — Rust panic hook not installed (Session 027
-  audit finding).** PRD §5 locks "Panic hook installed in Rust;
-  panics logged with backtrace before exit". No
-  `std::panic::set_hook` call exists anywhere in `src-tauri/src/`.
-  A panic exits silently with no log entry, which means §6B field-
-  test crashes leave the human without a backtrace. Implementation
-  hint: install the hook inside the same `setup()` closure that
-  ADR-090 already uses for `tracing` subscriber init (so a panic
-  during steady-state app code lands in the rolling file appender);
-  capture `backtrace::Backtrace::force_capture()` and emit it via
-  `tracing::error!` before the default hook re-panics. ~20 LOC.
-- **§5 Reliability — Frontend root `<ErrorBoundary>` missing
-  (Session 027 audit finding).** PRD §5 locks "Frontend errors
-  caught at root error boundary and logged". `App.tsx:81` has only
-  a single local `.catch()` on the boot-time `settingsGetAll()`
-  promise; any other unhandled error in a route or component
-  crashes the SolidJS tree without logging. Wrap the `<Router>`
-  in a SolidJS `<ErrorBoundary fallback={...} />` (the
-  `ErrorBoundary` ships in core Solid since 1.5); the `fallback`
-  receives `(err, reset)` and should both render a user-visible
-  retry surface AND emit the error through the existing
-  `console.error` (which the Tauri runtime relays to the
-  `tracing`-backed file appender via the webview's stderr channel).
-  ~30 LOC.
-- **§5 Logging — Advanced logging toggle not wired (Session 027
-  audit finding).** PRD §5 locks "DEBUG when 'advanced logging'
-  toggle is on in settings". `src-tauri/src/lib.rs:194-195`
-  initializes the subscriber with `EnvFilter::try_from_default_env()
-  .unwrap_or_else(|_| EnvFilter::new("info"))` — fixed at boot, no
-  reload, no setting wired in. The F-016 Settings → Display section
-  already has the dual-writer pattern (ADR-096) so the toggle could
-  follow that template; the trickier part is making `EnvFilter`
-  reloadable. Implementation hint: use
-  `tracing_subscriber::reload::Layer` for the filter layer and
-  expose a `set_log_level(level: &str)` Tauri command that flips
-  the handle when the toggle changes. Wire the boot-time read in
-  `setup()` so the toggle's persisted value applies at startup.
-  ~40 LOC.
+- ~~**§5 Reliability — Rust panic hook not installed (Session 027
+  audit finding).**~~ **RESOLVED in Session 028** — `install_panic_hook()`
+  is now installed at the top of `run()` (before the Tauri builder)
+  in `src-tauri/src/lib.rs`. See the §6A Code-Acceptance Regressions
+  entry for the resolution details.
+- ~~**§5 Reliability — Frontend root `<ErrorBoundary>` missing
+  (Session 027 audit finding).**~~ **RESOLVED in Session 028** —
+  `frontend/src/App.tsx` wraps `<Router>` in a SolidJS
+  `<ErrorBoundary>` with `RootErrorFallback`. See the §6A
+  Code-Acceptance Regressions entry.
+- ~~**§5 Logging — Advanced logging toggle not wired (Session 027
+  audit finding).**~~ **RESOLVED in Session 028** —
+  `tracing_subscriber::reload::Layer` published as
+  `commands::LogFilterHandle`; `settings_set` flips the live filter
+  on `display.advanced_logging` writes. See the §6A
+  Code-Acceptance Regressions entry.
 - **F-003 ETag handling unimplemented (Session 027 audit
   finding).** PRD §F-003 locks "ETag handled where the provider
   supports it; stored in `response_cache.etag`". The schema column
@@ -7170,55 +7330,70 @@ LICENSE file is also packaged into the AppImage / APK (Tauri's
 bundler already includes the file when present at repo root,
 since it's a sibling of `Cargo.toml`). ~25 LOC.
 
-### §5 Reliability / Rust panic hook
+### ~~§5 Reliability / Rust panic hook~~ — RESOLVED in Session 028
 
 **PRD §5 Reliability (locked):** "Panic hook installed in Rust;
 panics logged with backtrace before exit."
 
-**Actual:** no `std::panic::set_hook` call anywhere in
-`src-tauri/src/` (verified by grep).
+**Resolution (Session 028):** `install_panic_hook()` added in
+`src-tauri/src/lib.rs` and called at the **top** of `run()`
+before the Tauri builder. The hook takes the original default
+hook via `std::panic::take_hook()`, then in its replacement
+captures `std::backtrace::Backtrace::force_capture()`, decodes
+the panic payload from `&'static str` / `String` /
+`Box<dyn Any>`, emits via `tracing::error!(location, payload,
+backtrace)`, and chains to the captured default hook so the
+process still exits with the standard unhandled-panic signature
+and exit code. Installation BEFORE the Tauri builder means
+bootstrap panics still print to stderr with a backtrace even
+though no tracing subscriber is live yet; after
+`install_subscriber()` lands, the same hook also writes to the
+rolling log file the user can ship via Export Logs.
 
-**Closure plan:** install the hook inside the same `setup()`
-closure that ADR-090 already uses for `tracing` subscriber init.
-Capture `std::backtrace::Backtrace::force_capture()` (or the
-`backtrace` crate's equivalent), emit it via `tracing::error!`,
-then chain through to the default hook so the process still
-exits non-zero. ~20 LOC.
-
-### §5 Reliability / Frontend root `<ErrorBoundary>`
+### ~~§5 Reliability / Frontend root `<ErrorBoundary>`~~ — RESOLVED in Session 028
 
 **PRD §5 Reliability (locked):** "Frontend errors caught at root
 error boundary and logged."
 
-**Actual:** `frontend/src/App.tsx:81` has only one local `.catch()`
-on the boot-time `settingsGetAll()` promise. No
-`<ErrorBoundary>` wraps the `<Router>`.
+**Resolution (Session 028):** `frontend/src/App.tsx` wraps the
+SolidJS `<Router>` in `<ErrorBoundary fallback={(err, reset) =>
+<RootErrorFallback error={err} reset={reset} />}>`. The fallback
+renders a centered alert surface (testid `app-error-boundary`),
+a `<pre>` containing the decoded error message (testid
+`app-error-message`), and a "Try again" button (testid
+`app-error-retry`) that calls the boundary's `reset()`. It logs
+via `console.error` inside a `createEffect` so re-throws after
+`reset()` re-fire the log path; the Tauri webview's stderr is
+plumbed into the `tracing` rolling-file appender so the line
+lands in the same `kino.log.YYYY-MM-DD` file the user can ship.
+Two new i18n keys per locale (`app.errorTitle`, `app.errorBody`,
+`app.errorRetry`) for the fallback UI.
 
-**Closure plan:** wrap the top-level `<Router>` in a SolidJS
-`<ErrorBoundary fallback={(err, reset) => …} />`. The fallback
-renders a user-visible retry surface AND emits the error via
-`console.error` (which the Tauri runtime relays into the
-`tracing`-backed log file via the webview's stderr channel).
-~30 LOC.
-
-### §5 Logging / Advanced logging toggle
+### ~~§5 Logging / Advanced logging toggle~~ — RESOLVED in Session 028
 
 **PRD §5 Logging (locked):** "Levels: INFO default, DEBUG when
 'advanced logging' toggle is on in settings".
 
-**Actual:** `src-tauri/src/lib.rs:194-195` initializes the
-subscriber with
-`EnvFilter::try_from_default_env().unwrap_or_else(|_|
-EnvFilter::new("info"))` — fixed at boot, no reload mechanism,
-no setting read.
-
-**Closure plan:** use `tracing_subscriber::reload::Layer` for
-the filter layer and expose a `set_log_level(level: &str)`
-Tauri command that flips the handle when the toggle changes.
-Boot-time: read the `display.advanced_logging` setting (new) in
-`setup()` and seed the filter accordingly. Frontend: add the
-toggle to Settings → Display (or a new "Advanced" section per
-the dual-writer pattern in ADR-096). ~40 LOC.
+**Resolution (Session 028):** `install_subscriber()` rewritten
+to wrap `EnvFilter` in `tracing_subscriber::reload::Layer`; a
+type-erased `LogFilterApplier = Box<dyn Fn(&str) ->
+Result<(), String> + Send + Sync>` closure stores the reload
+handle behind a stable type and is published as managed Tauri
+state via `commands::LogFilterHandle::new(...)`. Boot-time path
+reads `display.advanced_logging` from the KV table after `Db::
+open` and applies `debug` when the setting is `true`. The
+`settings_set` Tauri command grew a `State<'_, LogFilterHandle>`
+extractor and, on the `display.advanced_logging` key, flips the
+filter to `debug` or `info` so the toggle takes effect without
+a restart. `settings_reset_defaults` resets the filter to
+`info` after wiping the KV row, matching the persisted state.
+New `DISPLAY_ADVANCED_LOGGING_KEY` in `KNOWN_SETTINGS_KEYS`;
+new `DisplayView.advanced_logging: bool` (default `false`) in
+both Rust and TS; new `Toggle` widget in `DisplaySection` of
+`Settings.tsx` keyed off `settings.display.advancedLogging`
+i18n in both locales. Side-effect lives entirely on the Rust
+side so no second IPC round-trip is needed and the live process
+matches the persisted state by construction.
 
 ---
 

@@ -109,6 +109,7 @@ function defaultView(): SettingsView {
       nsfw: false,
       input_override: "auto",
       high_contrast: false,
+      advanced_logging: false,
     },
   };
 }
@@ -543,6 +544,31 @@ describe("Settings route (F-016)", () => {
       .click();
     await flushAsync();
     expect(mockedSet).toHaveBeenCalledWith("display.nsfw", "true");
+  });
+
+  it("persists the PRD §5 advanced-logging toggle via settingsSet", async () => {
+    // PRD §5 Logging: "DEBUG when 'advanced logging' toggle is on in
+    // settings". The host watches the same key in `settings_set` and
+    // flips the live `tracing` `EnvFilter`; the toggle itself is a
+    // plain display-section bool from the frontend's point of view.
+    const { host, dispose } = mount();
+    activeHost = host;
+    activeDispose = dispose;
+    await flushAsync();
+    await waitFor(
+      () =>
+        !!host.querySelector(
+          '[data-testid="settings-section-display-advancedlogging"]',
+        ),
+    );
+
+    host
+      .querySelector<HTMLButtonElement>(
+        '[data-testid="settings-section-display-advancedlogging"]',
+      )!
+      .click();
+    await flushAsync();
+    expect(mockedSet).toHaveBeenCalledWith("display.advanced_logging", "true");
   });
 
   it("propagates the tile-size dropdown change", async () => {

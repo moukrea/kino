@@ -109,6 +109,12 @@ pub const DISPLAY_INPUT_OVERRIDE_KEY: &str = "display.input_override";
 /// PRD §F-016 §7 high-contrast theme toggle. Default `false`.
 pub const DISPLAY_HIGH_CONTRAST_KEY: &str = "display.high_contrast";
 
+/// PRD §5 Logging "advanced logging" toggle. When `true`, the live
+/// `tracing` `EnvFilter` is reloaded to `debug`; when `false` (default),
+/// it is reset to `info`. Surfaced in PRD §F-016 §7 Display alongside the
+/// other display-level reliability toggles.
+pub const DISPLAY_ADVANCED_LOGGING_KEY: &str = "display.advanced_logging";
+
 /// Every PRD §F-016-defined KV key, used by `settings_reset_defaults` to
 /// wipe only user-settable values. System-internal entries (`install_id`,
 /// `addons.bootstrap_done`) are deliberately NOT listed.
@@ -141,6 +147,7 @@ pub const KNOWN_SETTINGS_KEYS: &[&str] = &[
     DISPLAY_NSFW_KEY,
     DISPLAY_INPUT_OVERRIDE_KEY,
     DISPLAY_HIGH_CONTRAST_KEY,
+    DISPLAY_ADVANCED_LOGGING_KEY,
 ];
 
 /// Cache size lower bound shared by both platforms (PRD §F-016 §4).
@@ -223,6 +230,10 @@ pub struct PlayerView {
     pub tunneling: bool,
 }
 
+// PRD §F-016 §7 Display + PRD §5 Logging together pack four independent
+// boolean toggles into this view; a state-machine refactor would change
+// the shape of every Tauri call from `settings_get_all` for no benefit.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DisplayView {
     pub tile_size: String,
@@ -230,6 +241,9 @@ pub struct DisplayView {
     pub nsfw: bool,
     pub input_override: String,
     pub high_contrast: bool,
+    /// PRD §5 Logging — when `true`, the runtime tracing filter is
+    /// switched to `debug`. Default `false`.
+    pub advanced_logging: bool,
 }
 
 // ---- platform-aware defaults ------------------------------------------------
@@ -374,6 +388,7 @@ pub async fn load_view(
         nsfw: read_bool(db, DISPLAY_NSFW_KEY, false).await?,
         input_override: read_string_or(db, DISPLAY_INPUT_OVERRIDE_KEY, "auto").await?,
         high_contrast: read_bool(db, DISPLAY_HIGH_CONTRAST_KEY, false).await?,
+        advanced_logging: read_bool(db, DISPLAY_ADVANCED_LOGGING_KEY, false).await?,
     };
     Ok(SettingsView {
         api_keys,
@@ -455,7 +470,8 @@ pub fn validate_setting(key: &str, value: &str, platform: HostPlatform) -> Resul
         | PLAYER_TUNNELING_KEY
         | DISPLAY_FOCUS_ANIMATION_KEY
         | DISPLAY_NSFW_KEY
-        | DISPLAY_HIGH_CONTRAST_KEY => {
+        | DISPLAY_HIGH_CONTRAST_KEY
+        | DISPLAY_ADVANCED_LOGGING_KEY => {
             // Boolean settings — coerce to canonical string form.
             match value {
                 "true" | "1" => Ok("true".to_string()),
@@ -504,7 +520,35 @@ mod tests {
         assert!(!view.display.nsfw);
         assert_eq!(view.display.input_override, "auto");
         assert!(!view.display.high_contrast);
+        assert!(!view.display.advanced_logging);
         assert!(view.language.metadata_fallback.is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_view_reads_persisted_advanced_logging() {
+        let db = Db::open_in_memory().await.unwrap();
+        db.kv_set(DISPLAY_ADVANCED_LOGGING_KEY, "true")
+            .await
+            .unwrap();
+        let view = load_view(&db, HostPlatform::Linux, "/tmp/kino")
+            .await
+            .unwrap();
+        assert!(view.display.advanced_logging);
+    }
+
+    #[test]
+    fn validate_setting_normalizes_advanced_logging() {
+        assert_eq!(
+            validate_setting(DISPLAY_ADVANCED_LOGGING_KEY, "1", HostPlatform::Linux).unwrap(),
+            "true"
+        );
+        assert_eq!(
+            validate_setting(DISPLAY_ADVANCED_LOGGING_KEY, "false", HostPlatform::Linux).unwrap(),
+            "false"
+        );
+        assert!(
+            validate_setting(DISPLAY_ADVANCED_LOGGING_KEY, "yep", HostPlatform::Linux).is_err()
+        );
     }
 
     #[tokio::test]

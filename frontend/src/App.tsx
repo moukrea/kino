@@ -15,6 +15,9 @@
 // fall back to empty data so the UI still renders.
 
 import {
+  createEffect,
+  createMemo,
+  ErrorBoundary,
   onCleanup,
   onMount,
   type Component,
@@ -23,7 +26,7 @@ import {
 import { Router, Route, useNavigate, useLocation } from "@solidjs/router";
 
 import { NavRail } from "./components/NavRail";
-import { setLocale, type SupportedLocale, SUPPORTED_LOCALES } from "./i18n";
+import { setLocale, t, type SupportedLocale, SUPPORTED_LOCALES } from "./i18n";
 import { installInputSubsystem, onAction } from "./input";
 import {
   setOverride as setInputOverride,
@@ -117,16 +120,83 @@ const Shell: Component<{ children?: JSX.Element }> = (props) => {
   );
 };
 
+/**
+ * Root-level fallback rendered by [`App`]'s top-level
+ * [`ErrorBoundary`]. PRD §5 Reliability locks "Frontend errors caught at
+ * root error boundary and logged"; the boundary catches anything that
+ * escapes the router (route loaders, render errors, signal handlers
+ * during render) and the fallback surfaces a retry surface so the user
+ * isn't stuck on a blank screen. The error itself is logged via
+ * `console.error` which the Tauri webview relays into the
+ * `tracing`-backed file appender installed by the host.
+ *
+ * Exported for unit testing — production code only mounts this through
+ * the [`App`]-level boundary.
+ */
+export const RootErrorFallback: Component<{
+  error: unknown;
+  reset: () => void;
+}> = (props) => {
+  const message = createMemo(() => {
+    const e = props.error as { message?: unknown } | null;
+    if (e && typeof e.message === "string") return e.message;
+    try {
+      return String(props.error);
+    } catch {
+      return "unknown error";
+    }
+  });
+  // Log on every error change so a re-throw after reset is captured too.
+  // PRD §5: "Frontend errors caught at root error boundary and logged".
+  // The Tauri webview relays `console.error` into the host's tracing
+  // file appender via stderr.
+  createEffect(() => {
+    console.error("kino: root error boundary caught", props.error);
+  });
+  return (
+    <div
+      class="flex h-screen w-screen flex-col items-center justify-center gap-4 bg-neutral-950 p-8 text-neutral-50"
+      data-testid="app-error-boundary"
+      role="alert"
+    >
+      <h1 class="text-2xl font-bold">{t("app.errorTitle")}</h1>
+      <p class="max-w-xl text-center text-neutral-300">
+        {t("app.errorBody")}
+      </p>
+      <pre
+        class="max-w-2xl overflow-auto rounded bg-neutral-900 p-4 text-left text-xs text-neutral-400"
+        data-testid="app-error-message"
+      >
+        {message()}
+      </pre>
+      <button
+        type="button"
+        class="rounded bg-neutral-200 px-4 py-2 text-sm font-medium text-neutral-900 hover:bg-neutral-50"
+        data-testid="app-error-retry"
+        onClick={() => props.reset()}
+      >
+        {t("app.errorRetry")}
+      </button>
+    </div>
+  );
+};
+
 const App: Component = () => (
-  <Router root={Shell}>
-    <Route path="/" component={Home} />
-    <Route path="/movies" component={Movies} />
-    <Route path="/series" component={Series} />
-    <Route path="/search" component={Search} />
-    <Route path="/settings" component={Settings} />
-    <Route path="/title/:id" component={TitleDetail} />
-    <Route path="/player" component={Player} />
-  </Router>
+  <ErrorBoundary
+    fallback={(err, reset) => (
+      <RootErrorFallback error={err} reset={reset} />
+    )}
+  >
+    <Router root={Shell}>
+      <Route path="/" component={Home} />
+      <Route path="/movies" component={Movies} />
+      <Route path="/series" component={Series} />
+      <Route path="/search" component={Search} />
+      <Route path="/settings" component={Settings} />
+      <Route path="/title/:id" component={TitleDetail} />
+      <Route path="/player" component={Player} />
+    </Router>
+  </ErrorBoundary>
 );
 
 export default App;

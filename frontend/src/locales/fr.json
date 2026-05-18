@@ -2,7 +2,10 @@
   "app": {
     "name": "kino",
     "placeholderHome": "kino",
-    "placeholderTagline": "Le streaming, à votre façon."
+    "placeholderTagline": "Le streaming, à votre façon.",
+    "errorTitle": "Une erreur est survenue",
+    "errorBody": "kino a rencontré une erreur inattendue. Les détails ci-dessous ont été enregistrés. Vous pouvez réessayer, ou redémarrer l’application si le problème persiste.",
+    "errorRetry": "Réessayer"
   },
   "nav": {
     "label": "Navigation principale",
@@ -166,7 +169,8 @@
       "inputTouch": "Tactile",
       "inputDpad": "Pavé directionnel",
       "inputKbm": "Clavier et souris",
-      "highContrast": "Thème contraste élevé"
+      "highContrast": "Thème contraste élevé",
+      "advancedLogging": "Journalisation avancée (debug)"
     },
     "about": {
       "version": "Version",

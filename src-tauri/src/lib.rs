@@ -22,13 +22,48 @@ use kino_core::Db;
 use tauri::Manager;
 use tracing_appender::non_blocking::WorkerGuard;
 
-use commands::{PlayerRuntime, TorrentRuntime};
+use commands::{LogFilterHandle, PlayerRuntime, TorrentRuntime};
 
 /// Holder for the rolling-file-appender worker guard. The guard must outlive
 /// the process so the appender thread flushes buffered log lines on exit;
 /// stashing it in Tauri's managed state is the idiomatic pattern.
 #[allow(dead_code)] // held purely for its Drop side effect
 struct LogGuard(WorkerGuard);
+
+/// PRD §5 Reliability: install a global panic hook that records the panic
+/// message and a captured backtrace via `tracing::error!` before chaining
+/// to the default hook (so the process still exits with the standard panic
+/// signature and unhandled-panic exit code).
+///
+/// Installed at the very top of [`run`] — before the Tauri builder and
+/// before [`install_subscriber`] runs — so that bootstrap panics still
+/// chain through the default hook (printing to stderr with a backtrace).
+/// Once the subscriber is live the same hook ALSO writes to the rolling
+/// log file, giving §6B field-test crashes a backtrace artifact.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let location = info.location().map_or_else(
+            || "<unknown>".to_string(),
+            |l| format!("{}:{}:{}", l.file(), l.line(), l.column()),
+        );
+        let payload = if let Some(s) = info.payload().downcast_ref::<&'static str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "Box<dyn Any>".to_string()
+        };
+        tracing::error!(
+            location = %location,
+            payload = %payload,
+            backtrace = %backtrace,
+            "kino panic"
+        );
+        default_hook(info);
+    }));
+}
 
 /// Entry point shared by the desktop binary and the Android `cdylib`.
 ///
@@ -41,6 +76,11 @@ struct LogGuard(WorkerGuard);
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 #[allow(clippy::too_many_lines)] // setup() block lists every Tauri command + manages every state.
 pub fn run() {
+    // PRD §5 Reliability: install the panic hook BEFORE the Tauri builder
+    // so a panic during bootstrap is captured even though no tracing
+    // subscriber is live yet (the chained default hook still prints to
+    // stderr with a backtrace).
+    install_panic_hook();
     // Subscriber init lives in setup() rather than at function entry so the
     // PRD §F-016 §8 file appender can be wired in the SAME init call as the
     // stderr layer (a second `try_init` after the first wins NOTHING — the
@@ -74,6 +114,23 @@ pub fn run() {
                 tracing::error!(error = %e, "failed to open kino database");
                 e.to_string()
             })?;
+            // PRD §5 Logging: honour the persisted `display.advanced_logging`
+            // toggle at boot — if it's on, flip the reload-aware filter from
+            // the default `info` to `debug`. Failure here is non-fatal; the
+            // subscriber keeps the boot-time level.
+            if let Some(filter_handle) = app.try_state::<LogFilterHandle>() {
+                let advanced = tauri::async_runtime::block_on(
+                    db.kv_get(settings::DISPLAY_ADVANCED_LOGGING_KEY),
+                )
+                .ok()
+                .flatten()
+                .is_some_and(|v| v == "true" || v == "1");
+                if advanced {
+                    if let Err(e) = filter_handle.apply("debug") {
+                        tracing::warn!(error = %e, "could not apply advanced logging on boot");
+                    }
+                }
+            }
             // PRD §F-007: install Cinemeta as a non-removable default
             // addon on first launch. Runs once (gated by a settings
             // marker); failure here doesn't block startup — the user can
@@ -187,12 +244,21 @@ pub fn run() {
 /// stderr so the F-016 §8 Export-Logs button has artifacts to ship. When the
 /// directory isn't available (rare — read-only home dir, sandbox), stderr
 /// alone still keeps the app debuggable.
+///
+/// The `EnvFilter` is wrapped in a `reload::Layer` so PRD §5 Logging's
+/// "DEBUG when 'advanced logging' toggle is on in settings" can switch
+/// the filter at runtime without re-initialising the subscriber. The
+/// type-erased applier closure is stored as managed state under
+/// [`LogFilterHandle`] so [`commands::settings_set`] and the boot-time
+/// path can both flip the level.
 fn install_subscriber<R: tauri::Runtime>(app: &tauri::App<R>, handle: &tauri::AppHandle<R>) {
     use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::reload;
     use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::EnvFilter;
 
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let initial = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let (filter_layer, reload_handle) = reload::Layer::new(initial);
     let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
 
     match paths::app_config_dir(handle)
@@ -203,7 +269,7 @@ fn install_subscriber<R: tauri::Runtime>(app: &tauri::App<R>, handle: &tauri::Ap
                 .with_writer(non_blocking)
                 .with_ansi(false);
             let _ = tracing_subscriber::registry()
-                .with(filter)
+                .with(filter_layer)
                 .with(stderr_layer)
                 .with(file_layer)
                 .try_init();
@@ -211,9 +277,20 @@ fn install_subscriber<R: tauri::Runtime>(app: &tauri::App<R>, handle: &tauri::Ap
         }
         Err(_) => {
             let _ = tracing_subscriber::registry()
-                .with(filter)
+                .with(filter_layer)
                 .with(stderr_layer)
                 .try_init();
         }
     }
+
+    // Erase the reload-handle's subscriber-stack type behind a closure so
+    // app state can hold a plain `Send + Sync` value regardless of which
+    // match branch above ran.
+    let applier: commands::LogFilterApplier = Box::new(move |level: &str| {
+        let next = EnvFilter::try_new(level).map_err(|e| format!("invalid log filter: {e}"))?;
+        reload_handle
+            .modify(|f| *f = next)
+            .map_err(|e| format!("reload handle closed: {e}"))
+    });
+    app.manage(LogFilterHandle::new(applier));
 }

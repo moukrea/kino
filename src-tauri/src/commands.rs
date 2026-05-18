@@ -3140,16 +3140,62 @@ pub async fn settings_get_all(
     settings::load_view(&db, HostPlatform::current(), &cache_default).await
 }
 
+/// Type-erased applier closure that flips the global `tracing` filter at
+/// runtime. Installed by [`crate::install_subscriber`] as managed state
+/// under [`LogFilterHandle`] so PRD §5 Logging's "DEBUG when 'advanced
+/// logging' toggle is on in settings" can switch the filter without a
+/// restart.
+pub type LogFilterApplier = Box<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
+/// Managed-state wrapper around a [`LogFilterApplier`]. Reaches into the
+/// `tracing_subscriber::reload::Handle` to swap the active `EnvFilter`.
+pub struct LogFilterHandle {
+    applier: LogFilterApplier,
+}
+
+impl LogFilterHandle {
+    /// Construct a new handle from a type-erased applier.
+    pub fn new(applier: LogFilterApplier) -> Self {
+        Self { applier }
+    }
+
+    /// Apply a filter directive (e.g. `"debug"`, `"info"`, `"kino=debug"`).
+    /// Errors carry a human-readable reason the caller can surface over IPC.
+    pub fn apply(&self, level: &str) -> Result<(), String> {
+        (self.applier)(level)
+    }
+}
+
 /// `settings_set(key, value)` (PRD §F-016 "All settings persist across
 /// restarts"). Validates `(key, value)` against the per-key bounds in
 /// [`validate_setting`] then writes the normalized value to the KV table.
 ///
+/// PRD §5 Logging side effect: when `key ==
+/// `[`crate::settings::DISPLAY_ADVANCED_LOGGING_KEY`], the
+/// reload-aware tracing filter is flipped between `info` and `debug` so
+/// the toggle takes effect without a restart.
+///
 /// Returns the normalized value the caller should now consider authoritative
 /// (e.g. boolean inputs are canonicalized to `"true"`/`"false"`).
 #[tauri::command]
-pub async fn settings_set(db: State<'_, Db>, key: String, value: String) -> Result<String, String> {
+pub async fn settings_set(
+    db: State<'_, Db>,
+    log_filter: State<'_, LogFilterHandle>,
+    key: String,
+    value: String,
+) -> Result<String, String> {
     let normalized = validate_setting(&key, &value, HostPlatform::current())?;
     db.kv_set(&key, &normalized).await.map_err(ipc)?;
+    if key == crate::settings::DISPLAY_ADVANCED_LOGGING_KEY {
+        let level = if normalized == "true" {
+            "debug"
+        } else {
+            "info"
+        };
+        if let Err(e) = log_filter.apply(level) {
+            tracing::warn!(error = %e, "could not apply log filter after toggle");
+        }
+    }
     Ok(normalized)
 }
 
@@ -3162,7 +3208,10 @@ pub async fn settings_set(db: State<'_, Db>, key: String, value: String) -> Resu
 /// (`install_id`, `addons.bootstrap_done`) survive so the install identity
 /// remains stable.
 #[tauri::command]
-pub async fn settings_reset_defaults(db: State<'_, Db>) -> Result<(), String> {
+pub async fn settings_reset_defaults(
+    db: State<'_, Db>,
+    log_filter: State<'_, LogFilterHandle>,
+) -> Result<(), String> {
     for key in KNOWN_SETTINGS_KEYS {
         db.kv_delete(key).await.map_err(ipc)?;
     }
@@ -3182,6 +3231,11 @@ pub async fn settings_reset_defaults(db: State<'_, Db>) -> Result<(), String> {
             continue;
         }
         db.addons_delete(&addon.id).await.map_err(ipc)?;
+    }
+    // Advanced logging was wiped above; restore the boot-time `info` level
+    // so the live process matches the just-reset persisted state.
+    if let Err(e) = log_filter.apply("info") {
+        tracing::warn!(error = %e, "could not reset log filter to info");
     }
     Ok(())
 }

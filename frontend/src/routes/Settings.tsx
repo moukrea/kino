@@ -114,6 +114,7 @@ const DEFAULT_VIEW: SettingsView = {
     nsfw: false,
     input_override: "auto",
     high_contrast: false,
+    advanced_logging: false,
   },
 };
 
@@ -1279,6 +1280,14 @@ const DisplaySection: Component<SectionProps> = (props) => (
       value={() => props.view().display.high_contrast}
       onChange={(v) =>
         props.persist(SETTING_KEYS.displayHighContrast, boolStr(v))
+      }
+    />
+    <Toggle
+      id="settings-section-display-advancedlogging"
+      labelKey="settings.display.advancedLogging"
+      value={() => props.view().display.advanced_logging}
+      onChange={(v) =>
+        props.persist(SETTING_KEYS.displayAdvancedLogging, boolStr(v))
       }
     />
   </SectionShell>
