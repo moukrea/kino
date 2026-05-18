@@ -190,4 +190,116 @@ describe("Row", () => {
     expect(onActivate).toHaveBeenCalledTimes(1);
     expect(onActivate.mock.calls[0]?.[0].id).toBe("t1");
   });
+
+  it("PRD §F-006: hides unavailable tiles by default (showUnavailable OFF)", () => {
+    // Mark every odd tile as unavailable; the Row should hide them
+    // entirely so only the 5 even-indexed tiles render.
+    const items = makeItems(10);
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    dispose = render(
+      () => (
+        <Row
+          label="Mixed"
+          focusIdPrefix="row-mixed"
+          items={items}
+          itemAvailability={(s) =>
+            Number(s.id.slice(1)) % 2 === 0 ? "available" : "unavailable"
+          }
+        />
+      ),
+      host,
+    );
+
+    const rendered = host.querySelectorAll(
+      '[data-testid^="tile-row-mixed-"]',
+    );
+    // 5 even-indexed tiles survive the filter.
+    expect(rendered.length).toBe(5);
+    for (const el of Array.from(rendered)) {
+      expect(el.getAttribute("data-availability")).toBe("available");
+    }
+  });
+
+  it("PRD §F-006: shows unavailable tiles with badge when showUnavailable=true", () => {
+    const items = makeItems(6);
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    dispose = render(
+      () => (
+        <Row
+          label="Mixed"
+          focusIdPrefix="row-mixed"
+          items={items}
+          showUnavailable={true}
+          itemAvailability={(s) =>
+            Number(s.id.slice(1)) % 2 === 0 ? "available" : "unavailable"
+          }
+        />
+      ),
+      host,
+    );
+
+    const rendered = host.querySelectorAll(
+      '[data-testid^="tile-row-mixed-"]',
+    );
+    // All 6 tiles render now.
+    expect(rendered.length).toBe(6);
+    // Three of them carry the no-source badge.
+    expect(
+      host.querySelectorAll('[data-testid="tile-no-source-badge"]').length,
+    ).toBe(3);
+  });
+
+  it("PRD §F-006: keeps pending tiles visible regardless of the toggle", () => {
+    // "pending" is the PRD's "availability unknown" placeholder; it
+    // must stay rendered so the row reserves space for the eventual
+    // result rather than collapsing while the backend resolves.
+    const items = makeItems(4);
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    dispose = render(
+      () => (
+        <Row
+          label="Loading"
+          focusIdPrefix="row-loading"
+          items={items}
+          itemAvailability={() => "pending"}
+        />
+      ),
+      host,
+    );
+
+    const rendered = host.querySelectorAll(
+      '[data-testid^="tile-row-loading-"]',
+    );
+    expect(rendered.length).toBe(4);
+    expect(
+      host.querySelectorAll('[data-testid="tile-skeleton"]').length,
+    ).toBe(4);
+  });
+
+  it("PRD §F-006: an all-unavailable row collapses to the empty fallback", () => {
+    // A row whose every tile is unavailable with the toggle OFF must
+    // render its empty placeholder rather than an empty track.
+    const items = makeItems(3);
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    dispose = render(
+      () => (
+        <Row
+          label="None"
+          focusIdPrefix="row-none"
+          items={items}
+          itemAvailability={() => "unavailable"}
+        />
+      ),
+      host,
+    );
+
+    expect(
+      host.querySelector('[data-testid="row-empty-fallback"]'),
+    ).not.toBeNull();
+    expect(host.querySelector('[data-testid="row-track"]')).toBeNull();
+  });
 });

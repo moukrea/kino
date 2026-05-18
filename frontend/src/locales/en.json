@@ -26,7 +26,8 @@
     "cwResumeMovie": "Resume",
     "cwResumeEpisode": "Resume S{{season}}E{{episode}}",
     "cwUpNextEpisode": "Up next: S{{season}}E{{episode}}",
-    "cwRemoveAction": "Remove from Continue Watching"
+    "cwRemoveAction": "Remove from Continue Watching",
+    "tileNoSource": "no source"
   },
   "detail": {
     "back": "Back",
@@ -172,7 +173,9 @@
       "inputDpad": "D-pad",
       "inputKbm": "Keyboard + mouse",
       "highContrast": "High-contrast theme",
-      "advancedLogging": "Advanced logging (debug)"
+      "advancedLogging": "Advanced logging (debug)",
+      "showUnavailable": "Show unavailable titles",
+      "showUnavailableHint": "Render catalog tiles even when no enabled addon has streams for them, marked with a 'no source' badge. Off by default (PRD §F-006)."
     },
     "about": {
       "version": "Version",

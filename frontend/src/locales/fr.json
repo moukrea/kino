@@ -26,7 +26,8 @@
     "cwResumeMovie": "Reprendre",
     "cwResumeEpisode": "Reprendre S{{season}}E{{episode}}",
     "cwUpNextEpisode": "À suivre : S{{season}}E{{episode}}",
-    "cwRemoveAction": "Retirer de Reprendre"
+    "cwRemoveAction": "Retirer de Reprendre",
+    "tileNoSource": "aucune source"
   },
   "detail": {
     "back": "Retour",
@@ -172,7 +173,9 @@
       "inputDpad": "Pavé directionnel",
       "inputKbm": "Clavier et souris",
       "highContrast": "Thème contraste élevé",
-      "advancedLogging": "Journalisation avancée (debug)"
+      "advancedLogging": "Journalisation avancée (debug)",
+      "showUnavailable": "Afficher les titres sans source",
+      "showUnavailableHint": "Affiche les vignettes de catalogue même quand aucune extension activée ne fournit de flux, marquées d’un badge « aucune source ». Désactivé par défaut (PRD §F-006)."
     },
     "about": {
       "version": "Version",

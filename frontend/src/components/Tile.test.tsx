@@ -176,4 +176,69 @@ describe("Tile", () => {
     expect(img?.getAttribute("src")).toBe("https://example/poster.jpg");
     expect(img?.getAttribute("loading")).toBe("lazy");
   });
+
+  it("PRD §F-006: pending availability renders a skeleton instead of the poster", () => {
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    dispose = render(
+      () => (
+        <Tile
+          focusId="t1"
+          summary={{ ...SAMPLE, poster: "https://example/poster.jpg" }}
+          availability="pending"
+        />
+      ),
+      host,
+    );
+
+    // Skeleton present; <img> absent; aria-busy + data attribute set.
+    expect(host.querySelector('[data-testid="tile-skeleton"]')).not.toBeNull();
+    expect(host.querySelector("img")).toBeNull();
+    const button = host.querySelector('[data-testid="tile-t1"]');
+    expect(button?.getAttribute("data-availability")).toBe("pending");
+    expect(button?.getAttribute("aria-busy")).toBe("true");
+  });
+
+  it("PRD §F-006: unavailable tiles render a 'no source' badge and a muted poster", () => {
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    dispose = render(
+      () => (
+        <Tile
+          focusId="t1"
+          summary={{ ...SAMPLE, poster: "https://example/poster.jpg" }}
+          availability="unavailable"
+        />
+      ),
+      host,
+    );
+
+    expect(
+      host.querySelector('[data-testid="tile-no-source-badge"]'),
+    ).not.toBeNull();
+    expect(host.querySelector('[data-testid="tile-skeleton"]')).toBeNull();
+    // Poster still renders so the title is recognizable behind the badge.
+    expect(host.querySelector("img")).not.toBeNull();
+    const button = host.querySelector('[data-testid="tile-t1"]');
+    expect(button?.getAttribute("data-availability")).toBe("unavailable");
+    // Reduced opacity class signals the unavailable visual state.
+    expect(button?.getAttribute("class")).toContain("opacity-60");
+  });
+
+  it("PRD §F-006: default (no availability prop) renders as available", () => {
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    dispose = render(
+      () => <Tile focusId="t1" summary={SAMPLE} />,
+      host,
+    );
+
+    expect(host.querySelector('[data-testid="tile-skeleton"]')).toBeNull();
+    expect(
+      host.querySelector('[data-testid="tile-no-source-badge"]'),
+    ).toBeNull();
+    const button = host.querySelector('[data-testid="tile-t1"]');
+    expect(button?.getAttribute("data-availability")).toBe("available");
+    expect(button?.getAttribute("aria-busy")).toBeNull();
+  });
 });

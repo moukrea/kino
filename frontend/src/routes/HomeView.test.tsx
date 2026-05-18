@@ -39,6 +39,7 @@ vi.mock("../lib/tauri", async (importOriginal) => {
     getTrendingPools: vi.fn(),
     getWeeklyTrending: vi.fn(),
     listHomeCatalogs: vi.fn(),
+    checkAvailability: vi.fn(),
   };
 });
 
@@ -48,6 +49,9 @@ const mockedCwRemoveTitle = vi.mocked(tauri.cwRemoveTitle);
 const mockedGetTrendingPools = vi.mocked(tauri.getTrendingPools);
 const mockedGetWeeklyTrending = vi.mocked(tauri.getWeeklyTrending);
 const mockedListHomeCatalogs = vi.mocked(tauri.listHomeCatalogs);
+const mockedCheckAvailability = vi.mocked(tauri.checkAvailability);
+
+const displaySettings = await import("../lib/displaySettings");
 
 function summary(id: string, kind: TitleKind, title: string): TitleSummary {
   return { id, kind, title, year: 2024, poster: null, rating: null };
@@ -137,16 +141,29 @@ describe("HomeView (F-009)", () => {
   beforeEach(() => {
     _resetFocus();
     _resetProfile();
+    displaySettings._resetForTests();
     mockedCwList.mockReset();
     mockedCwRemoveTitle.mockReset();
     mockedGetTrendingPools.mockReset();
     mockedGetWeeklyTrending.mockReset();
     mockedListHomeCatalogs.mockReset();
+    mockedCheckAvailability.mockReset();
     mockedCwList.mockResolvedValue([]);
     mockedCwRemoveTitle.mockResolvedValue(0);
     mockedGetTrendingPools.mockResolvedValue(pools([]));
     mockedGetWeeklyTrending.mockResolvedValue([]);
     mockedListHomeCatalogs.mockResolvedValue([]);
+    // Default: every check_availability batch reports every requested
+    // (kind, id) as available, so the F-009 sub-home tests can keep
+    // ignoring the filter (it was a no-op before and stays a no-op).
+    mockedCheckAvailability.mockImplementation(async (items) =>
+      items.map((i) => ({
+        title_id: i.title_id,
+        type: i.type,
+        available: true,
+        source_count: 1,
+      })),
+    );
   });
 
   afterEach(() => {
@@ -303,14 +320,24 @@ describe("HomeView addon catalog rows (F-008 row 5)", () => {
   beforeEach(() => {
     _resetFocus();
     _resetProfile();
+    displaySettings._resetForTests();
     mockedCwList.mockReset();
     mockedGetTrendingPools.mockReset();
     mockedGetWeeklyTrending.mockReset();
     mockedListHomeCatalogs.mockReset();
+    mockedCheckAvailability.mockReset();
     mockedCwList.mockResolvedValue([]);
     mockedGetTrendingPools.mockResolvedValue(pools([]));
     mockedGetWeeklyTrending.mockResolvedValue([]);
     mockedListHomeCatalogs.mockResolvedValue([]);
+    mockedCheckAvailability.mockImplementation(async (items) =>
+      items.map((i) => ({
+        title_id: i.title_id,
+        type: i.type,
+        available: true,
+        source_count: 1,
+      })),
+    );
   });
 
   afterEach(() => {
@@ -419,15 +446,25 @@ describe("HomeView Continue Watching row (F-012)", () => {
   beforeEach(() => {
     _resetFocus();
     _resetProfile();
+    displaySettings._resetForTests();
     mockedCwList.mockReset();
     mockedCwRemoveTitle.mockReset();
     mockedGetTrendingPools.mockReset();
     mockedGetWeeklyTrending.mockReset();
     mockedListHomeCatalogs.mockReset();
+    mockedCheckAvailability.mockReset();
     mockedCwRemoveTitle.mockResolvedValue(1);
     mockedGetTrendingPools.mockResolvedValue(pools([]));
     mockedGetWeeklyTrending.mockResolvedValue([]);
     mockedListHomeCatalogs.mockResolvedValue([]);
+    mockedCheckAvailability.mockImplementation(async (items) =>
+      items.map((i) => ({
+        title_id: i.title_id,
+        type: i.type,
+        available: true,
+        source_count: 1,
+      })),
+    );
   });
 
   afterEach(() => {
@@ -515,6 +552,218 @@ describe("HomeView Continue Watching row (F-012)", () => {
       '[data-testid="row-continue-watching"] [data-testid="tile-badge"]',
     );
     expect(badge).toBeNull();
+  });
+});
+
+describe("HomeView availability filter (F-006)", () => {
+  let host: HTMLDivElement | null = null;
+  let dispose: (() => void) | null = null;
+
+  beforeEach(() => {
+    _resetFocus();
+    _resetProfile();
+    displaySettings._resetForTests();
+    mockedCwList.mockReset();
+    mockedCwRemoveTitle.mockReset();
+    mockedGetTrendingPools.mockReset();
+    mockedGetWeeklyTrending.mockReset();
+    mockedListHomeCatalogs.mockReset();
+    mockedCheckAvailability.mockReset();
+    mockedCwList.mockResolvedValue([]);
+    mockedCwRemoveTitle.mockResolvedValue(0);
+    mockedGetTrendingPools.mockResolvedValue(pools([]));
+    mockedGetWeeklyTrending.mockResolvedValue([]);
+    mockedListHomeCatalogs.mockResolvedValue([]);
+  });
+
+  afterEach(() => {
+    dispose?.();
+    host?.remove();
+    host = null;
+    dispose = null;
+  });
+
+  it("PRD §F-006: catalog rows call check_availability with their items batched", async () => {
+    mockedGetTrendingPools.mockImplementation(async () =>
+      pools([
+        summary("m1", "movie", "Matrix"),
+        summary("m2", "movie", "Heat"),
+      ]),
+    );
+    mockedCheckAvailability.mockImplementation(async (items) =>
+      items.map((i) => ({
+        title_id: i.title_id,
+        type: i.type,
+        available: true,
+        source_count: 1,
+      })),
+    );
+
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    dispose = mount(host, "movie");
+    await flushAsync();
+
+    expect(mockedCheckAvailability).toHaveBeenCalled();
+    const flatRequests = mockedCheckAvailability.mock.calls.flatMap((c) => c[0]);
+    const ids = new Set(flatRequests.map((r) => r.title_id));
+    expect(ids).toContain("m1");
+    expect(ids).toContain("m2");
+    // Trending Now batch is one call with both items (not split per tile).
+    const sizes = mockedCheckAvailability.mock.calls.map((c) => c[0].length);
+    expect(sizes.some((n) => n === 2)).toBe(true);
+  });
+
+  it("PRD §F-006: tiles whose availability resolves false hide by default", async () => {
+    mockedGetTrendingPools.mockImplementation(async () =>
+      pools([
+        summary("m1", "movie", "Available"),
+        summary("m2", "movie", "Unavailable"),
+      ]),
+    );
+    mockedCheckAvailability.mockImplementation(async (items) =>
+      items.map((i) => ({
+        title_id: i.title_id,
+        type: i.type,
+        available: i.title_id === "m1",
+        source_count: i.title_id === "m1" ? 1 : 0,
+      })),
+    );
+
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    dispose = mount(host, "movie");
+    await flushAsync();
+    // Two flushes to allow availability state-set to propagate.
+    await flushAsync();
+
+    const tiles = Array.from(
+      host.querySelectorAll<HTMLElement>(
+        '[data-testid="row-trending-now"] button[data-availability]',
+      ),
+    );
+    const ids = tiles.map((t) => {
+      const tid = t.getAttribute("data-testid") ?? "";
+      return tid.split("-").pop();
+    });
+    expect(ids).toContain("m1");
+    expect(ids).not.toContain("m2");
+  });
+
+  it("PRD §F-006: when showUnavailable is ON, unavailable tiles render with the badge", async () => {
+    displaySettings.setShowUnavailable(true);
+    mockedGetTrendingPools.mockImplementation(async () =>
+      pools([
+        summary("m1", "movie", "Available"),
+        summary("m2", "movie", "Unavailable"),
+      ]),
+    );
+    mockedCheckAvailability.mockImplementation(async (items) =>
+      items.map((i) => ({
+        title_id: i.title_id,
+        type: i.type,
+        available: i.title_id === "m1",
+        source_count: i.title_id === "m1" ? 1 : 0,
+      })),
+    );
+
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    dispose = mount(host, "movie");
+    await flushAsync();
+    await flushAsync();
+
+    const tiles = Array.from(
+      host.querySelectorAll<HTMLElement>(
+        '[data-testid="row-trending-now"] button[data-availability]',
+      ),
+    );
+    expect(tiles.length).toBe(2);
+    expect(
+      host.querySelectorAll('[data-testid="tile-no-source-badge"]').length,
+    ).toBe(1);
+
+    displaySettings.setShowUnavailable(false);
+  });
+
+  it("PRD §F-006: tiles render skeleton while check_availability is pending", async () => {
+    mockedGetTrendingPools.mockImplementation(async () =>
+      pools([summary("m1", "movie", "Pending")]),
+    );
+    // Hang the availability check so it never resolves during the test.
+    mockedCheckAvailability.mockImplementation(
+      () =>
+        new Promise(() => {
+          /* never resolves */
+        }),
+    );
+
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    dispose = mount(host, "movie");
+    await flushAsync();
+
+    // The single trending tile is in pending state — skeleton present,
+    // poster absent, aria-busy true.
+    const skeletons = host.querySelectorAll('[data-testid="tile-skeleton"]');
+    expect(skeletons.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("PRD §F-006: Continue Watching tiles are NOT availability-filtered", async () => {
+    // CW shows a series the user has been watching; even if no enabled
+    // addon currently has a stream (transient), the tile must remain
+    // visible so the user can manually remove it.
+    mockedCwList.mockResolvedValue([cw("cw1", "movie")]);
+    mockedCheckAvailability.mockImplementation(async (items) =>
+      items.map((i) => ({
+        title_id: i.title_id,
+        type: i.type,
+        available: false, // every CW item is "unavailable" per the mock
+        source_count: 0,
+      })),
+    );
+
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    dispose = mount(host, null);
+    await flushAsync();
+    await flushAsync();
+
+    // CW row still visible with the tile.
+    expect(
+      host.querySelector('[data-testid="row-continue-watching"]'),
+    ).not.toBeNull();
+    const cwTiles = host.querySelectorAll(
+      '[data-testid="row-continue-watching"] button',
+    );
+    expect(cwTiles.length).toBe(1);
+    // And check_availability was NOT called for the CW item (PRD lists
+    // trending / sub-homes / search / addon catalogs, NOT CW).
+    const allReqIds = mockedCheckAvailability.mock.calls
+      .flatMap((c) => c[0])
+      .map((r) => r.title_id);
+    expect(allReqIds).not.toContain("cw1");
+  });
+
+  it("PRD §F-006: network error treats every tile as available so the row doesn't go dark", async () => {
+    mockedGetTrendingPools.mockImplementation(async () =>
+      pools([summary("m1", "movie", "Matrix")]),
+    );
+    mockedCheckAvailability.mockRejectedValue(new Error("network down"));
+
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    dispose = mount(host, "movie");
+    await flushAsync();
+    await flushAsync();
+
+    const tiles = Array.from(
+      host.querySelectorAll<HTMLElement>(
+        '[data-testid="row-trending-now"] button[data-availability]',
+      ),
+    );
+    expect(tiles.length).toBe(1);
+    expect(tiles[0]?.getAttribute("data-availability")).toBe("available");
   });
 });
 

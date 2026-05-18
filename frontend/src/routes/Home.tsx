@@ -29,6 +29,7 @@
 // "instant — no full reload" acceptance.
 
 import {
+  createEffect,
   createResource,
   createSignal,
   For,
@@ -39,10 +40,12 @@ import {
 import { useNavigate } from "@solidjs/router";
 
 import { Row } from "../components/Row";
+import type { TileAvailability } from "../components/Tile";
 import { focusedId, pushReturnFocus, setInitialFocus } from "../input/focus";
 import { locale } from "../i18n";
 import { t } from "../i18n";
 import {
+  checkAvailability,
   cwList,
   cwRemoveTitle,
   getTrendingPools,
@@ -56,6 +59,7 @@ import {
   type TrendingPools,
 } from "../lib/tauri";
 import { cwTileBadge } from "../lib/cw";
+import { showUnavailable } from "../lib/displaySettings";
 
 /**
  * PRD §F-008 acceptance "Home composition (locked row order)" — the
@@ -108,8 +112,87 @@ export function interleaveByKind<T>(a: readonly T[], b: readonly T[]): T[] {
   return out;
 }
 
+/**
+ * PRD §F-006: availability state is keyed by `(kind, id)` because the
+ * backend takes `(title_id, type)` pairs — the same `tmdb:603` can map
+ * to a movie OR series under separate addons, so the kind disambiguates.
+ */
+function availabilityKey(kind: TitleKind, id: string): string {
+  return `${kind}:${id}`;
+}
+
 export const HomeView: Component<HomeViewProps> = (props) => {
   const navigate = useNavigate();
+
+  // PRD §F-006 per-tile availability map shared across every catalog
+  // row. The key is `${kind}:${id}` so the same `tmdb:603` doesn't
+  // collide across movie / series sub-feeds. Lookups fall back to
+  // `"pending"` until the per-row batch resolves, which is the PRD-
+  // locked default for "availability unknown".
+  const [availability, setAvailability] = createSignal<
+    Map<string, TileAvailability>
+  >(new Map());
+
+  /**
+   * Reactive accessor passed to every `<Row>` as `itemAvailability`.
+   * Returns `"available"` for tiles whose backend check confirmed ≥1
+   * stream, `"unavailable"` for explicit zero-stream results, and
+   * `"pending"` otherwise (covers cache-miss + in-flight + initial
+   * mount before the batch even fired).
+   */
+  const tileAvailability = (s: TitleSummary): TileAvailability => {
+    const key = availabilityKey(s.kind, s.id);
+    return availability().get(key) ?? "pending";
+  };
+
+  /**
+   * Fire a batched `check_availability` for one row's items, then fold
+   * the per-item result into the shared availability map. Idempotent —
+   * tiles already marked "available" / "unavailable" stay as-is when
+   * the batch confirms the same state, and re-running for a row whose
+   * items haven't changed is harmless (the backend's 30-min cache
+   * absorbs the network cost).
+   */
+  const dispatchAvailabilityFor = async (items: TitleSummary[]) => {
+    if (!hasTauri() || items.length === 0) return;
+    // De-dup the (kind, id) pairs so two catalogs with overlapping
+    // titles don't re-fire the same lookup twice in one tick.
+    const seen = new Set<string>();
+    const reqs = items
+      .filter((s) => {
+        const k = availabilityKey(s.kind, s.id);
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      })
+      .map((s) => ({ title_id: s.id, type: s.kind }));
+    if (reqs.length === 0) return;
+    try {
+      const out = await checkAvailability(reqs);
+      setAvailability((prev) => {
+        const next = new Map(prev);
+        for (const r of out) {
+          next.set(
+            availabilityKey(r.type, r.title_id),
+            r.available ? "available" : "unavailable",
+          );
+        }
+        return next;
+      });
+    } catch (e) {
+      // Network or backend error: don't strand the row in "pending"
+      // forever — fall back to "available" for the requested ids so
+      // the user at least sees the catalog. The next mount retries.
+      console.warn("check_availability failed", e);
+      setAvailability((prev) => {
+        const next = new Map(prev);
+        for (const req of reqs) {
+          next.set(availabilityKey(req.type, req.title_id), "available");
+        }
+        return next;
+      });
+    }
+  };
 
   /**
    * Tile activation handler. Remembers the focused-tile id so the
@@ -224,6 +307,32 @@ export const HomeView: Component<HomeViewProps> = (props) => {
     },
   );
 
+  // PRD §F-006: "Batch availability check fired immediately when a
+  // catalog is loaded". Per row, one batch — backend concurrency
+  // semaphore (8 in-flight, 5s timeout) handles cross-row queueing.
+  // Continue Watching is intentionally skipped: PRD §F-006 lists
+  // trending / sub-homes / search / addon catalogs as the contexts;
+  // CW is a user-watched signal where hiding the tile would be
+  // confusing if the source briefly disappears.
+  createEffect(() => {
+    const items = poolsResource()?.top_trending ?? [];
+    void dispatchAvailabilityFor(items);
+  });
+  createEffect(() => {
+    const items = poolsResource()?.hidden_gems ?? [];
+    void dispatchAvailabilityFor(items);
+  });
+  createEffect(() => {
+    const items = weeklyResource() ?? [];
+    void dispatchAvailabilityFor(items);
+  });
+  createEffect(() => {
+    const bundle = catalogsResource() ?? [];
+    for (const cat of bundle) {
+      void dispatchAvailabilityFor(cat.items);
+    }
+  });
+
   // CW summaries are rendered as Tiles so we coerce the cw rows into
   // TitleSummary shape (the existing meta_json field carries poster /
   // year / title via the F-010 Resume / Mark-Watched writes and the
@@ -324,6 +433,8 @@ export const HomeView: Component<HomeViewProps> = (props) => {
         focusIdPrefix="row-trending-now"
         items={poolsResource()?.top_trending ?? []}
         onActivate={activateTile}
+        itemAvailability={tileAvailability}
+        showUnavailable={showUnavailable()}
         testId="row-trending-now"
       />
       <Row
@@ -331,6 +442,8 @@ export const HomeView: Component<HomeViewProps> = (props) => {
         focusIdPrefix="row-hidden-gems"
         items={poolsResource()?.hidden_gems ?? []}
         onActivate={activateTile}
+        itemAvailability={tileAvailability}
+        showUnavailable={showUnavailable()}
         testId="row-hidden-gems"
       />
       <Row
@@ -338,6 +451,8 @@ export const HomeView: Component<HomeViewProps> = (props) => {
         focusIdPrefix="row-weekly"
         items={weeklyResource() ?? []}
         onActivate={activateTile}
+        itemAvailability={tileAvailability}
+        showUnavailable={showUnavailable()}
         testId="row-trending-this-week"
       />
 
@@ -348,6 +463,8 @@ export const HomeView: Component<HomeViewProps> = (props) => {
             focusIdPrefix={`row-cat-${cat.addon_id}-${cat.catalog_id}`}
             items={cat.items}
             onActivate={activateTile}
+            itemAvailability={tileAvailability}
+            showUnavailable={showUnavailable()}
             testId={`row-cat-${cat.addon_id}-${cat.catalog_id}`}
           />
         )}

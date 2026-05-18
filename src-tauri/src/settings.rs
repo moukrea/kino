@@ -115,6 +115,12 @@ pub const DISPLAY_HIGH_CONTRAST_KEY: &str = "display.high_contrast";
 /// other display-level reliability toggles.
 pub const DISPLAY_ADVANCED_LOGGING_KEY: &str = "display.advanced_logging";
 
+/// PRD §F-006 "Show unavailable titles" toggle. Default `false` (the PRD
+/// locks "hidden by default"). When `true`, the frontend renders tiles
+/// whose backend availability check returned `available = false` with a
+/// muted "no source" badge instead of hiding them.
+pub const DISPLAY_SHOW_UNAVAILABLE_KEY: &str = "display.show_unavailable";
+
 /// Every PRD §F-016-defined KV key, used by `settings_reset_defaults` to
 /// wipe only user-settable values. System-internal entries (`install_id`,
 /// `addons.bootstrap_done`) are deliberately NOT listed.
@@ -148,6 +154,7 @@ pub const KNOWN_SETTINGS_KEYS: &[&str] = &[
     DISPLAY_INPUT_OVERRIDE_KEY,
     DISPLAY_HIGH_CONTRAST_KEY,
     DISPLAY_ADVANCED_LOGGING_KEY,
+    DISPLAY_SHOW_UNAVAILABLE_KEY,
 ];
 
 /// Cache size lower bound shared by both platforms (PRD §F-016 §4).
@@ -244,6 +251,10 @@ pub struct DisplayView {
     /// PRD §5 Logging — when `true`, the runtime tracing filter is
     /// switched to `debug`. Default `false`.
     pub advanced_logging: bool,
+    /// PRD §F-006 "Show unavailable titles" toggle. Default `false` so
+    /// catalog tiles with no enabled-addon stream stay hidden; when
+    /// `true` the frontend renders them with a muted "no source" badge.
+    pub show_unavailable: bool,
 }
 
 // ---- platform-aware defaults ------------------------------------------------
@@ -389,6 +400,7 @@ pub async fn load_view(
         input_override: read_string_or(db, DISPLAY_INPUT_OVERRIDE_KEY, "auto").await?,
         high_contrast: read_bool(db, DISPLAY_HIGH_CONTRAST_KEY, false).await?,
         advanced_logging: read_bool(db, DISPLAY_ADVANCED_LOGGING_KEY, false).await?,
+        show_unavailable: read_bool(db, DISPLAY_SHOW_UNAVAILABLE_KEY, false).await?,
     };
     Ok(SettingsView {
         api_keys,
@@ -471,7 +483,8 @@ pub fn validate_setting(key: &str, value: &str, platform: HostPlatform) -> Resul
         | DISPLAY_FOCUS_ANIMATION_KEY
         | DISPLAY_NSFW_KEY
         | DISPLAY_HIGH_CONTRAST_KEY
-        | DISPLAY_ADVANCED_LOGGING_KEY => {
+        | DISPLAY_ADVANCED_LOGGING_KEY
+        | DISPLAY_SHOW_UNAVAILABLE_KEY => {
             // Boolean settings — coerce to canonical string form.
             match value {
                 "true" | "1" => Ok("true".to_string()),
@@ -521,6 +534,7 @@ mod tests {
         assert_eq!(view.display.input_override, "auto");
         assert!(!view.display.high_contrast);
         assert!(!view.display.advanced_logging);
+        assert!(!view.display.show_unavailable);
         assert!(view.language.metadata_fallback.is_empty());
     }
 
@@ -548,6 +562,35 @@ mod tests {
         );
         assert!(
             validate_setting(DISPLAY_ADVANCED_LOGGING_KEY, "yep", HostPlatform::Linux).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn load_view_reads_persisted_show_unavailable() {
+        // PRD §F-006: "Show unavailable titles" persists across restarts
+        // and overrides the locked default-OFF rendering policy.
+        let db = Db::open_in_memory().await.unwrap();
+        db.kv_set(DISPLAY_SHOW_UNAVAILABLE_KEY, "true")
+            .await
+            .unwrap();
+        let view = load_view(&db, HostPlatform::Linux, "/tmp/kino")
+            .await
+            .unwrap();
+        assert!(view.display.show_unavailable);
+    }
+
+    #[test]
+    fn validate_setting_normalizes_show_unavailable() {
+        assert_eq!(
+            validate_setting(DISPLAY_SHOW_UNAVAILABLE_KEY, "1", HostPlatform::Linux).unwrap(),
+            "true"
+        );
+        assert_eq!(
+            validate_setting(DISPLAY_SHOW_UNAVAILABLE_KEY, "0", HostPlatform::Linux).unwrap(),
+            "false"
+        );
+        assert!(
+            validate_setting(DISPLAY_SHOW_UNAVAILABLE_KEY, "maybe", HostPlatform::Linux).is_err()
         );
     }
 

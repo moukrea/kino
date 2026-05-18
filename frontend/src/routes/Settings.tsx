@@ -41,6 +41,7 @@ import {
   setOverride as setInputOverride,
   type InputProfileOverride,
 } from "../input/profile";
+import { setShowUnavailable } from "../lib/displaySettings";
 import { locale, setLocale, type SupportedLocale, t, tDyn } from "../i18n";
 import {
   addonsList,
@@ -123,6 +124,7 @@ const DEFAULT_VIEW: SettingsView = {
     input_override: "auto",
     high_contrast: false,
     advanced_logging: false,
+    show_unavailable: false,
   },
 };
 
@@ -1345,6 +1347,18 @@ const DisplaySection: Component<SectionProps> = (props) => (
       onChange={(v) =>
         props.persist(SETTING_KEYS.displayAdvancedLogging, boolStr(v))
       }
+    />
+    <Toggle
+      id="settings-section-display-showunavailable"
+      labelKey="settings.display.showUnavailable"
+      value={() => props.view().display.show_unavailable}
+      onChange={(v) => {
+        // PRD §F-006: the rendering policy is reactive — flipping the
+        // toggle updates the module-level signal so already-mounted
+        // catalog rows re-render without a route remount.
+        setShowUnavailable(v);
+        void props.persist(SETTING_KEYS.displayShowUnavailable, boolStr(v));
+      }}
     />
   </SectionShell>
 );

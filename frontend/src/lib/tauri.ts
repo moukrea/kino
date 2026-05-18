@@ -131,6 +131,46 @@ export async function listHomeCatalogs(
   return invoke<HomeCatalog[]>("list_home_catalogs", { kind, locale });
 }
 
+// ---- F-006: Source availability filter --------------------------------
+
+/**
+ * One `(title_id, kind)` request for the F-006 availability batch
+ * command. Catalog rows post one batch per row mount; the backend folds
+ * the per-addon stream-resource lookups behind an 8-in-flight semaphore
+ * and a 30-min `stream_availability` cache (PRD §F-006).
+ */
+export type AvailabilityRequest = {
+  title_id: string;
+  /** Serialized as `"type"` to match the backend `#[serde(rename = "type")]`. */
+  type: TitleKind;
+};
+
+/**
+ * One result returned by `check_availability`. `available` is true when
+ * any enabled stream-serving addon returned ≥1 stream; `source_count`
+ * exposes how many addons matched, used by the title-detail view in a
+ * future polish pass.
+ */
+export type AvailabilityResult = {
+  title_id: string;
+  type: TitleKind;
+  available: boolean;
+  source_count: number;
+};
+
+/**
+ * `check_availability(items)` (PRD §F-006). Sends a batch of
+ * `(title_id, kind)` pairs and returns one result per input in input
+ * order. Throws on transport errors; callers should fall back to
+ * rendering every tile as "available" so a network blip doesn't
+ * hide the entire catalog (the cache will catch up on the next mount).
+ */
+export async function checkAvailability(
+  items: AvailabilityRequest[],
+): Promise<AvailabilityResult[]> {
+  return invoke<AvailabilityResult[]>("check_availability", { items });
+}
+
 // ---- F-010: Title detail view -----------------------------------------
 
 export type CastMember = {
@@ -383,6 +423,12 @@ export type DisplayView = {
    * switches the runtime `tracing` `EnvFilter` to `debug`.
    */
   advanced_logging: boolean;
+  /**
+   * PRD §F-006 "Show unavailable titles" toggle. Default `false` so
+   * catalog tiles whose backend availability returned no streams stay
+   * hidden; when `true` the row renders them with a "no source" badge.
+   */
+  show_unavailable: boolean;
 };
 
 export type SettingsView = {
@@ -438,6 +484,7 @@ export const SETTING_KEYS = {
   displayInputOverride: "display.input_override",
   displayHighContrast: "display.high_contrast",
   displayAdvancedLogging: "display.advanced_logging",
+  displayShowUnavailable: "display.show_unavailable",
 } as const;
 
 export async function settingsGetAll(): Promise<SettingsView> {

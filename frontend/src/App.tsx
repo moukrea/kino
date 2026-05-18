@@ -32,6 +32,7 @@ import {
   setOverride as setInputOverride,
   type InputProfileOverride,
 } from "./input/profile";
+import { setShowUnavailable } from "./lib/displaySettings";
 import { hasTauri, settingsGetAll } from "./lib/tauri";
 import { Home } from "./routes/Home";
 import { Movies } from "./routes/Movies";
@@ -80,6 +81,10 @@ const Shell: Component<{ children?: JSX.Element }> = (props) => {
           ) {
             setInputOverride(override as InputProfileOverride);
           }
+          // PRD §F-006 / §F-016: hydrate the live "show unavailable"
+          // toggle so catalog rows mounted before Settings has been
+          // visited honor the persisted choice immediately.
+          setShowUnavailable(view.display.show_unavailable);
         })
         .catch(() => {
           // First-boot DB may not be ready yet; keep going with defaults.
