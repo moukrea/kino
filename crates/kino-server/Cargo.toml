@@ -20,9 +20,25 @@ missing_errors_doc = "allow"
 
 [dependencies]
 kino-core = { path = "../kino-core" }
+kino-torrent = { path = "../kino-torrent" }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-# axum / tower wiring lands in F-013 alongside the librqbit integration; this
-# crate is intentionally a thin shell until then.
+tokio = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+bytes = { workspace = true }
+uuid = { workspace = true }
+parking_lot = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+mime_guess = { workspace = true }
 
 [dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+reqwest = { workspace = true }
+librqbit = { workspace = true }
+uuid = { workspace = true }
+bytes = { workspace = true }

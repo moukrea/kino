@@ -23,8 +23,15 @@ kino-core = { path = "../kino-core" }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-# librqbit itself is added in the session that implements F-013. Pulling it
-# in now would force every other session to compile a torrent engine on the
-# critical path with nothing to validate.
+tokio = { workspace = true }
+bytes = { workspace = true }
+librqbit = { workspace = true }
+parking_lot = { workspace = true }
+anyhow = { workspace = true }
+url = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true }
+rand = { workspace = true }

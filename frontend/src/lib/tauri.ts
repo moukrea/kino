@@ -517,3 +517,100 @@ export async function uninstallAddon(id: string): Promise<number> {
 export async function setAddonOrder(id: string, order: number): Promise<void> {
   return invoke<void>("set_addon_order", { id, order });
 }
+
+// ---- F-013: embedded torrent engine + local HTTP server -----------------
+
+/**
+ * One file inside an added torrent, surfaced by `startPlayback` for the
+ * UI's "wrong file picked?" affordance. Empty for direct-URL playback.
+ */
+export type PlaybackFile = {
+  index: number;
+  relativePath: string;
+  size: number;
+  isVideo: boolean;
+};
+
+/**
+ * Response shape of `start_playback`. The `url` is what the platform
+ * player consumes (a local HTTP URL for torrent-backed playback, the
+ * passthrough URL for direct streams). `token` is the handle that
+ * `stop_playback` / `playback_status` keys off.
+ */
+export type PlaybackHandle = {
+  url: string;
+  /** Empty string for direct URLs. */
+  token: string;
+  /** `true` iff the embedded engine is serving this stream. */
+  viaTorrent: boolean;
+  fileName: string;
+  fileSize: number | null;
+  mime: string | null;
+  infoHash: string | null;
+  files: PlaybackFile[];
+  torrentId: number | null;
+};
+
+/**
+ * Discriminated input for `startPlayback`. The frontend selects:
+ *
+ * - `magnet`: `magnet:?xt=urn:btih:…` URI (or a `.torrent` http link).
+ * - `torrentBytes`: raw `.torrent` file bytes, base64-encoded.
+ * - `directUrl`: a pre-resolved HTTP(S) URL (used for the http-stream
+ *   addon variants — no torrent engine involvement).
+ */
+export type PlaybackSource =
+  | { kind: "magnet"; url: string; fileIndex?: number | null }
+  | {
+      kind: "torrentBytes";
+      bytesBase64: string;
+      fileIndex?: number | null;
+    }
+  | {
+      kind: "directUrl";
+      url: string;
+      mime?: string | null;
+      fileName?: string | null;
+    };
+
+/**
+ * `start_playback` (PRD §F-013). Adds the torrent (waiting up to the
+ * engine's `init_timeout` for metadata), picks the largest video file
+ * unless the caller supplies a `fileIndex`, registers a token with the
+ * local HTTP server, and returns the streaming URL.
+ */
+export async function startPlayback(
+  source: PlaybackSource,
+): Promise<PlaybackHandle> {
+  return invoke<PlaybackHandle>("start_playback", { source });
+}
+
+/**
+ * `stop_playback(token, deleteFiles?)` — tears down the registered
+ * session and removes the torrent from the engine. `deleteFiles`
+ * defaults to `false` so the next Play on the same title reuses the
+ * already-downloaded cache.
+ */
+export async function stopPlayback(
+  token: string,
+  deleteFiles?: boolean,
+): Promise<boolean> {
+  return invoke<boolean>("stop_playback", { token, deleteFiles });
+}
+
+/**
+ * `playback_status(token)` snapshot. The F-015 player consumes it to
+ * surface filename + size before bytes start flowing.
+ */
+export type PlaybackStatus = {
+  token: string;
+  fileName: string;
+  fileSize: number;
+  active: boolean;
+};
+
+export async function playbackStatus(
+  token: string,
+): Promise<PlaybackStatus | null> {
+  return invoke<PlaybackStatus | null>("playback_status", { token });
+}

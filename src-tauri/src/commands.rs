@@ -3229,7 +3229,7 @@ pub async fn export_logs(app: tauri::AppHandle, dest_zip: String) -> Result<u64,
         .map_err(|e| format!("export_logs failed: {e}"))
 }
 
-async fn resolve_cache_path(app: &tauri::AppHandle, db: &Db) -> Result<String, String> {
+pub async fn resolve_cache_path(app: &tauri::AppHandle, db: &Db) -> Result<String, String> {
     if let Some(custom) = db.kv_get(CACHE_PATH_KEY).await.map_err(ipc)? {
         let trimmed = custom.trim();
         if !trimmed.is_empty() {
@@ -3239,6 +3239,285 @@ async fn resolve_cache_path(app: &tauri::AppHandle, db: &Db) -> Result<String, S
     Ok(crate::paths::cache_dir_default(app)?
         .to_string_lossy()
         .into_owned())
+}
+
+// ---- F-013: torrent engine + local HTTP server -------------------------
+
+use kino_server::ServerHandle;
+use kino_torrent::{AddInput, Engine};
+
+/// Holder for the torrent engine + local HTTP server. Built once at app
+/// boot and stashed in Tauri's managed state so the `start_playback` and
+/// `stop_playback` commands can route to a single shared session.
+#[derive(Clone)]
+pub struct TorrentRuntime {
+    pub engine: Engine,
+    pub server: ServerHandle,
+}
+
+impl TorrentRuntime {
+    /// Build the runtime: open a librqbit session pointed at `cache_root`,
+    /// spawn the axum HTTP server on `127.0.0.1:0`, and return both
+    /// handles wrapped together.
+    pub async fn new(cache_root: std::path::PathBuf) -> Result<Self, String> {
+        let config = kino_torrent::EngineConfig {
+            cache_root,
+            ..Default::default()
+        };
+        let engine = Engine::new(config).await.map_err(|e| e.to_string())?;
+        let server = ServerHandle::spawn().await.map_err(|e| e.to_string())?;
+        Ok(Self { engine, server })
+    }
+}
+
+/// `start_playback` request: a magnet/torrent input plus an optional
+/// caller-chosen file index. The frontend passes one of these for each
+/// "Play" / "Resume" action in the F-010 title detail.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum PlaybackSource {
+    /// `magnet:?xt=urn:btih:…` URI. Also accepts a plain HTTP(S) URL that
+    /// points to a `.torrent` file (`AddTorrent::from_url` handles both).
+    Magnet {
+        url: String,
+        file_index: Option<usize>,
+    },
+    /// Raw `.torrent` metainfo, base64-encoded so it can cross the IPC
+    /// boundary (Tauri's IPC layer is JSON, not binary).
+    TorrentBytes {
+        bytes_base64: String,
+        file_index: Option<usize>,
+    },
+    /// A direct HTTP(S) stream URL (e.g. from an `http_url` Stremio
+    /// stream). The frontend can play this without going through the
+    /// embedded server; we simply echo the URL back inside the response
+    /// for a uniform play flow.
+    DirectUrl {
+        url: String,
+        mime: Option<String>,
+        file_name: Option<String>,
+    },
+}
+
+/// Snapshot of one file inside an added torrent, surfaced to the frontend
+/// when it needs to disambiguate which file in a season pack to play.
+#[derive(Debug, Serialize)]
+pub struct PlaybackFile {
+    pub index: usize,
+    pub relative_path: String,
+    pub size: u64,
+    pub is_video: bool,
+}
+
+/// Response payload for `start_playback`. The `url` is what the platform
+/// player consumes; `token` lets the frontend call back into
+/// `stop_playback` / `playback_status` for the same session.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybackHandle {
+    /// The URL passed to the platform player (Android `ExoPlayer` /
+    /// `libmpv`).
+    pub url: String,
+    /// Token used by `stop_playback`. Empty string for direct URLs (no
+    /// torrent session to tear down).
+    pub token: String,
+    /// `true` iff this playback is being served by the embedded engine
+    /// (vs. a direct URL pass-through).
+    pub via_torrent: bool,
+    /// File name surfaced to the player (used for Content-Disposition and
+    /// for the player's title bar).
+    pub file_name: String,
+    /// File size in bytes. `None` for direct URLs (we don't HEAD upstream).
+    pub file_size: Option<u64>,
+    /// MIME type. Best-effort from the filename extension; defaults to
+    /// `application/octet-stream` if unknown.
+    pub mime: Option<String>,
+    /// Lower-hex info hash for the torrent. `None` for direct URLs.
+    pub info_hash: Option<String>,
+    /// Full file list for torrents (lets the UI surface a file-picker if
+    /// the auto-pick chose wrong). Empty for direct URLs.
+    pub files: Vec<PlaybackFile>,
+    /// Engine-assigned id used by `stop_playback` to remove the torrent.
+    /// `None` for direct URLs.
+    pub torrent_id: Option<usize>,
+}
+
+/// Live stats for a registered playback session.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybackStatus {
+    /// The token of the session being queried.
+    pub token: String,
+    /// File name being served.
+    pub file_name: String,
+    /// File size in bytes.
+    pub file_size: u64,
+    /// `true` while the session is registered with the server.
+    pub active: bool,
+}
+
+/// `start_playback({ source })` — F-013 entry point. Adds the torrent
+/// (waiting up to `init_timeout` for metadata), picks the largest video
+/// file (or honors the caller's `file_index` hint), registers a token,
+/// and returns the streaming URL.
+#[tauri::command]
+pub async fn start_playback(
+    runtime: State<'_, TorrentRuntime>,
+    source: PlaybackSource,
+) -> Result<PlaybackHandle, String> {
+    match source {
+        PlaybackSource::DirectUrl {
+            url,
+            mime,
+            file_name,
+        } => Ok(PlaybackHandle {
+            url: url.clone(),
+            token: String::new(),
+            via_torrent: false,
+            file_name: file_name
+                .unwrap_or_else(|| extract_filename_from_url(&url).unwrap_or_default()),
+            file_size: None,
+            mime,
+            info_hash: None,
+            files: Vec::new(),
+            torrent_id: None,
+        }),
+        PlaybackSource::Magnet { url, file_index } => {
+            start_torrent_playback(&runtime, AddInput::Url(url), file_index).await
+        }
+        PlaybackSource::TorrentBytes {
+            bytes_base64,
+            file_index,
+        } => {
+            use base64::Engine as _;
+            let raw = base64::engine::general_purpose::STANDARD
+                .decode(bytes_base64.as_bytes())
+                .map_err(|e| format!("invalid base64 torrent bytes: {e}"))?;
+            start_torrent_playback(&runtime, AddInput::Bytes(raw.into()), file_index).await
+        }
+    }
+}
+
+async fn start_torrent_playback(
+    runtime: &TorrentRuntime,
+    input: AddInput,
+    requested_file_index: Option<usize>,
+) -> Result<PlaybackHandle, String> {
+    let added = runtime.engine.add(input).await.map_err(|e| e.to_string())?;
+    let chosen_index = requested_file_index.unwrap_or_else(|| {
+        // Empty torrents are rejected by Engine::add already, so the
+        // `0` fallback only kicks in if the auto-pick somehow returns
+        // None for a non-empty torrent.
+        added.pick_largest_video().map_or(0, |f| f.index)
+    });
+    if chosen_index >= added.files().len() {
+        return Err(format!(
+            "file index {chosen_index} out of range (have {})",
+            added.files().len()
+        ));
+    }
+
+    let file_name = added.file_name(chosen_index).unwrap_or("").to_string();
+    let file_size = added.file_size(chosen_index).unwrap_or(0);
+    let mime = mime_guess::from_path(&file_name)
+        .first_or_octet_stream()
+        .essence_str()
+        .to_string();
+    let info_hash = added.info_hash_hex().to_string();
+    let torrent_id = added.id();
+    let files = added
+        .files()
+        .iter()
+        .map(|f| PlaybackFile {
+            index: f.index,
+            relative_path: f.relative_path.clone(),
+            size: f.size,
+            is_video: f.is_video(),
+        })
+        .collect::<Vec<_>>();
+
+    let token = runtime
+        .server
+        .register(added, chosen_index)
+        .map_err(|e| e.to_string())?;
+    let url = runtime.server.stream_url(token);
+
+    Ok(PlaybackHandle {
+        url,
+        token: token.to_string(),
+        via_torrent: true,
+        file_name,
+        file_size: Some(file_size),
+        mime: Some(mime),
+        info_hash: Some(info_hash),
+        files,
+        torrent_id: Some(torrent_id),
+    })
+}
+
+/// `stop_playback(token, deleteFiles?)` — F-013 teardown. Unregisters the
+/// token from the local HTTP server and, if the session was torrent-
+/// backed, removes the torrent from the engine.
+///
+/// `delete_files` controls whether librqbit also wipes on-disk pieces.
+/// Defaults to `false` so the next "Play" on the same title reuses the
+/// already-downloaded cache (PRD §F-013 LRU eviction takes care of it).
+#[tauri::command]
+pub async fn stop_playback(
+    runtime: State<'_, TorrentRuntime>,
+    token: String,
+    delete_files: Option<bool>,
+) -> Result<bool, String> {
+    if token.is_empty() {
+        // Direct-URL playback: nothing to tear down.
+        return Ok(false);
+    }
+    let uuid = uuid::Uuid::parse_str(&token).map_err(|e| format!("invalid token: {e}"))?;
+    let Some(session) = runtime.server.unregister(uuid) else {
+        return Ok(false);
+    };
+    let torrent_id = session.torrent.id();
+    runtime
+        .engine
+        .remove(torrent_id, delete_files.unwrap_or(false))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+/// `playback_status(token)` — returns a minimal snapshot the F-015 player
+/// uses to surface filename + size before bytes start flowing. Returns
+/// `None` if the token is unknown.
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri command bindings take owned String / State
+pub fn playback_status(
+    runtime: State<'_, TorrentRuntime>,
+    token: String,
+) -> Result<Option<PlaybackStatus>, String> {
+    if token.is_empty() {
+        return Ok(None);
+    }
+    let uuid = uuid::Uuid::parse_str(&token).map_err(|e| format!("invalid token: {e}"))?;
+    Ok(runtime.server.session(uuid).map(|s| PlaybackStatus {
+        token: s.token.to_string(),
+        file_name: s.file_name,
+        file_size: s.file_size,
+        active: true,
+    }))
+}
+
+/// Best-effort filename extraction from a URL. Used for direct-URL playback
+/// where the caller didn't supply a filename — we surface the URL's last
+/// path segment so the player can display *something*.
+fn extract_filename_from_url(url: &str) -> Option<String> {
+    let path = url.split('?').next()?;
+    let path = path.split('#').next()?;
+    let last = path.rsplit('/').next()?;
+    if last.is_empty() {
+        None
+    } else {
+        Some(last.to_string())
+    }
 }
 
 #[cfg(test)]

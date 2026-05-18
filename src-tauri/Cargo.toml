@@ -40,6 +40,14 @@ kino-metadata = { path = "../crates/kino-metadata" }
 # F-007: kino-addons supplies the Stremio addon protocol client driving
 # install / list / catalog / meta / stream calls.
 kino-addons = { path = "../crates/kino-addons" }
+# F-013: embedded torrent engine + local HTTP server (`start_playback` /
+# `stop_playback` Tauri commands).
+kino-torrent = { path = "../crates/kino-torrent" }
+kino-server = { path = "../crates/kino-server" }
+bytes = { workspace = true }
+uuid = { workspace = true }
+base64 = "0.22"
+mime_guess = { workspace = true }
 
 # Platform-aware directory resolution for the per-target DB path. PRD §3
 # Storage layout: `$XDG_CONFIG_HOME/kino/` on Linux. Android resolves via the
