@@ -119,7 +119,7 @@ const DEFAULT_VIEW: SettingsView = {
 
 const DEFAULT_APP_INFO: AppInfo = {
   name: "kino",
-  version: "0.0.0",
+  version: "1.0.0-alpha.1",
   commit: "unknown",
   repository: "",
   license: "MIT",
