@@ -614,3 +614,96 @@ export async function playbackStatus(
 ): Promise<PlaybackStatus | null> {
   return invoke<PlaybackStatus | null>("playback_status", { token });
 }
+
+// ---- F-014: adaptive buffer ---------------------------------------------
+
+/**
+ * Wire-shaped payload of the `buffer:status` Tauri event (PRD §F-014).
+ * Mirrors `BufferStatusEvent` in `src-tauri/src/commands.rs`. The player
+ * subscribes via [`onBufferStatus`] and renders the "Buffering for smooth
+ * playback" overlay whenever `state !== "safe"`.
+ */
+export type BufferStatusEvent = {
+  token: string;
+  state: "safe" | "needsPrebuffer" | "rebuffer";
+  /** Present when `state === "needsPrebuffer"`. */
+  requiredPrebufferS: number | null;
+  dlRateBytesPerS: number;
+  piecesAheadSeconds: number;
+  bytesDownloaded: number;
+  fileSizeBytes: number;
+  positionS: number;
+  durationS: number;
+  etaSeconds: number | null;
+};
+
+/**
+ * `buffer_start_monitor(token, durationS)` (PRD §F-014). Spins up the
+ * adaptive-buffer state machine + sampler for an in-flight playback
+ * session and starts emitting `buffer:status` events every 5 s plus on
+ * every `bufferReportPosition` call. Idempotent — calling twice on the
+ * same token replaces the prior monitor.
+ */
+export async function bufferStartMonitor(
+  token: string,
+  durationS: number,
+): Promise<void> {
+  await invoke<void>("buffer_start_monitor", { token, durationS });
+}
+
+/**
+ * `buffer_stop_monitor(token)` (PRD §F-014). Tears down the monitor +
+ * event bridge for the given token. Returns `true` if a monitor was
+ * active. Called on player exit. `stop_playback` also auto-stops the
+ * monitor, so explicit teardown is only needed when the player wants to
+ * stop monitoring without stopping the underlying stream.
+ */
+export async function bufferStopMonitor(token: string): Promise<boolean> {
+  return invoke<boolean>("buffer_stop_monitor", { token });
+}
+
+/**
+ * `buffer_report_position(token, positionS)` (PRD §F-014). Pushes a fresh
+ * playhead value into the monitor. PRD §8 caps cadence at
+ * `PLAYER_POSITION_INTERVAL_S = 5s`; the player calls this every 5 s and
+ * on every seek so the state machine recomputes immediately.
+ */
+export async function bufferReportPosition(
+  token: string,
+  positionS: number,
+): Promise<boolean> {
+  return invoke<boolean>("buffer_report_position", { token, positionS });
+}
+
+/**
+ * `buffer_status(token)` — one-shot snapshot of the monitor's current
+ * state. Returns `null` if no monitor is registered for `token`. The
+ * player uses this for its first paint so the overlay shows correct data
+ * before the first recompute event arrives.
+ */
+export async function bufferStatus(
+  token: string,
+): Promise<BufferStatusEvent | null> {
+  return invoke<BufferStatusEvent | null>("buffer_status", { token });
+}
+
+/**
+ * Subscribe to the `buffer:status` Tauri event. Returns a `Promise` of
+ * an `unlisten` function; callers should call it from `onCleanup` to
+ * tear down the listener.
+ *
+ * Resolves to a no-op `unlisten` when the Tauri bridge isn't present
+ * (vitest jsdom / plain `vite dev`), so consumer code can `await` it
+ * unconditionally.
+ */
+export async function onBufferStatus(
+  handler: (status: BufferStatusEvent) => void,
+): Promise<() => void> {
+  if (!hasTauri()) {
+    return () => {};
+  }
+  // Lazy import so the @tauri-apps/api/event chunk is only pulled into
+  // bundles that actually wire the player UI.
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<BufferStatusEvent>("buffer:status", (e) => handler(e.payload));
+}

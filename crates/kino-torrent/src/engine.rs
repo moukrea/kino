@@ -260,6 +260,13 @@ impl AddedTorrent {
             .get(file_index)
             .map(|f| f.relative_path.as_str())
     }
+
+    /// Access to the underlying `librqbit::ManagedTorrent`. `pub(crate)` so
+    /// the stats / scheduler modules can pull `ManagedTorrent::stats` without
+    /// re-exposing librqbit types through the public surface (PRD ADR-101).
+    pub(crate) fn inner(&self) -> &Arc<ManagedTorrent> {
+        &self.inner
+    }
 }
 
 /// kino's torrent engine: wraps a single `librqbit::Session`.

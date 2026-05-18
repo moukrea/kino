@@ -3244,15 +3244,35 @@ pub async fn resolve_cache_path(app: &tauri::AppHandle, db: &Db) -> Result<Strin
 // ---- F-013: torrent engine + local HTTP server -------------------------
 
 use kino_server::ServerHandle;
-use kino_torrent::{AddInput, Engine};
+use kino_torrent::{
+    AddInput, BufferMonitor, BufferState, BufferStatus, Engine, LibrqbitStatsSource, MonitorConfig,
+};
+use std::sync::Mutex as StdMutex;
+use tauri::Emitter;
+use tokio::task::JoinHandle;
 
 /// Holder for the torrent engine + local HTTP server. Built once at app
 /// boot and stashed in Tauri's managed state so the `start_playback` and
 /// `stop_playback` commands can route to a single shared session.
+///
+/// As of Session 019 the runtime also owns the F-014 buffer-monitor
+/// registry: one [`BufferMonitor`] per active playback token plus a
+/// per-monitor bridge task that fans `BufferStatus` updates onto the
+/// Tauri `buffer:status` event.
 #[derive(Clone)]
 pub struct TorrentRuntime {
     pub engine: Engine,
     pub server: ServerHandle,
+    pub monitors: Arc<StdMutex<HashMap<uuid::Uuid, MonitorEntry>>>,
+}
+
+/// One entry in the [`TorrentRuntime::monitors`] map. Holds the monitor
+/// handle and the bridge task that re-emits status changes as Tauri
+/// events. Dropping `BufferMonitor` shuts down its internal task; the
+/// bridge task observes the receiver closing and exits on its own.
+pub struct MonitorEntry {
+    pub monitor: BufferMonitor,
+    pub bridge: JoinHandle<()>,
 }
 
 impl TorrentRuntime {
@@ -3266,7 +3286,11 @@ impl TorrentRuntime {
         };
         let engine = Engine::new(config).await.map_err(|e| e.to_string())?;
         let server = ServerHandle::spawn().await.map_err(|e| e.to_string())?;
-        Ok(Self { engine, server })
+        Ok(Self {
+            engine,
+            server,
+            monitors: Arc::new(StdMutex::new(HashMap::new())),
+        })
     }
 }
 
@@ -3473,6 +3497,18 @@ pub async fn stop_playback(
         return Ok(false);
     }
     let uuid = uuid::Uuid::parse_str(&token).map_err(|e| format!("invalid token: {e}"))?;
+
+    // Tear down any F-014 buffer monitor that was running against this
+    // session before we lose the AddedTorrent handle.
+    if let Some(MonitorEntry { bridge, .. }) = runtime
+        .monitors
+        .lock()
+        .expect("monitor registry poisoned")
+        .remove(&uuid)
+    {
+        bridge.abort();
+    }
+
     let Some(session) = runtime.server.unregister(uuid) else {
         return Ok(false);
     };
@@ -3504,6 +3540,186 @@ pub fn playback_status(
         file_size: s.file_size,
         active: true,
     }))
+}
+
+// ---- F-014: adaptive buffer monitor commands ---------------------------
+
+/// Serialized payload for the `buffer:status` Tauri event emitted on every
+/// monitor recompute (PRD §F-014 player coordination). Mirrors
+/// [`kino_torrent::BufferStatus`] with the camelCase wire shape the
+/// frontend bindings expect.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BufferStatusEvent {
+    pub token: String,
+    pub state: BufferStateWire,
+    pub required_prebuffer_s: Option<f64>,
+    pub dl_rate_bytes_per_s: f64,
+    pub pieces_ahead_seconds: f64,
+    pub bytes_downloaded: u64,
+    pub file_size_bytes: u64,
+    pub position_s: f64,
+    pub duration_s: f64,
+    pub eta_seconds: Option<f64>,
+}
+
+/// String-shaped enum used in the `buffer:status` event payload. We can't
+/// directly serialize [`BufferState`] because Tauri events go through the
+/// JS bridge and the `tag` / `content` representation of an internally-
+/// tagged Rust enum is awkward to consume from TS. A simple string tag +
+/// sibling `required_prebuffer_s` field is the cleanest wire shape.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BufferStateWire {
+    Safe,
+    NeedsPrebuffer,
+    Rebuffer,
+}
+
+impl BufferStatusEvent {
+    fn from_status(token: uuid::Uuid, s: &BufferStatus) -> Self {
+        let (state, required_prebuffer_s) = match s.state {
+            BufferState::Safe => (BufferStateWire::Safe, None),
+            BufferState::NeedsPrebuffer {
+                required_prebuffer_s,
+            } => (BufferStateWire::NeedsPrebuffer, Some(required_prebuffer_s)),
+            BufferState::Rebuffer => (BufferStateWire::Rebuffer, None),
+        };
+        Self {
+            token: token.to_string(),
+            state,
+            required_prebuffer_s,
+            dl_rate_bytes_per_s: s.dl_rate_bytes_per_s,
+            pieces_ahead_seconds: s.pieces_ahead_seconds,
+            bytes_downloaded: s.bytes_downloaded,
+            file_size_bytes: s.file_size_bytes,
+            position_s: s.position_s,
+            duration_s: s.duration_s,
+            eta_seconds: s.eta_seconds,
+        }
+    }
+}
+
+/// `buffer_start_monitor(token, duration_s)` — spin up the F-014 adaptive
+/// buffer monitor for an in-flight playback session. Idempotent: calling
+/// twice on the same token replaces the previous monitor (the duration
+/// may have been re-probed by the player).
+///
+/// Once running, the monitor emits a `buffer:status` Tauri event every 5 s
+/// (PRD §F-014 `RECOMPUTE_INTERVAL_S`) and additionally on every
+/// `buffer_report_position` call. The frontend overlay subscribes to the
+/// event and shows the "Buffering for smooth playback" UI when the state
+/// is anything other than `Safe`.
+#[tauri::command]
+pub async fn buffer_start_monitor(
+    app: tauri::AppHandle,
+    runtime: State<'_, TorrentRuntime>,
+    token: String,
+    duration_s: f64,
+) -> Result<(), String> {
+    let uuid = uuid::Uuid::parse_str(&token).map_err(|e| format!("invalid token: {e}"))?;
+    let session = runtime
+        .server
+        .session(uuid)
+        .ok_or_else(|| "unknown playback token".to_string())?;
+
+    let cfg = MonitorConfig::new(session.file_size, duration_s.max(0.0));
+    let source = LibrqbitStatsSource::new(session.torrent.clone(), session.file_index);
+    let monitor = BufferMonitor::spawn(cfg, source);
+
+    // Bridge: subscribe to status updates, fan onto Tauri events.
+    let mut rx = monitor.status_rx();
+    let app_handle = app.clone();
+    let bridge_token = uuid;
+    let bridge = tokio::spawn(async move {
+        // Emit the initial state so the frontend has something to render
+        // immediately without waiting for the first recompute tick.
+        let initial = rx.borrow_and_update().clone();
+        let _ = app_handle.emit(
+            "buffer:status",
+            BufferStatusEvent::from_status(bridge_token, &initial),
+        );
+        while rx.changed().await.is_ok() {
+            let next = rx.borrow_and_update().clone();
+            if let Err(e) = app_handle.emit(
+                "buffer:status",
+                BufferStatusEvent::from_status(bridge_token, &next),
+            ) {
+                tracing::warn!(token = %bridge_token, error = %e, "buffer:status emit failed");
+            }
+        }
+    });
+
+    // Atomically swap in the new entry, dropping (and shutting down) any
+    // prior monitor for this token.
+    let prev = runtime
+        .monitors
+        .lock()
+        .expect("monitor registry poisoned")
+        .insert(uuid, MonitorEntry { monitor, bridge });
+    if let Some(MonitorEntry { bridge, .. }) = prev {
+        bridge.abort();
+    }
+    Ok(())
+}
+
+/// `buffer_stop_monitor(token)` — tear down the monitor + bridge task
+/// associated with `token`. Returns `true` if a monitor was active.
+#[tauri::command]
+pub async fn buffer_stop_monitor(
+    runtime: State<'_, TorrentRuntime>,
+    token: String,
+) -> Result<bool, String> {
+    let uuid = uuid::Uuid::parse_str(&token).map_err(|e| format!("invalid token: {e}"))?;
+    let entry = runtime
+        .monitors
+        .lock()
+        .expect("monitor registry poisoned")
+        .remove(&uuid);
+    if let Some(MonitorEntry { bridge, .. }) = entry {
+        bridge.abort();
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// `buffer_report_position(token, position_s)` — push a fresh playhead
+/// position into the F-014 monitor. PRD §F-014 says the state machine
+/// recomputes on events; this is the canonical "player tick" path. The
+/// player calls this every PRD §8 `PLAYER_POSITION_INTERVAL_S` (5 s) and
+/// on every seek.
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri takes owned values
+pub fn buffer_report_position(
+    runtime: State<'_, TorrentRuntime>,
+    token: String,
+    position_s: f64,
+) -> Result<bool, String> {
+    let uuid = uuid::Uuid::parse_str(&token).map_err(|e| format!("invalid token: {e}"))?;
+    let g = runtime.monitors.lock().expect("monitor registry poisoned");
+    if let Some(entry) = g.get(&uuid) {
+        entry.monitor.update_position(position_s.max(0.0));
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// `buffer_status(token)` — one-shot snapshot of the monitor's current
+/// state. Returns `None` if no monitor is registered for `token`. Used by
+/// the player's first-frame paint to render the overlay without waiting
+/// for the first recompute event.
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri takes owned values
+pub fn buffer_status(
+    runtime: State<'_, TorrentRuntime>,
+    token: String,
+) -> Result<Option<BufferStatusEvent>, String> {
+    let uuid = uuid::Uuid::parse_str(&token).map_err(|e| format!("invalid token: {e}"))?;
+    let g = runtime.monitors.lock().expect("monitor registry poisoned");
+    Ok(g.get(&uuid)
+        .map(|e| BufferStatusEvent::from_status(uuid, &e.monitor.current())))
 }
 
 /// Best-effort filename extraction from a URL. Used for direct-URL playback

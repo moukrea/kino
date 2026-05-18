@@ -191,5 +191,14 @@
     "lastActionLabel": "Last action",
     "lastActionNone": "(none)",
     "demoHint": "Press arrow keys, Enter, Esc, F10, /, or Space — or connect a gamepad."
+  },
+  "buffer": {
+    "title": "Buffering for smooth playback",
+    "rebuffering": "Rebuffering…",
+    "ariaLabel": "Buffer status overlay",
+    "downloadRate": "Download: {{rate}}",
+    "eta": "Time left: {{eta}}",
+    "ratePerSecond": "{{n}}/s",
+    "etaUnknown": "unknown"
   }
 }
