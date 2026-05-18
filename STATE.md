@@ -1,9 +1,9 @@
 # kino — Agent State
 
 **PRD version:** 1.0 (locked)
-**Status:** v1.0.0-alpha.1 staged on main; release pipeline now fireable via Actions UI (workflow_dispatch). Tag push from agent still BLOCKED by harness git proxy, but tag is created by `gh release create --target` on dispatch. **Session 026 fixed the build-android Kotlin compile regression**: the release pipeline will now produce all 4 Android APK artifacts (universal + arm64-v8a + armeabi-v7a + x86_64) when the human fires the dispatch.
-**Last session:** 026 (§6B regression fix: build-android Kotlin compile errors — `Util.isAutomotive` property-vs-function in `Capabilities.kt` + `JSObject.NULL` inherited-static access in `Events.kt`)
-**Next session:** none required from the agent — human runs `Actions → release → Run workflow` with `version = 1.0.0-alpha.1` (preferred) OR pushes the tag from a directly-authenticated machine OR cuts the release via the GitHub UI. See PRD Issues entry "§F-018 release tag push blocked by harness Git proxy" for the three workarounds, now in priority order with workflow_dispatch as the recommended path.
+**Status:** v1.0.0-alpha.1 release pipeline shipped, BUT a Session 027 §6A audit (human-requested, documentation-only) found that six features marked `[x]` have unmet PRD-locked code-acceptance criteria, and three §5 non-functional requirements (panic hook, frontend ErrorBoundary, advanced-logging toggle) are not implemented. `F-003`, `F-006`, `F-013`, `F-014`, `F-015`, `F-016` have been flipped back to `[ ]`. **§6A is no longer claimable.** The PRD North Star is not yet honored. Sessions 028+ must close the gaps listed under the new "§6A Code-Acceptance Regressions" section below before the next release pass. See ADR-118.
+**Last session:** 027 (§6A audit — documentation-only; re-opened F-003 / F-006 / F-013 / F-014 / F-015 / F-016; filed §6A Code-Acceptance Regressions section; ADR-118 locks the audit's interpretation of §6A condition 2)
+**Next session:** 028 — pick the highest-impact §6A regression from the list below. Recommended order: (1) F-006 frontend availability filter (entire UI surface missing), (2) §5 reliability bundle (panic hook + ErrorBoundary + advanced-logging toggle — small, all three together fit one session), (3) F-016 directory picker + license-text accessor, (4) F-003 ETag handling, (5) F-015 Android DV decoder selector, (6) F-013 / F-014 librqbit-blocked items (require either an upstream PR, a fork, or a human PRD revision — file as PRD Issue if blocked).
 
 ---
 
@@ -68,6 +68,157 @@ a hard requirement.
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 027 — §6A audit re-opens F-003 / F-006 / F-013 / F-014 / F-015 / F-016
+
+**Branch:** `claude/verify-prd-coverage-tLGZs`
+(Harness-supplied; see ADR-033.)
+
+**Scope chosen:** Documentation-only §6A code-acceptance audit triggered
+by a direct human request ("ensure the PRD is completely covered in
+current implementation"). No code edits in this session; only
+`STATE.md` is touched. The PR's value is to re-flip Feature Tracker
+checkboxes that were optimistically marked `[x]` despite unmet
+PRD-locked acceptance criteria, so that the next harness sessions
+pick the gaps up via the Step 2 protocol ("the next not-started or
+in-progress feature") rather than skating past them on the basis of
+a stale tracker.
+
+**Audit method:** seven parallel `Explore` agents cross-checked each
+feature block of `PRD.md` §4 against the actual code on `main`,
+followed by direct grep / file-read verification of every reported
+gap. Each finding is recorded with a `file:line` citation in the new
+"§6A Code-Acceptance Regressions" section.
+
+**Findings (full detail in the new "§6A Code-Acceptance Regressions"
+section below; one-line summary here):**
+
+1. **F-006** — Entire frontend availability-filter UI layer is
+   missing. Backend is correct (`commands.rs:1210-1308` implements
+   the 8-permit Semaphore, the 5 s timeout, the 30-min cache). The
+   frontend never calls `check_availability`, never renders a
+   skeleton state, never surfaces the "no source" badge, and the
+   "Show unavailable titles" toggle does not exist in Settings.
+   Catalog rows render every tile unconditionally. PRD §F-006
+   explicitly locks "Unavailable (hidden by default)" tile state.
+2. **F-003** — ETag handling is unimplemented. `response_cache.etag`
+   exists in the schema but `kino-core/src/db.rs:388` explicitly
+   nulls it out on UPSERT; no client sends `If-None-Match`; no `304
+   Not Modified` path. PRD §F-003 locks "ETag handled where the
+   provider supports it; stored in `response_cache.etag`".
+3. **F-013** — `MAX_CONNECTIONS_PER_TORRENT = 200` is defined in
+   `kino-core::constants` but is never passed to librqbit
+   (`engine.rs:310-319` builds `SessionOptions` without it).
+   ADR-103 deferred this on librqbit-API grounds, but PRD §F-013
+   locks the cap without exception. Either upstream / fork librqbit
+   or file as a PRD revision request.
+4. **F-014** — Piece-priority windows (HIGHEST `[pos, pos+60s]`,
+   HIGH `[pos+60s, pos+300s]`, last-piece HIGH) are not assigned
+   to librqbit. ADR-106 deferred this on the same upstream grounds.
+   Same disposition path as F-013.
+5. **F-015** — (a) Android DV decoder forcing is unimplemented:
+   `PlayerActivity.kt:193` uses `MediaCodecSelector.DEFAULT` for
+   all content even though `Capabilities.kt` already probes DV
+   support and the PRD locks "force selection of a DV-capable
+   decoder" for profile-5/8.1 content; the capabilities snapshot
+   is only displayed in the info panel today. (b) Linux libmpv
+   runs as an out-of-process subprocess (ADR-108) rather than the
+   PRD-locked "rendered into a GL surface owned by the Tauri
+   window".
+6. **F-016** — (a) §F-016 §4's "Path (with directory picker)" ships
+   as a plain text input (ADR-095; `tauri-plugin-dialog` not on
+   the dependency tree). (b) §F-016 §8's "License: MIT, full text
+   accessible" surfaces only the literal string `"MIT"` at
+   `Settings.tsx:1334` — the LICENSE body is never rendered or
+   linked to.
+7. **§5 Reliability — Rust panic hook NOT installed.** No
+   `std::panic::set_hook` call anywhere in `src-tauri/src/`. A
+   panic exits silently with no log entry. PRD §5 locks "Panic
+   hook installed in Rust; panics logged with backtrace before
+   exit".
+8. **§5 Reliability — Frontend root `<ErrorBoundary>` missing.**
+   `App.tsx` has only one local `.catch()` at line 81. PRD §5
+   locks "Frontend errors caught at root error boundary and
+   logged".
+9. **§5 Logging — Advanced logging toggle not wired.**
+   `src-tauri/src/lib.rs:194-195` honors only `RUST_LOG` env or
+   falls back to `EnvFilter::new("info")`; no path reads from the
+   `kv_get("advanced_logging")` setting and adjusts the filter.
+   PRD §5 locks "DEBUG when 'advanced logging' toggle is on in
+   settings".
+
+**Non-gaps (verified clean during the audit, kept here so future
+sessions don't re-question them):** F-001 scaffolding; F-002 schema
++ WAL + pool 4; F-004 trending math (weighted 0.45/0.35/0.20,
+ChaCha20Rng-seeded daily shuffle); F-005 6-tier artwork cascade;
+F-007 endpoints + manifest validation + Cinemeta non-removable +
+4 recommended addons; F-008 / F-009 home layout + nav rail + 600 ms
+info overlay + virtualization; F-010 detail view + stream sort +
+the 4 PRD §8 parse fixtures matching exact tags; F-011 search
+(300 ms debounce, `^tt\d+$` shortcut, dedup); F-012 CW (5 s save,
+0.95 completion, 24 h auto-remove, all 3 series branches);
+F-013 axum server (Range, 206/200, UUID v4 token, 14 trackers,
+DHT/PEX/LSD enabled); F-014 state machine + 30 s rolling rate +
+monitor + UI overlay; F-015 Linux `mpv.conf` (9 directives, matching
+PRD verbatim); F-017 input profile detection; F-018 release
+pipeline (all 9 artifacts, locked names, Android `minSdk` /
+`targetSdk` / `compileSdk` pins, leanback, signed APK). §8 numeric
+constants (every value exact). §8 parsing regex set. §8 14
+trackers. §8 4 recommended addons. The audit re-affirms these and
+the closed F-XXX boxes for F-001 / F-002 / F-004 / F-005 / F-007
+/ F-008 / F-009 / F-010 / F-011 / F-012 / F-017 / F-018.
+
+**Documented deviation, NOT a §6A regression: ADR-019 / 5 vs 6
+workspace crates.** PRD §3 + ADR-019 lock the workspace at 5 crates
+(`kino-core`, `kino-torrent`, `kino-server`, `kino-addons`,
+`kino-metadata`); the repo carries 6 (adds `kino-player`) plus the
+`tauri-plugin-kino-player` plugin crate at `android/player-plugin/`.
+ADR-114 documents the split for F-015 cross-platform isolation. The
+audit's take: the underlying ARCHITECTURAL invariant ("one crate
+per concern, isolated platform impls behind a trait") is honored;
+the literal crate count is exceeded. Worth a future PRD revision
+to bump the locked count to 6 (or to "5 lib crates + 1 plugin
+crate"), but not a §6A regression — no acceptance criterion within
+F-001 / F-015 mentions a literal crate count.
+
+**Files added (summary):**
+
+- `STATE.md` — top preamble updated, this session entry prepended,
+  six Feature Tracker checkboxes flipped, ADR-118 appended, three
+  Known Issues / Tech Debt bullets appended, new "§6A
+  Code-Acceptance Regressions" section inserted above "§6B
+  Verification".
+
+**No code changes.** Verification suite was not re-run because the
+diff is `STATE.md` only; CI's `lint` + `test` jobs cover the
+doc-only edit by running unchanged against the existing tree.
+
+**Features advanced:**
+
+- F-003: complete → incomplete (ETag handling unimplemented)
+- F-006: complete → incomplete (frontend filter UI missing)
+- F-013: complete → incomplete (`MAX_CONNECTIONS_PER_TORRENT` not
+  enforced)
+- F-014: complete → incomplete (piece-priority windows not
+  assigned)
+- F-015: complete → incomplete (Android DV selector + Linux GL
+  surface)
+- F-016: complete → incomplete (directory picker + license-text
+  accessor)
+
+**ADRs filed:** ADR-118.
+
+**Heads-up for Session 028:** see the top preamble's "Next session"
+guidance for the recommended order. The F-006 frontend wiring is
+the largest single gap (entire UI surface) but is well-contained
+inside the SolidJS routes and the existing `<Row>` / `<Tile>` API;
+expect a single session to cover it including the Settings toggle.
+The §5 reliability bundle (panic hook + ErrorBoundary + advanced
+logging toggle) is small enough that one session can ship all
+three together. The librqbit-blocked items (F-013 / F-014) need a
+strategic decision — see ADR-118 for the three escape hatches.
+
+---
 
 ### Session 026 — §6B regression fix: build-android Kotlin compile errors
 
@@ -6164,9 +6315,14 @@ implementation" split.
   migrations + install_id bootstrap, KV/CW/addons API + Tauri commands, 16 tests)_
 
 ### Metadata & Catalogs
-- [x] F-003: Metadata clients (TMDB / Trakt / TVDB / Fanart.tv) _(Session 004:
+- [ ] F-003: Metadata clients (TMDB / Trakt / TVDB / Fanart.tv) _(Session 004:
   per-provider HTTP clients with locked retry/User-Agent, `test_credentials()`
-  on each, 4 Tauri test commands, 12 wiremock tests)_
+  on each, 4 Tauri test commands, 12 wiremock tests. **Re-opened by Session
+  027 audit:** PRD §F-003 "ETag handled where the provider supports it;
+  stored in `response_cache.etag`" is unimplemented — `db.rs:388` writes
+  `etag = NULL` on UPSERT, no client sends `If-None-Match`, no `304 Not
+  Modified` path. See "§6A Code-Acceptance Regressions / F-003" for the
+  closure plan.)_
 - [x] F-004: Trending aggregation with diversity _(Session 006: per-provider
   trending fetchers, the locked merge/split/alternate/seeded-shuffle
   aggregator, `get_trending` Tauri command, day-long output cache via
@@ -6176,13 +6332,21 @@ implementation" split.
   `resolve_artwork` Tauri command, 7-day cache via `response_cache`
   keyed by `(title_id, kind, lang_chain_hash)`, cross-provider id
   resolution via TMDB `/find` + `/external_ids`, 27 tests)_
-- [x] F-006: Source availability filter _(Session 009:
-  `check_availability(items)` Tauri command with Semaphore-bounded
-  8-in-flight concurrency, 5s per-request timeout (reqwest-native),
-  30-min `stream_availability` cache, per-addon stream-resource +
-  kind manifest filter; `Manifest::serves_stream` helper in
-  kino-addons; three new `Db` methods (`availability_get_fresh` /
-  `availability_list_fresh` / `availability_upsert_many`); 22 tests)_
+- [ ] F-006: Source availability filter _(Session 009 shipped the
+  BACKEND only: `check_availability(items)` Tauri command with
+  Semaphore-bounded 8-in-flight concurrency, 5s per-request timeout
+  (reqwest-native), 30-min `stream_availability` cache, per-addon
+  stream-resource + kind manifest filter; `Manifest::serves_stream`
+  helper in kino-addons; three new `Db` methods
+  (`availability_get_fresh` / `availability_list_fresh` /
+  `availability_upsert_many`); 22 tests. **Re-opened by Session 027
+  audit:** the FRONTEND surface required by PRD §F-006 is missing —
+  catalog rows never call `check_availability`, there's no tile
+  loading-skeleton state, no "no source" badge, and the "Show
+  unavailable titles" toggle does not exist in Settings (the
+  default-OFF behavior PRD locks). All catalog rows render every
+  tile unconditionally. See "§6A Code-Acceptance Regressions /
+  F-006" for the closure plan.)_
 - [x] F-007: Stremio addon protocol client _(Session 008: `AddonClient`
   covering all seven Stremio protocol endpoints, manifest validation,
   `stremio://` URL normalization, `install_addon` / `uninstall_addon`
@@ -6241,7 +6405,7 @@ implementation" split.
   "Up next: Sxx Eyy") + per-tile manual remove via Y / Menu /
   right-click / long-press wired through the new `<Focusable>
   onContext` prop. 24 new Rust tests + 16 new frontend tests.)_
-- [x] F-016: Settings screen _(Session 016: full PRD §F-016 §1-§8
+- [ ] F-016: Settings screen _(Session 016: full PRD §F-016 §1-§8
   form tree (API keys / Addons / Language / Cache / Buffer / Player
   (Android-only) / Display / About) with 28 KV-backed user-tunable
   settings, validation + normalization via `settings::validate_setting`,
@@ -6251,7 +6415,15 @@ implementation" split.
   `<config>/logs/`, zip-based log export, confirmation-modal-gated
   Reset, App.tsx boot-time `settingsGetAll()` for UI language +
   input override persistence, full D-pad navigability via the F-017
-  `<Focusable>` primitive. 29 new Rust tests + 20 new frontend tests.)_
+  `<Focusable>` primitive. 29 new Rust tests + 20 new frontend tests.
+  **Re-opened by Session 027 audit:** two PRD-locked widgets are
+  not implemented — (a) §F-016 §4 "Path (with directory picker)"
+  ships as a plain text input (ADR-095; `tauri-plugin-dialog` not
+  on the dependency tree), and (b) §F-016 §8 "License: MIT, full
+  text accessible" surfaces only the string `"MIT"` at
+  `Settings.tsx:1334` with no link / dialog rendering the LICENSE
+  body. See "§6A Code-Acceptance Regressions / F-016" for the
+  closure plan.)_
 - [x] F-017: Input handling _(Session 010: per-platform input
   profile detection + auto-adaptation, locked PRD §F-017
   keyboard / gamepad action maps, focus manager with geometric
@@ -6259,7 +6431,7 @@ implementation" split.
   input demonstrator. 58 frontend tests added.)_
 
 ### Streaming
-- [x] F-013: Embedded torrent engine _(Session 018: librqbit-backed
+- [ ] F-013: Embedded torrent engine _(Session 018: librqbit-backed
       engine with locked PRD §F-013 config (DHT/PEX/LSD on, 14 PRD §8
       supplementary trackers, OS-assigned port, cache root from
       `cache.path` settings); axum local HTTP server on
@@ -6274,8 +6446,19 @@ implementation" split.
       404). Piece-priority scheduler and LRU cache eviction deferred
       to F-014 per PRD wording. ADR-101 (FileStream marker trait),
       ADR-102 (base64 IPC), ADR-103 (no v1 connection cap),
-      ADR-104 (64 KiB chunks), ADR-105 (no multipart byteranges))._
-- [x] F-014: Adaptive buffer _(Session 019: pure PRD §F-014 state
+      ADR-104 (64 KiB chunks), ADR-105 (no multipart byteranges).
+      **Re-opened by Session 027 audit:** PRD §F-013 locks "Max
+      connections per torrent: 200" with no exception clause.
+      `MAX_CONNECTIONS_PER_TORRENT = 200` exists in
+      `kino-core::constants` but is never passed to librqbit
+      (`engine.rs:310-319` builds `SessionOptions` without it).
+      ADR-103 deferred the cap on librqbit-API grounds; the audit
+      treats this as a §6A regression rather than acceptable
+      polish. Closure paths: (a) upstream PR exposing the option,
+      (b) fork librqbit, (c) swap to a different torrent engine,
+      (d) PRD revision request. See "§6A Code-Acceptance
+      Regressions / F-013" and ADR-118.)_
+- [ ] F-014: Adaptive buffer _(Session 019: pure PRD §F-014 state
       machine in `kino_torrent::scheduler::compute_state`
       (SAFE / NEEDS_PREBUFFER / REBUFFER per locked pseudocode), 30-s
       `RollingRate` estimator, `pieces_ahead_seconds` helper;
@@ -6293,8 +6476,15 @@ implementation" split.
       NEEDS_PREBUFFER (scripted source), position-update → recompute.
       Piece-priority window assignment to librqbit deferred per
       ADR-106 (8.1.1 keeps the API `pub(crate)`); v1 relies on
-      stream-mode prioritisation.)_
-- [x] F-015: Native player integration _(Session 020: backend / Linux
+      stream-mode prioritisation. **Re-opened by Session 027
+      audit:** PRD §F-014 locks an explicit piece-priority mapping
+      (HIGHEST `[pos, pos+60s]`, HIGH `[pos+60s, pos+300s]`,
+      last-piece HIGH, others NORMAL) — the constants
+      `PIECE_PRIORITY_HIGH_WINDOW_S` and `_MED_WINDOW_S` are
+      defined but never consumed. Same closure paths as F-013
+      (upstream / fork / engine swap / PRD revision). See "§6A
+      Code-Acceptance Regressions / F-014" and ADR-118.)_
+- [ ] F-015: Native player integration _(Session 020: backend / Linux
       mpv subprocess driver + `PlayerHandle` trait + Tauri command
       surface + bridge task feeding CW + F-014 monitor; see ADR-108.
       Session 021: SolidJS `Player.tsx` overlay route at `/player`
@@ -6320,9 +6510,22 @@ implementation" split.
       first drop on overflow (ADR-113), stub driver registered on
       non-Android targets so the plugin shell stays uniform
       (ADR-114), `(C.TRACK_TYPE shl 32) | index` track-id encoding
-      (ADR-115). PRD §F-015 code-acceptance items satisfied; §6B
-      hardware verification (Shield Pro / phone / DV / Atmos / ASS
-      rendering) remains for the human.)_
+      (ADR-115). PRD §F-015 code-acceptance items previously
+      claimed satisfied; §6B hardware verification (Shield Pro /
+      phone / DV / Atmos / ASS rendering) remains for the human.
+      **Re-opened by Session 027 audit:** (a) PRD §F-015 Android
+      "force selection of a DV-capable decoder" is unimplemented —
+      `PlayerActivity.kt:193` uses `MediaCodecSelector.DEFAULT` for
+      all content even though `Capabilities.kt` probes DV support;
+      the snapshot is only displayed in the info panel. A custom
+      `MediaCodecSelector` that, on DV profile-5/8.1 streams,
+      filters `MediaCodecList` results to codecs whose
+      `CodecCapabilities.profileLevels` declare a `DolbyVisionProfile`
+      entry is required. (b) PRD §F-015 / ADR-011 Linux locks
+      "rendered into a GL surface owned by the Tauri window";
+      ADR-108 deferred to an mpv subprocess driver. The audit
+      treats both as §6A regressions. See "§6A Code-Acceptance
+      Regressions / F-015" for closure plan.)_
 
 ### Release
 - [x] F-018: Build, packaging, distribution _(Session 022:
@@ -6444,6 +6647,7 @@ Additional ADRs filed by sessions:
 | ADR-115 | F-015 Android track IDs are encoded as `(C.TRACK_TYPE shl 32) | track_index` `Long` values. Media3 doesn't surface a stable per-track id; the closest natural identifier is `(TrackGroup, trackIndex)`. Packing track-type (audio / text / video) into the high byte of a 64-bit id lets the Rust side use a single `Option<i64>` for both audio and subtitle selection without ambiguity. `applyTrackOverride` round-trips the encoding back to the matching `TrackGroup` + index. Stable across track-list refreshes because the order of `Tracks.groups` is stable within a single playback session. | 023 |
 | ADR-116 | `release.yml` accepts a `workflow_dispatch:` trigger alongside the PRD §F-018 `on: push: tags: v*` trigger. The agent cannot push tag refs through the harness Git proxy (Session 024 PRD Issues entry — HTTP 403 `ERR Unable to parse branch information from push data`); rather than chase the harness fix (out of scope) or wait on a human-side tag push, the workflow gains a `version` string input and creates the tag at the run's commit via `gh release create --target ${{ github.sha }}` whenever `github.event_name == workflow_dispatch`. Both triggers feed the same `version` → `build-*` → `release` DAG; the only per-trigger code is the `extract` step's event-name branch and the `gh release create` `--target` flag. PRD §F-018 wording ("Triggered on tag matching v*") is preserved — the new trigger is additive, not a replacement. Rejected alternatives: keep the workflow tag-only and add a "create tag via PR" mechanism (commit a tagged ref to a `.tags/` directory + a workflow that consumes it — more moving parts, leaks tag state into the file tree); rewrite the harness proxy to accept tag refs (out of this repo's scope). | 025 |
 | ADR-117 | Kotlin does not expose inherited Java static fields through subclass references. `JSObject.NULL` does NOT resolve to `JSONObject.NULL` even though `JSObject extends JSONObject` and Java would inherit the static. Two acceptable fixes: (a) `import org.json.JSONObject` and reference `JSONObject.NULL` directly, or (b) omit the key entirely on null values and rely on the Rust contract's missing-field default. This codebase picks (b) for the player plugin because the Rust `tracks` types use `Option<T>` with serde's missing-field-defaults-to-None behaviour; an omitted JSON key is bit-for-bit equivalent to a JSON null for the wire contract. Future Kotlin code in the plugin module should not reach for `JSObject.NULL` — either import `JSONObject` explicitly or omit. Documents the cause of the §6B regression filed in Session 023 and fixed in Session 026. | 026 |
+| ADR-118 | **§6A condition 2 is interpreted strictly: an ADR that defers a PRD-locked code-acceptance criterion does NOT entitle the owning `F-XXX` to remain `[x]`.** PRD §6A.2 reads "Every code-acceptance criterion within each F-XXX is verifiably satisfied by code on `main`" — without an "or documented as deferred via ADR" escape clause. Prior sessions filed ADR-095 (directory picker as text input), ADR-103 (no `max_connections_per_torrent`), ADR-106 (no piece-priority window assignment), and ADR-108 (Linux mpv subprocess instead of in-window GL) framing each as "acceptable v1 polish gap"; the audit re-classifies all four as §6A regressions and flips their owning checkboxes (F-016, F-013, F-014, F-015) back to `[ ]`. Resolution options when an ADR-blocked criterion is genuinely unreachable inside the workspace's current dependency surface: (a) upstream PR + version bump, (b) fork the dependency, (c) swap the dependency, (d) file under "PRD Issues" with a concrete revision proposal so the human can amend the PRD. Picking (a)-(c) closes the regression; picking (d) only closes it once the human-edited PRD lands. This ADR does not retroactively invalidate any other ADR — ADRs 095 / 103 / 106 / 108 remain valid records of what shipped — but it does establish that "shipped behind an ADR" is NOT a substitute for the PRD-locked acceptance criterion at the §6A door. | 027 |
 
 ---
 
@@ -6534,6 +6738,112 @@ Additional ADRs filed by sessions:
   need an Android emulator or instrumented test runner in CI. Not
   blocking for §6A; the §6B human-verification path covers
   rendering-correctness today.
+- **§5 Reliability — Rust panic hook not installed (Session 027
+  audit finding).** PRD §5 locks "Panic hook installed in Rust;
+  panics logged with backtrace before exit". No
+  `std::panic::set_hook` call exists anywhere in `src-tauri/src/`.
+  A panic exits silently with no log entry, which means §6B field-
+  test crashes leave the human without a backtrace. Implementation
+  hint: install the hook inside the same `setup()` closure that
+  ADR-090 already uses for `tracing` subscriber init (so a panic
+  during steady-state app code lands in the rolling file appender);
+  capture `backtrace::Backtrace::force_capture()` and emit it via
+  `tracing::error!` before the default hook re-panics. ~20 LOC.
+- **§5 Reliability — Frontend root `<ErrorBoundary>` missing
+  (Session 027 audit finding).** PRD §5 locks "Frontend errors
+  caught at root error boundary and logged". `App.tsx:81` has only
+  a single local `.catch()` on the boot-time `settingsGetAll()`
+  promise; any other unhandled error in a route or component
+  crashes the SolidJS tree without logging. Wrap the `<Router>`
+  in a SolidJS `<ErrorBoundary fallback={...} />` (the
+  `ErrorBoundary` ships in core Solid since 1.5); the `fallback`
+  receives `(err, reset)` and should both render a user-visible
+  retry surface AND emit the error through the existing
+  `console.error` (which the Tauri runtime relays to the
+  `tracing`-backed file appender via the webview's stderr channel).
+  ~30 LOC.
+- **§5 Logging — Advanced logging toggle not wired (Session 027
+  audit finding).** PRD §5 locks "DEBUG when 'advanced logging'
+  toggle is on in settings". `src-tauri/src/lib.rs:194-195`
+  initializes the subscriber with `EnvFilter::try_from_default_env()
+  .unwrap_or_else(|_| EnvFilter::new("info"))` — fixed at boot, no
+  reload, no setting wired in. The F-016 Settings → Display section
+  already has the dual-writer pattern (ADR-096) so the toggle could
+  follow that template; the trickier part is making `EnvFilter`
+  reloadable. Implementation hint: use
+  `tracing_subscriber::reload::Layer` for the filter layer and
+  expose a `set_log_level(level: &str)` Tauri command that flips
+  the handle when the toggle changes. Wire the boot-time read in
+  `setup()` so the toggle's persisted value applies at startup.
+  ~40 LOC.
+- **F-003 ETag handling unimplemented (Session 027 audit
+  finding).** PRD §F-003 locks "ETag handled where the provider
+  supports it; stored in `response_cache.etag`". The schema column
+  exists, but `kino-core/src/db.rs:388` explicitly writes `etag =
+  NULL` on UPSERT, and no client in `kino-metadata` sends
+  `If-None-Match` or handles `304 Not Modified`. Closure plan:
+  add an `etag: Option<&str>` parameter to the cache-set helper;
+  in `fetch_with_retry`, on cache-hit-with-etag, set the
+  `If-None-Match` request header and on `304` return the cached
+  payload (refreshing `expires_at` only). TMDB, Trakt, and TVDB
+  all return ETags on most read endpoints; Fanart.tv is
+  inconsistent so the absence-of-header path must be tolerant.
+  ~80 LOC including the wiremock test.
+- **F-006 frontend availability filter UI missing entirely
+  (Session 027 audit finding).** Backend ready since Session 009.
+  Frontend never invokes `check_availability` and has no
+  skeleton / hidden / badged tile states. Closure plan: extend
+  the existing `<Row>` / `<Tile>` API so each tile carries an
+  `availability: "pending" | "available" | "unavailable"` field
+  derived from a per-row `check_availability` batch call fired
+  on row mount (debounced behind the virtualization window so
+  pages of 1000 tiles don't all dispatch at once); render
+  `pending` as a skeleton (already exists for the empty-state
+  placeholder), `unavailable` as either hidden OR a badged tile
+  depending on the new `display.show_unavailable` Display
+  setting (default OFF per PRD §F-006); add the toggle to
+  Settings → Display following the existing dual-writer
+  pattern. ~120 LOC including the Settings widget and tests.
+- **F-016 §4 directory picker is a text input, NOT a picker
+  (Session 027 audit finding).** ADR-095 documented the
+  shortcut; the audit re-classifies as §6A regression. Closure
+  plan: add `tauri-plugin-dialog` (Tauri 2's first-party file/
+  folder picker — already part of the Tauri 2 official plugin
+  ecosystem, so no third-party trust concern); permission audit
+  required for Android (`READ_EXTERNAL_STORAGE` is already
+  declared via the Tauri scaffold). On Linux it surfaces the
+  native GTK picker; on Android it uses the Storage Access
+  Framework. ~30 LOC including the Settings widget wiring.
+- **F-016 §8 LICENSE full text not accessible (Session 027 audit
+  finding).** `Settings.tsx:1334` renders the literal string
+  `"MIT"`. PRD locks "License: MIT, full text accessible".
+  Closure plan: ship the LICENSE body as a `frontend/src/assets/`
+  string import (Vite's `?raw` modifier) and render it behind a
+  Focusable "View license" button that opens an in-app modal
+  with a scrollable `<pre>` element. ~25 LOC.
+- **F-015 Android DV decoder forcing unimplemented (Session 027
+  audit finding).** PRD §F-015 locks "For DV content (profile 5
+  / 8.1 detected in stream metadata), force selection of a
+  DV-capable decoder". `PlayerActivity.kt:193` uses
+  `MediaCodecSelector.DEFAULT`; the existing `Capabilities.kt`
+  DV probe is only displayed in the info panel. Closure plan:
+  implement a custom `MediaCodecSelector` that wraps
+  `MediaCodecSelector.DEFAULT` and, for video tracks whose
+  `Format.codecs` indicates DV profile 5 / 8.1, filters
+  candidate `MediaCodecInfo`s to those whose
+  `CodecCapabilities.profileLevels` declare a Dolby Vision
+  profile entry (the constants already used in
+  `Capabilities.kt:50-103`). Trigger the override only when
+  the stream's parsed metadata says DV; non-DV content keeps
+  the default selector to avoid regression. ~60 LOC.
+- **F-015 Linux libmpv in-window GL surface still outstanding
+  (Session 020 / ADR-108, escalated by Session 027 audit).**
+  Already tracked above (the "F-015 follow-ups" bullet) as a
+  Linux libmpv-rs in-process driver task; the audit re-
+  classifies its status from "candidate polish" to "§6A
+  regression". The substantive work (Wayland subsurface
+  negotiation OR X11 `--wid` parent handoff inside the Tauri
+  WebKit window) is unchanged; only the priority is.
 
 ---
 
@@ -6653,6 +6963,262 @@ Additional ADRs filed by sessions:
   it next (human or agent). The F-018 Feature Tracker entry
   stays `[x]` because the release pipeline itself is
   code-complete; only the human-side trigger is outstanding.
+
+---
+
+## §6A Code-Acceptance Regressions
+
+_Filed by Session 027's documentation-only §6A audit. Each entry
+quotes the PRD's locked acceptance wording, cites the actual code,
+and outlines the closure plan. Sessions 028+ address these as the
+highest-priority scope (alongside any open §6B Regressions); the
+closure of every entry below is required before `PRD COMPLETE` can
+be declared per the harness AGENT_PROMPT Step 15._
+
+### F-003 / ETag handling
+
+**PRD §F-003 (locked):** "ETag handled where the provider supports
+it; stored in `response_cache.etag`".
+
+**Actual:** `crates/kino-core/src/db.rs:384` issues
+```
+INSERT INTO response_cache (key, payload_json, etag, expires_at)
+... etag = NULL, ...
+```
+unconditionally on every cache UPSERT, and no `kino-metadata`
+client sends an `If-None-Match` header or handles a `304 Not
+Modified` response. The schema column is dead.
+
+**Closure plan:** thread an `etag: Option<&str>` parameter through
+the cache-set helper; in `crates/kino-core/src/http.rs::fetch_with_retry`,
+on cache hit with a non-NULL etag set the `If-None-Match` request
+header; on `304` re-use the cached payload and refresh
+`expires_at`. TMDB, Trakt, and TVDB all return ETags on most read
+endpoints; Fanart.tv is inconsistent so the absence-of-header path
+must be tolerant. Owner: next session that touches `kino-core::http`.
+
+### F-006 / Frontend availability filter UI
+
+**PRD §F-006 (locked):**
+> - Tile rendering states: **Loading** (skeleton): default while
+>   availability unknown; **Available**: rendered once any enabled
+>   addon returns ≥ 1 stream; **Unavailable** (hidden by default):
+>   no addon returned streams
+> - Setting "Show unavailable titles" (default OFF) toggles
+>   unavailable tiles to render with a "no source" badge
+
+**Actual:** zero references to `check_availability` /
+`stream_availability` exist in `frontend/src/` (verified by grep).
+`Home.tsx:310-354` renders every tile unconditionally. There is no
+"Show unavailable titles" toggle in `Settings.tsx`. The skeleton
+state is only used as a top-level loading placeholder, not as a
+per-tile pending-availability indicator.
+
+**Closure plan:** see the Known Issues entry above for the
+~120-LOC sketch. Wire one batched `check_availability` call per
+row mount (debounced behind the F-008 virtualization window),
+extend the `<Tile>` props with an `availability: "pending" |
+"available" | "unavailable"` discriminant, gate hidden-vs-badged
+rendering on a new `display.show_unavailable` boolean setting
+(default OFF per PRD), and add the toggle to Settings → Display.
+
+### F-013 / Max connections per torrent
+
+**PRD §F-013 (locked):**
+> - Max connections per torrent: 200
+
+**Actual:** `MAX_CONNECTIONS_PER_TORRENT = 200` exists at
+`crates/kino-core/src/constants.rs` but is never consumed.
+`crates/kino-torrent/src/engine.rs:310-319` builds
+`SessionOptions` without setting a connection cap. ADR-103
+deferred this on the grounds that librqbit 8.1.1's public
+`SessionOptions` / `PeerConnectionOptions` expose only timeouts,
+not a concurrent-connection cap; per ADR-118 that deferral is now
+classified as a §6A regression rather than acceptable polish.
+
+**Closure plan (pick one):**
+
+- **(a) Upstream PR** to librqbit exposing a public `max_peers`
+  / `max_connections_per_torrent` option on `SessionOptions`,
+  followed by a version bump.
+- **(b) Fork librqbit** and apply the option locally; track the
+  fork in `Cargo.toml` via a `[patch.crates-io]` directive.
+- **(c) Swap the torrent engine** to one whose public API
+  exposes the cap (e.g. `rqbit`'s underlying chunk tracker
+  surface, or a different async-Rust torrent crate). High blast
+  radius; this is essentially redoing F-013.
+- **(d) File a PRD revision request** under "PRD Issues"
+  proposing to relax the 200-connection cap to "best-effort,
+  subject to engine capabilities" so the human can ratify. The
+  fastest route to §6A closure if the team accepts the relaxed
+  invariant.
+
+Recommendation: (a) is the right long-term answer; (d) is the
+fastest gate-clearer. (b)/(c) only if (a) is rejected upstream and
+(d) is unacceptable to the human.
+
+### F-014 / Piece-priority window assignment
+
+**PRD §F-014 (locked):**
+> Piece priorities mapped to librqbit:
+> - Window `[position, position + 60s]`: HIGHEST
+> - Window `[position + 60s, position + 300s]`: HIGH
+> - Last piece of the active file: HIGH
+> - All others: NORMAL
+
+**Actual:** `PIECE_PRIORITY_HIGH_WINDOW_S = 60` and
+`PIECE_PRIORITY_MED_WINDOW_S = 300` exist at
+`crates/kino-core/src/constants.rs` but are never consumed.
+`crates/kino-torrent/src/scheduler.rs:1-29` and
+`crates/kino-torrent/src/monitor.rs:24-28` explicitly document
+the omission. ADR-106 deferred this on the same librqbit-API
+grounds as F-013.
+
+**Closure plan:** identical to F-013's (a)-(d). The same
+upstream PR that exposes `max_connections_per_torrent` should
+also expose the piece-priority / per-file priority API surface
+(`update_only_files`, `file_priorities`, `chunk_tracker_*`)
+currently in `pub(crate)`.
+
+### F-015 / Android DV decoder forcing
+
+**PRD §F-015 (locked):**
+> Decoders: hardware preferred via `MediaCodecSelector.DEFAULT`.
+> For DV content (profile 5/8.1 detected in stream metadata),
+> force selection of a DV-capable decoder.
+
+**Actual:**
+`android/player-plugin/android/src/main/java/dev/kino/player/PlayerActivity.kt:193`
+uses `MediaCodecSelector.DEFAULT` unconditionally. The DV-capable
+codec list IS already enumerated in
+`Capabilities.kt:50-103` (the `DolbyVisionProfileDvheStn` /
+`DolbyVisionProfileDvheSt` / `DolbyVisionProfileDvheDtb`
+constants are looped against `MediaCodecList`); the snapshot is
+displayed in the info panel (`PlayerActivity.kt:511`) but never
+used to drive selector behavior.
+
+**Closure plan:** implement a custom
+`MediaCodecSelector` (e.g. `DvAwareCodecSelector`) that delegates
+to `MediaCodecSelector.DEFAULT.getDecoderInfos(...)` and, for
+video tracks whose parsed `Format.codecs` indicates DV profile
+5 or 8.1, filters the returned list to codecs whose
+`CodecCapabilities.profileLevels` declare a Dolby Vision profile
+entry. Non-DV content keeps the default behavior. Hook via
+`ExoPlayer.Builder.setRenderersFactory(...)` or
+`DefaultRenderersFactory.setMediaCodecSelector(...)`. ~60 LOC.
+
+### F-015 / Linux libmpv in-window GL surface
+
+**PRD §F-015 (locked):** "Implementation: libmpv via `libmpv-rs`
+rendered into a GL surface owned by the Tauri window."
+
+**Actual:** Linux ships an mpv subprocess driver via
+`crates/kino-player/src/mpv.rs`; the player opens its own window.
+ADR-108 documents the deviation. Per ADR-118 the deviation is
+now classified as a §6A regression rather than acceptable
+polish.
+
+**Closure plan:** introduce a `libmpv-rs` in-process driver
+behind a Cargo feature flag (per ADR-108's "drop-in peer driver"
+sketch). The architecturally hard half is reaching a GL surface
+inside the Tauri 2 / WebKitGTK window — either via X11 `--wid`
+parent-window handoff (Wayland-incompatible by default) or a
+Wayland subsurface protocol negotiation (deep webkit-gtk
+integration work). The `PlayerHandle` trait abstraction means
+the host `kino-app` code does NOT change; only the new
+`crates/kino-player/src/libmpv.rs` peer driver is new code.
+Expect this to be a multi-session effort — likely split as
+"Session N: enumerate webview surface access on Linux", "Session
+N+1: implement render-context-aware driver", "Session N+2: wire
+behind feature flag + CI matrix".
+
+### F-016 §4 / Cache directory picker
+
+**PRD §F-016 §4 (locked):** "Path (with directory picker)".
+
+**Actual:** `frontend/src/routes/Settings.tsx:1014` ships a plain
+`<TextField>` for the cache-path value. No
+`@tauri-apps/plugin-dialog` is on the dependency tree
+(`frontend/package.json` does not declare it, `src-tauri/Cargo.toml`
+does not declare `tauri-plugin-dialog`). ADR-095 documented the
+shortcut.
+
+**Closure plan:** add `tauri-plugin-dialog` (Tauri 2 first-party
+plugin, no third-party trust concern). Register it on both the
+Rust side (`tauri_plugin_dialog::init()` in the builder) and the
+frontend side (`@tauri-apps/plugin-dialog` in `package.json`).
+Wire a "Browse…" Focusable button next to the cache-path
+TextField that calls `open({ directory: true })` and writes the
+returned path back through the existing `settingsSet` channel.
+Android-side: SAF picker is acceptable per ADR-095's
+permission-audit note; ensure no NEW manifest permissions are
+declared without explicit re-audit. ~30 LOC.
+
+### F-016 §8 / LICENSE full text accessible
+
+**PRD §F-016 §8 (locked):** "License: MIT, full text accessible".
+
+**Actual:** `frontend/src/routes/Settings.tsx:1334` renders only
+the literal string `"MIT"`. No link to `/LICENSE`, no in-app
+viewer, no scroll dialog.
+
+**Closure plan:** import the LICENSE body as a Vite
+`?raw` string import (`import licenseText from "../../../LICENSE?raw"`)
+and add a Focusable "View license" button that opens an in-app
+modal with a scrollable `<pre>{licenseText}</pre>`. Confirm the
+LICENSE file is also packaged into the AppImage / APK (Tauri's
+bundler already includes the file when present at repo root,
+since it's a sibling of `Cargo.toml`). ~25 LOC.
+
+### §5 Reliability / Rust panic hook
+
+**PRD §5 Reliability (locked):** "Panic hook installed in Rust;
+panics logged with backtrace before exit."
+
+**Actual:** no `std::panic::set_hook` call anywhere in
+`src-tauri/src/` (verified by grep).
+
+**Closure plan:** install the hook inside the same `setup()`
+closure that ADR-090 already uses for `tracing` subscriber init.
+Capture `std::backtrace::Backtrace::force_capture()` (or the
+`backtrace` crate's equivalent), emit it via `tracing::error!`,
+then chain through to the default hook so the process still
+exits non-zero. ~20 LOC.
+
+### §5 Reliability / Frontend root `<ErrorBoundary>`
+
+**PRD §5 Reliability (locked):** "Frontend errors caught at root
+error boundary and logged."
+
+**Actual:** `frontend/src/App.tsx:81` has only one local `.catch()`
+on the boot-time `settingsGetAll()` promise. No
+`<ErrorBoundary>` wraps the `<Router>`.
+
+**Closure plan:** wrap the top-level `<Router>` in a SolidJS
+`<ErrorBoundary fallback={(err, reset) => …} />`. The fallback
+renders a user-visible retry surface AND emits the error via
+`console.error` (which the Tauri runtime relays into the
+`tracing`-backed log file via the webview's stderr channel).
+~30 LOC.
+
+### §5 Logging / Advanced logging toggle
+
+**PRD §5 Logging (locked):** "Levels: INFO default, DEBUG when
+'advanced logging' toggle is on in settings".
+
+**Actual:** `src-tauri/src/lib.rs:194-195` initializes the
+subscriber with
+`EnvFilter::try_from_default_env().unwrap_or_else(|_|
+EnvFilter::new("info"))` — fixed at boot, no reload mechanism,
+no setting read.
+
+**Closure plan:** use `tracing_subscriber::reload::Layer` for
+the filter layer and expose a `set_log_level(level: &str)`
+Tauri command that flips the handle when the toggle changes.
+Boot-time: read the `display.advanced_logging` setting (new) in
+`setup()` and seed the filter accordingly. Frontend: add the
+toggle to Settings → Display (or a new "Advanced" section per
+the dual-writer pattern in ADR-096). ~40 LOC.
 
 ---
 
