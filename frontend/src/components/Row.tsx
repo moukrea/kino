@@ -86,6 +86,18 @@ export type RowProps = {
    */
   onActivate?: (summary: TitleSummary) => void;
   /**
+   * Optional per-item PRD §F-012 context (manual-remove) handler. The
+   * Continue Watching row sets this; other rows leave it unset.
+   */
+  onContext?: (summary: TitleSummary) => void;
+  /**
+   * Optional per-item badge text accessor — the Continue Watching row
+   * uses this to render "Resume Sxx Eyy" / "Up next: Sxx Eyy"
+   * (PRD §F-012). Returning `null` (or omitting the prop) leaves the
+   * tile badge-less.
+   */
+  itemBadge?: (summary: TitleSummary) => string | null;
+  /**
    * Optional rendering override for empty rows. Default is a single-
    * line muted placeholder; callers like the home screen can pass
    * `null` to render nothing (useful for the CW row whose empty state
@@ -207,7 +219,11 @@ export const Row: Component<RowProps> = (props) => {
                 <Tile
                   focusId={`${props.focusIdPrefix}-${item.id}`}
                   summary={item}
+                  badge={props.itemBadge?.(item) ?? null}
                   onActivate={() => props.onActivate?.(item)}
+                  onContext={
+                    props.onContext ? () => props.onContext?.(item) : undefined
+                  }
                 />
               </div>
             )}

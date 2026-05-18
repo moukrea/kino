@@ -243,6 +243,30 @@ export async function cwDelete(
   return invoke<number>("cw_delete", { titleId, season, episode });
 }
 
+/**
+ * PRD §F-012 canonical position writer. Applies completion + series
+ * next-episode rules backend-side. `episodes` is the canonical
+ * `(season, episode)` tuple list (empty for movies). Returns the row
+ * that ends up on disk, or `null` when the rule wiped the series.
+ */
+export async function cwRecordPosition(
+  entry: ContinueWatching,
+  episodes: ReadonlyArray<readonly [number, number]>,
+): Promise<ContinueWatching | null> {
+  return invoke<ContinueWatching | null>("cw_record_position", {
+    entry,
+    episodes,
+  });
+}
+
+/**
+ * PRD §F-012 manual-remove action. Wipes every CW row for `titleId` —
+ * triggered by Y / Menu / right-click / long-press on a Home CW tile.
+ */
+export async function cwRemoveTitle(titleId: string): Promise<number> {
+  return invoke<number>("cw_remove_title", { titleId });
+}
+
 // ---- F-011: Search ---------------------------------------------------
 
 /**

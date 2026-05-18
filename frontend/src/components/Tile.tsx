@@ -44,9 +44,22 @@ export type TileProps = {
    */
   summary: TitleSummary;
   /**
+   * Optional badge text rendered above the focused-tile caption.
+   * Used by the F-012 Continue Watching row to surface "Resume Sxx
+   * Eyy" / "Up next: Sxx Eyy" labels per PRD §F-012 series rules.
+   */
+  badge?: string | null;
+  /**
    * Invoked when the user activates the tile (Enter / A / tap / click).
    */
   onActivate?: () => void;
+  /**
+   * Optional PRD §F-012 manual-remove handler. When set, the tile
+   * accepts Y (gamepad) / Menu (D-pad) / right-click / long-press as
+   * context actions. The Home CW row wires this to wipe the title's
+   * CW rows; other rows leave it unset.
+   */
+  onContext?: () => void;
 };
 
 export const Tile: Component<TileProps> = (props) => {
@@ -80,16 +93,32 @@ export const Tile: Component<TileProps> = (props) => {
     <Focusable
       id={props.focusId}
       onActivate={props.onActivate}
+      onContext={props.onContext}
       onFocus={armOverlay}
       onBlur={cancelOverlay}
     >
-      {({ focused, showRing, ref, onClick }) => (
+      {({
+        focused,
+        showRing,
+        ref,
+        onClick,
+        onContextMenu,
+        onTouchStart,
+        onTouchEnd,
+        onTouchMove,
+        onTouchCancel,
+      }) => (
         <button
           ref={ref as (el: HTMLButtonElement) => void}
           onClick={() => {
             cancelOverlay();
             onClick();
           }}
+          onContextMenu={onContextMenu}
+          onTouchStart={onTouchStart}
+          onTouchEnd={onTouchEnd}
+          onTouchMove={onTouchMove}
+          onTouchCancel={onTouchCancel}
           data-testid={`tile-${props.focusId}`}
           data-focused={focused() ? "true" : "false"}
           data-kind={props.summary.kind}
@@ -129,6 +158,16 @@ export const Tile: Component<TileProps> = (props) => {
                 class="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/85 via-black/50 to-transparent px-2 py-2 text-sm"
                 data-testid="tile-caption"
               >
+                <Show when={props.badge}>
+                  {(badge) => (
+                    <div
+                      class="mb-1 inline-block rounded bg-sky-500/90 px-1.5 py-0.5 text-xs font-semibold text-neutral-50"
+                      data-testid="tile-badge"
+                    >
+                      {badge()}
+                    </div>
+                  )}
+                </Show>
                 <div class="truncate font-medium text-neutral-50">
                   {props.summary.title}
                 </div>

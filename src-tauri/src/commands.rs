@@ -62,9 +62,22 @@ pub async fn install_id(db: State<'_, Db>) -> Result<String, String> {
 }
 
 // ---- continue_watching --------------------------------------------------
+//
+// F-002 ships `cw_list` / `cw_upsert` / `cw_delete` as low-level CRUD.
+// F-012 layers the PRD §F-012 semantics on top via `cw_record_position`
+// (the canonical writer the player and detail-view actions call) and
+// `cw_remove_title` (the home-row manual-remove action). The
+// auto-removal sweep runs implicitly inside `cw_list` so the home
+// screen never displays a completed row past its 24h window.
 
 #[tauri::command]
 pub async fn cw_list(db: State<'_, Db>) -> Result<Vec<ContinueWatching>, String> {
+    // PRD §F-012 "Completed items auto-removed from Continue Watching
+    // after 24h" — sweep before returning so the home screen sees the
+    // up-to-date list without needing its own scheduler.
+    if let Err(e) = cw_sweep_completed(&db).await {
+        tracing::warn!(error = %e, "cw_sweep_completed failed; returning unswept list");
+    }
     db.cw_list().await.map_err(ipc)
 }
 
@@ -81,6 +94,114 @@ pub async fn cw_delete(
     episode: i64,
 ) -> Result<u64, String> {
     db.cw_delete(&title_id, season, episode).await.map_err(ipc)
+}
+
+/// PRD §F-012 canonical position writer. Applies the locked completion
+/// + next-episode rules in one place so the player (F-015, future) and
+/// the title-detail Resume / Mark Watched actions share the same
+/// behavior.
+///
+/// `episodes` is the canonical series episode list as `(season,
+/// episode)` tuples; pass `Vec::new()` for movies. When the rule
+/// resolves to [`kino_core::cw::ResumeDecision::AdvanceToNext`] the
+/// row's `(season, episode, position_s)` are replaced with the next
+/// episode at position 0 and the old row is deleted. When the rule
+/// resolves to [`kino_core::cw::ResumeDecision::RemoveSeries`] every CW
+/// row for the title is wiped (the series has been fully watched).
+///
+/// Returns the canonical CW row that ends up on disk — `None` when the
+/// rule was `RemoveSeries`. The frontend uses the return to mirror its
+/// in-memory CW signal without re-fetching.
+#[tauri::command]
+pub async fn cw_record_position(
+    db: State<'_, Db>,
+    entry: ContinueWatching,
+    episodes: Vec<(i64, i64)>,
+) -> Result<Option<ContinueWatching>, String> {
+    cw_record_position_inner(&db, entry, &episodes).await
+}
+
+/// Implementation core for [`cw_record_position`]. Takes a `&Db`
+/// directly so unit tests can drive it without a Tauri `State`. The
+/// command wrapper above is a one-liner.
+async fn cw_record_position_inner(
+    db: &Db,
+    entry: ContinueWatching,
+    episodes: &[(i64, i64)],
+) -> Result<Option<ContinueWatching>, String> {
+    use kino_core::cw::{resume_decision, ResumeDecision};
+    match resume_decision(&entry, episodes) {
+        ResumeDecision::Keep => {
+            db.cw_upsert(&entry).await.map_err(ipc)?;
+            Ok(Some(entry))
+        }
+        ResumeDecision::AdvanceToNext { season, episode } => {
+            // Wipe the previous (completed) episode's row before
+            // writing the new one so only one row per series is kept.
+            db.cw_delete(&entry.title_id, entry.season, entry.episode)
+                .await
+                .map_err(ipc)?;
+            let advanced = ContinueWatching {
+                title_id: entry.title_id.clone(),
+                kind: entry.kind,
+                season,
+                episode,
+                position_s: 0.0,
+                duration_s: 0.0,
+                last_played_at: entry.last_played_at,
+                meta_json: entry.meta_json.clone(),
+            };
+            db.cw_upsert(&advanced).await.map_err(ipc)?;
+            Ok(Some(advanced))
+        }
+        ResumeDecision::RemoveSeries => {
+            db.cw_delete_all_for_title(&entry.title_id)
+                .await
+                .map_err(ipc)?;
+            Ok(None)
+        }
+    }
+}
+
+/// PRD §F-012 manual-remove action: wipe every CW row that belongs to
+/// `title_id`. The home-screen CW row triggers this via the `context`
+/// action (Y / Menu / right-click / long-press); the action targets the
+/// whole title rather than the single `(season, episode)` row because
+/// the home renders one tile per title.
+#[tauri::command]
+pub async fn cw_remove_title(db: State<'_, Db>, title_id: String) -> Result<u64, String> {
+    db.cw_delete_all_for_title(&title_id).await.map_err(ipc)
+}
+
+/// PRD §F-012 auto-removal sweep. Walks every CW row and deletes any
+/// that satisfy [`kino_core::cw::should_auto_remove`] under the current
+/// system clock. Invoked from `cw_list`; also exposed as a Tauri
+/// command for explicit calls (the Settings screen could surface a
+/// "Sweep finished items now" button in a future polish pass).
+#[tauri::command]
+pub async fn cw_sweep(db: State<'_, Db>) -> Result<u64, String> {
+    cw_sweep_completed(&db).await.map_err(ipc)
+}
+
+/// Inner sweep used by `cw_list` and `cw_sweep`. Returns the number of
+/// rows removed.
+async fn cw_sweep_completed(db: &Db) -> Result<u64, kino_core::db::DbError> {
+    use kino_core::cw::should_auto_remove;
+    let rows = db.cw_list().await?;
+    let now = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    )
+    .unwrap_or(i64::MAX);
+    let mut removed: u64 = 0;
+    for row in rows {
+        if should_auto_remove(&row, now) {
+            removed += db.cw_delete(&row.title_id, row.season, row.episode).await?;
+        }
+    }
+    Ok(removed)
 }
 
 // ---- addons -------------------------------------------------------------
@@ -5640,5 +5761,159 @@ mod tests {
             ["linux", "android", "macos", "windows", "unknown"].contains(&platform),
             "unexpected platform label: {platform}"
         );
+    }
+
+    // ---- F-012: continue-watching rule application --------------------
+
+    fn cw_movie(id: &str, position: f64, duration: f64, last_played: i64) -> ContinueWatching {
+        ContinueWatching {
+            title_id: id.into(),
+            kind: TitleKind::Movie,
+            season: 0,
+            episode: 0,
+            position_s: position,
+            duration_s: duration,
+            last_played_at: last_played,
+            meta_json: serde_json::json!({}),
+        }
+    }
+
+    fn cw_episode(
+        id: &str,
+        season: i64,
+        episode: i64,
+        position: f64,
+        duration: f64,
+        last_played: i64,
+    ) -> ContinueWatching {
+        ContinueWatching {
+            title_id: id.into(),
+            kind: TitleKind::Series,
+            season,
+            episode,
+            position_s: position,
+            duration_s: duration,
+            last_played_at: last_played,
+            meta_json: serde_json::json!({}),
+        }
+    }
+
+    #[tokio::test]
+    async fn cw_record_position_keeps_in_progress_row_unchanged() {
+        let db = Db::open_in_memory().await.unwrap();
+        let cw = cw_movie("tt1", 600.0, 1800.0, 100); // 33%
+        let out = cw_record_position_inner(&db, cw.clone(), &[])
+            .await
+            .unwrap();
+        assert_eq!(out, Some(cw.clone()));
+        let listed = db.cw_list().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!((listed[0].position_s - 600.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn cw_record_position_series_advances_to_next_episode() {
+        let db = Db::open_in_memory().await.unwrap();
+        let cw = cw_episode("tt_series", 1, 1, 1800.0, 1800.0, 200); // 100%
+        let eps = [(1, 1), (1, 2), (1, 3)];
+        let out = cw_record_position_inner(&db, cw.clone(), &eps)
+            .await
+            .unwrap();
+        let advanced = out.expect("series advance must return the new row");
+        assert_eq!(advanced.season, 1);
+        assert_eq!(advanced.episode, 2);
+        assert!(advanced.position_s.abs() < f64::EPSILON);
+        let listed = db.cw_list().await.unwrap();
+        assert_eq!(listed.len(), 1, "old episode row must be wiped");
+        assert_eq!((listed[0].season, listed[0].episode), (1, 2));
+    }
+
+    #[tokio::test]
+    async fn cw_record_position_series_removes_when_final_episode_completed() {
+        let db = Db::open_in_memory().await.unwrap();
+        // Pre-seed a prior episode's row so we can prove the wipe is
+        // title-wide, not just the (s,e) we record on.
+        db.cw_upsert(&cw_episode("tt_series", 1, 1, 1800.0, 1800.0, 199))
+            .await
+            .unwrap();
+        let cw = cw_episode("tt_series", 1, 2, 1800.0, 1800.0, 200);
+        db.cw_upsert(&cw).await.unwrap();
+        let eps = [(1, 1), (1, 2)];
+        let out = cw_record_position_inner(&db, cw, &eps).await.unwrap();
+        assert!(out.is_none(), "series end must signal removal");
+        assert_eq!(db.cw_list().await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn cw_record_position_movie_completion_keeps_row_for_sweep() {
+        let db = Db::open_in_memory().await.unwrap();
+        let cw = cw_movie("tt_done", 6000.0, 6000.0, 100); // 100%
+        let out = cw_record_position_inner(&db, cw.clone(), &[])
+            .await
+            .unwrap();
+        assert_eq!(out, Some(cw));
+        // Row stays — PRD §F-012 movies are kept until the 24h sweep
+        // ages them out, distinguishing them from series which advance.
+        assert_eq!(db.cw_list().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cw_remove_title_wipes_every_episode_for_that_title() {
+        let db = Db::open_in_memory().await.unwrap();
+        db.cw_upsert(&cw_episode("tt_a", 1, 1, 10.0, 60.0, 100))
+            .await
+            .unwrap();
+        db.cw_upsert(&cw_episode("tt_a", 1, 2, 10.0, 60.0, 110))
+            .await
+            .unwrap();
+        db.cw_upsert(&cw_episode("tt_b", 1, 1, 10.0, 60.0, 120))
+            .await
+            .unwrap();
+        let removed = db.cw_delete_all_for_title("tt_a").await.unwrap();
+        assert_eq!(removed, 2);
+        let remaining: Vec<String> = db
+            .cw_list()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.title_id)
+            .collect();
+        assert_eq!(remaining, vec!["tt_b"]);
+    }
+
+    #[tokio::test]
+    async fn cw_list_runs_auto_removal_sweep_before_returning() {
+        let db = Db::open_in_memory().await.unwrap();
+        // Completed row last played 25h ago — must be swept.
+        let now = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap();
+        let stale_completed = cw_movie("tt_old", 100.0, 100.0, now - 25 * 3600);
+        // Completed row last played 1h ago — keep.
+        let fresh_completed = cw_movie("tt_new", 100.0, 100.0, now - 3600);
+        // In-progress row, last played 30 days ago — keep (only
+        // completed rows participate in the sweep).
+        let stale_in_progress = cw_movie("tt_inprog", 50.0, 100.0, now - 30 * 86_400);
+        db.cw_upsert(&stale_completed).await.unwrap();
+        db.cw_upsert(&fresh_completed).await.unwrap();
+        db.cw_upsert(&stale_in_progress).await.unwrap();
+
+        // Drive the sweep directly so we don't need a Tauri State.
+        let removed = cw_sweep_completed(&db).await.unwrap();
+        assert_eq!(removed, 1);
+        let ids: Vec<String> = db
+            .cw_list()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.title_id)
+            .collect();
+        assert!(ids.contains(&"tt_new".to_string()));
+        assert!(ids.contains(&"tt_inprog".to_string()));
+        assert!(!ids.contains(&"tt_old".to_string()));
     }
 }

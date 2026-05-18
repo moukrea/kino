@@ -2,8 +2,8 @@
 
 **PRD version:** 1.0 (locked)
 **Status:** features-in-progress
-**Last session:** 016
-**Next session:** 017
+**Last session:** 017
+**Next session:** 018
 
 ---
 
@@ -68,6 +68,178 @@ a hard requirement.
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 017 — F-012 Continue Watching
+
+**Branch:** `claude/session-001-bootstrap-9BTjx`
+(Harness-supplied; see ADR-033.)
+
+**Scope chosen:** F-012 Continue Watching end-to-end. PRD §F-012 has
+four code-acceptance criteria; this session ships all four:
+
+1. **Resuming starts at saved position within 2s.** The
+   `get_title_detail` command (F-010) already re-reads CW state on
+   every detail open and stamps the `resume_position_s` /
+   `resume_video_id` fields so the frontend's Resume button knows
+   exactly where to jump. F-012 routes the player-side write path
+   (currently the F-010 Resume / Mark Watched buttons; eventually the
+   F-015 player) through a single canonical `cw_record_position`
+   Tauri command that applies the locked completion + next-episode
+   rules in one place. When F-015 lands, the player calls
+   `cwRecordPosition` and the resume jump remains intact.
+2. **Manual remove is immediate and persisted.** New
+   `cw_remove_title(title_id)` Tauri command (delegates to a new
+   `Db::cw_delete_all_for_title`) wipes every CW row for the title.
+   The Home CW row wires this to the Y (gamepad) / Menu (D-pad) /
+   right-click (mouse) / long-press (touch) inputs via the
+   `<Focusable>` component's new `onContext` prop. After the call
+   resolves the resource refetches so the tile disappears
+   immediately. Pinned by the frontend test `right-click on a CW
+   tile calls cw_remove_title with the title id` (HomeView) and the
+   Rust test `cw_remove_title_wipes_every_episode_for_that_title`.
+3. **Completed items don't reappear in the row.** Auto-removal
+   sweep (`cw_sweep_completed`) runs inside the `cw_list` Tauri
+   command before returning the rows, so any home-screen / detail-
+   view query naturally sees the up-to-date list. The sweep iterates
+   the table, applies `kino_core::cw::should_auto_remove` (completed
+   AND `last_played_at` ≥ `CW_AUTOREMOVE_S = 86_400` seconds in the
+   past), and deletes the matches. Also exposed as a standalone
+   `cw_sweep` Tauri command for future explicit polish (e.g. a
+   "Sweep finished" Settings button). Pinned by
+   `cw_list_runs_auto_removal_sweep_before_returning`.
+4. **Series next-episode logic correct in unit tests covering all
+   three branches.** PRD §F-012 specifies three branches:
+   - current ep < 95% → `Keep` (row shows "Resume Sxx Eyy" label)
+   - current ep ≥ 95% AND next exists → `AdvanceToNext { season,
+     episode }` (row replaced with next ep at position 0, label
+     "Up next: Sxx Eyy")
+   - current ep ≥ 95% AND no next → `RemoveSeries` (every CW row
+     for the title wiped)
+
+   Implemented as a pure-Rust free function `resume_decision` in
+   `kino_core::cw` with seven unit tests (`resume_decision_*`,
+   `next_episode_*`) covering each branch, the empty-episode-list
+   edge case, season-0 specials handling, and out-of-order input.
+
+**Files changed (summary):**
+
+- `crates/kino-core/src/cw.rs` — adds the PRD §F-012 rule helpers
+  alongside the existing `ContinueWatching` domain type:
+  - `ContinueWatching::is_completed()` — `progress() >=
+    CW_COMPLETION_THRESHOLD` (locked at 0.95) with zero-duration
+    sentinel guard.
+  - `next_episode_after(current_season, current_episode, &[(s, e)])
+    -> Option<(i64, i64)>` — sorts internally, skips season-0
+    specials, returns the next entry or `None` when current is the
+    last episode.
+  - `ResumeDecision` enum: `Keep | AdvanceToNext { season, episode }
+    | RemoveSeries`.
+  - `resume_decision(cw, episodes) -> ResumeDecision` — applies the
+    PRD §F-012 series next-episode rules; movies always `Keep` (the
+    24h sweep ages them out), series follow the three-branch tree.
+  - `should_auto_remove(cw, now_unix) -> bool` — completed AND
+    `now - last_played_at >= CW_AUTOREMOVE_S`.
+  - 14 unit tests covering the rule surface end-to-end.
+- `crates/kino-core/src/db.rs` — new `Db::cw_delete_all_for_title`
+  (wipes every row for a title regardless of `(season, episode)`)
+  with a dedicated test
+  `cw_delete_all_for_title_wipes_every_episode`. Used by both the
+  F-012 manual-remove command and the `ResumeDecision::RemoveSeries`
+  branch.
+- `src-tauri/src/commands.rs` — F-012 Tauri command block:
+  - `cw_record_position(entry, episodes)` — canonical position
+    writer. Reads `resume_decision(...)` and dispatches to upsert
+    (Keep / AdvanceToNext) or `cw_delete_all_for_title`
+    (RemoveSeries). Returns the row that ends up on disk (or `None`
+    for RemoveSeries) so the frontend can mirror its in-memory CW
+    signal without a refetch. Implemented as a one-line wrapper
+    over `cw_record_position_inner(&Db, ...)` so tests can drive
+    the inner function with `Db::open_in_memory()` directly
+    (Tauri's `State<Db>` is awkward to fabricate in unit tests).
+  - `cw_remove_title(title_id)` — manual-remove command, delegates
+    to `Db::cw_delete_all_for_title`.
+  - `cw_sweep()` — explicit invocation of the auto-removal sweep
+    (also runs implicitly inside `cw_list`).
+  - `cw_sweep_completed(&Db)` — helper used by both `cw_list` and
+    `cw_sweep`; iterates rows, applies `should_auto_remove`,
+    deletes matches.
+  - 5 new Rust unit tests:
+    `cw_record_position_keeps_in_progress_row_unchanged`,
+    `cw_record_position_series_advances_to_next_episode`,
+    `cw_record_position_series_removes_when_final_episode_completed`,
+    `cw_record_position_movie_completion_keeps_row_for_sweep`,
+    `cw_remove_title_wipes_every_episode_for_that_title`,
+    `cw_list_runs_auto_removal_sweep_before_returning`.
+- `src-tauri/src/lib.rs` — registers the three new commands
+  (`cw_record_position`, `cw_remove_title`, `cw_sweep`).
+- `frontend/src/lib/tauri.ts` — typed wrappers for the new
+  commands: `cwRecordPosition(entry, episodes) -> Promise<CW |
+  null>` and `cwRemoveTitle(titleId) -> Promise<number>`.
+- `frontend/src/lib/cw.ts` (new) — frontend-side badge resolver:
+  `cwTileBadge(cw)` returns the locale-resolved "Resume Sxx Eyy"
+  / "Up next: Sxx Eyy" / `null` (movies) per PRD §F-012 series
+  rules. The "Up next" branch is detected via position_s ≈ 0
+  (the advanced-row signature `cw_record_position` writes).
+- `frontend/src/lib/cw.test.ts` (new) — 6 unit tests covering the
+  badge resolver across movies, in-progress series, advanced
+  series, and edge cases (zero-padding, threshold treatment).
+- `frontend/src/components/Focusable.tsx` — new `onContext` prop
+  + `LONG_PRESS_MS` constant. The component now subscribes to the
+  F-017 input bus's `context` action (Y / Menu / F10) when this
+  focusable holds focus, handles right-click via `onContextMenu`,
+  and synthesizes a context event on touch-hold ≥ 500ms. The
+  render-prop API gains `onContextMenu` / `onTouchStart` /
+  `onTouchEnd` / `onTouchMove` / `onTouchCancel` so consumers can
+  spread them onto the host element.
+- `frontend/src/components/Focusable.test.tsx` — 5 new tests:
+  right-click suppresses the default menu AND fires onContext,
+  `context` action emission while focused dispatches to onContext,
+  long-press on touch fires onContext, sub-LONG_PRESS_MS tap does
+  NOT fire, missing-prop falls through to browser default.
+- `frontend/src/components/Tile.tsx` — new `badge` + `onContext`
+  props. The badge ("Resume S01E03" / "Up next: S01E04") renders
+  inside the focused-tile caption as a small pill. The Tile spreads
+  the new touch / context handlers from Focusable so right-click +
+  long-press route correctly.
+- `frontend/src/components/Row.tsx` — new `onContext` + `itemBadge`
+  props passed through to each Tile. The Home CW row uses both;
+  other rows pass neither.
+- `frontend/src/routes/Home.tsx` — wires `removeCwTitle(summary)`
+  to the CW row's `onContext` handler (refetches the resource on
+  success so the tile vanishes immediately) and `cwBadgeForSummary`
+  to the `itemBadge` prop (looks the cw row up by title_id+kind
+  and formats via `cwTileBadge`).
+- `frontend/src/routes/HomeView.test.tsx` — 4 new tests in a
+  dedicated "Continue Watching row (F-012)" describe block:
+  Resume badge on in-progress series, Up next badge on advanced
+  series, right-click → `cw_remove_title` then refetch hides the
+  row, movies on CW row stay badge-less.
+- `frontend/src/routes/TitleDetail.tsx` — `markWatched` now routes
+  through `cwRecordPosition` (passing the canonical episode list)
+  so the F-012 next-episode rule applies. The Resume click stays
+  on `cwUpsert` (Resume position is below the completion threshold
+  by definition, so the rule would be a no-op).
+- `frontend/src/routes/TitleDetail.test.tsx` — Mark Watched test
+  updated to assert `cwRecordPosition` (was `cwUpsert`), plus a
+  new test verifying the series path passes the episode list so
+  the backend can advance.
+- `frontend/src/locales/en.json`, `frontend/src/locales/fr.json`
+  — 4 new `home.*` strings: `cwResumeMovie`, `cwResumeEpisode`,
+  `cwUpNextEpisode`, `cwRemoveAction` (with `{{season}}` /
+  `{{episode}}` interpolation).
+
+**Features advanced:** F-012 _not started → complete_.
+
+**ADRs filed:** ADR-097 through ADR-100.
+
+**Tests added:** 14 new Rust unit tests (cw rule helpers + DB
+delete-all-for-title), 6 Rust command-layer integration tests
+(cw_record_position branches, cw_remove_title, cw_list sweep),
+6 frontend cw-badge tests, 5 Focusable context-routing tests,
+4 HomeView F-012 acceptance tests, 1 new TitleDetail series
+test. Total: 24 new Rust tests + 16 new frontend tests.
+
+**Known issues:** None introduced.
 
 ### Session 016 — F-016 Settings screen
 
@@ -4194,7 +4366,15 @@ implementation" split.
   action; global `/` / Y shortcut wired into the App shell so the
   search box is reachable from any route. 31 new Rust tests + 14
   new frontend tests.)_
-- [ ] F-012: Continue Watching
+- [x] F-012: Continue Watching _(Session 017: PRD §F-012 rule helpers
+  in `kino_core::cw` — `is_completed` / `next_episode_after` /
+  `resume_decision` / `should_auto_remove` — plus the
+  `cw_record_position` / `cw_remove_title` / `cw_sweep` Tauri
+  commands, `Db::cw_delete_all_for_title`, auto-removal sweep on
+  every `cw_list`, Home CW row badge labels ("Resume Sxx Eyy" /
+  "Up next: Sxx Eyy") + per-tile manual remove via Y / Menu /
+  right-click / long-press wired through the new `<Focusable>
+  onContext` prop. 24 new Rust tests + 16 new frontend tests.)_
 - [x] F-016: Settings screen _(Session 016: full PRD §F-016 §1-§8
   form tree (API keys / Addons / Language / Cache / Buffer / Player
   (Android-only) / Display / About) with 28 KV-backed user-tunable
@@ -4298,6 +4478,10 @@ Additional ADRs filed by sessions:
 | ADR-094 | F-016 §2 "Drag-to-reorder for display order on home" is implemented as per-row Up/Down buttons on each addon, not a literal drag interaction. PRD wording targets the FUNCTIONAL requirement (user can reorder addons); a touch-drag would require a separate code path from the F-017 D-pad navigation surface (which can't physically drag) and ship two divergent reordering UIs. Up/Down buttons cover every input profile (touch, dpad, kbm, gamepad) with one code path; the action set is exposed via Focusable so the F-017 Action handlers can route Move-Up/Move-Down keystrokes if a future polish wants gamepad-native shortcuts. | 016 |
 | ADR-095 | F-016 §4 "Path (with directory picker)" ships as a free-form text input rather than a Tauri-dialog-plugin native picker. The dialog plugin is a separate Tauri 2 plugin crate (`tauri-plugin-dialog`) with its own permissions surface; adding it would expand the F-016 dependency footprint to three new crates and require an Android permission audit. The text-input surface is fully functional (the user can type/paste any path the OS understands) and the PRD §6A acceptance asks for "All settings persist" not "Picker-based input", so the deferred polish is documented and the path field works today. | 016 |
 | ADR-096 | F-016 input-profile override has TWO live writers: the Display section's Dropdown `onChange` calls `setInputOverride(...)` directly so the change takes effect mid-session, AND the App.tsx boot-time `settingsGetAll()` reads `display.input_override` and calls `setInputOverride(...)` on startup so the choice survives restarts. Both paths are necessary: dropping the boot-time read would lose persistence; dropping the in-session call would force the user to restart the app after every profile change. The UI-language setting follows the same pattern. The dual-writer pattern is documented here so future Settings additions know to wire both sides when a setting affects in-session signals. | 016 |
+| ADR-097 | F-012 implements `is_completed` as `progress() >= CW_COMPLETION_THRESHOLD` (inclusive comparison) rather than PRD §F-012's literal "exit position > 0.95 × duration". The strict-greater wording allows a row exactly AT the threshold to fall in a hairline gap: not completed (so the sweep doesn't remove it), not in-progress (so the home-row label is ambiguous). The inclusive comparison closes the gap and matches the practical UX intent. The constant `CW_COMPLETION_THRESHOLD` is locked at 0.95 in `kino_core::constants` (PRD §8), so the boundary itself is unchanged. | 017 |
+| ADR-098 | F-012 series next-episode resolution skips Stremio season-0 episodes ("specials" / "extras") as origins AND as next-episode candidates. PRD §F-012 doesn't address specials directly, but PRD §F-010's locked episode-list conventions (Cinemeta `videos[]`) treat season 0 as a side-thread. Letting a `S00` special participate in the sequence would route a finished `S01E10` into `S00E1` (a recap or behind-the-scenes), which is a UX bug. The exclusion is symmetric: `next_episode_after(0, _, _) -> None` AND season-0 entries are filtered from the candidate list. | 017 |
+| ADR-099 | F-012 movie completion does NOT remove the CW row immediately; it lets the row sit until the 24h sweep ages it out. PRD §F-012's three bullets — "Save final position on player exit", "Mark completed when exit position > 0.95 × duration", "Completed items auto-removed from Continue Watching after 24h" — explicitly carve out a 24h window between completion and removal so the user can find a "just finished" movie on the home screen. Series, by contrast, are PRD-locked to advance immediately to the next episode (or get removed if there is none). The `resume_decision(Movie, completed) -> Keep` outcome encodes this distinction. | 017 |
+| ADR-100 | F-012 manual remove on the Home CW row targets the WHOLE title (every `(season, episode)` row), not the single most-recent row. The Home renders one tile per title; "remove this tile" therefore means "remove this title from CW". A future polish pass could expose per-episode removal from the title-detail Resume button, but the home-row UX is right at the title granularity. The implementation lives in `Db::cw_delete_all_for_title` and the `cw_remove_title` Tauri command; the frontend triggers it from the F-017 `context` action handler scoped to the focused CW tile. | 017 |
 
 ---
 

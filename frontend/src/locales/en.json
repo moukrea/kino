@@ -19,7 +19,11 @@
     "continueWatching": "Continue Watching",
     "trendingNow": "Trending Now",
     "hiddenGems": "Hidden Gems",
-    "trendingThisWeek": "Trending This Week"
+    "trendingThisWeek": "Trending This Week",
+    "cwResumeMovie": "Resume",
+    "cwResumeEpisode": "Resume S{{season}}E{{episode}}",
+    "cwUpNextEpisode": "Up next: S{{season}}E{{episode}}",
+    "cwRemoveAction": "Remove from Continue Watching"
   },
   "detail": {
     "back": "Back",

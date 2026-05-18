@@ -39,6 +39,7 @@ import { onAction } from "../input/keyboard";
 import { locale } from "../i18n";
 import { t } from "../i18n";
 import {
+  cwRecordPosition,
   cwUpsert,
   getStreams,
   getTitleDetail,
@@ -312,24 +313,32 @@ export const TitleDetailRoute: Component = () => {
       data.kind === "series" ? selectedEpisode() : 0;
     const duration =
       data.runtime_minutes !== null ? data.runtime_minutes * 60 : 1;
-    // Mark watched = write a CW row at >= CW_COMPLETION_THRESHOLD (0.95
-    // per PRD §8). The CW auto-removal sweep (F-012) will tidy these up
-    // 24h after writes; for now the row's existence is the signal.
-    cwUpsert({
-      title_id: data.stremio_id,
-      kind: data.kind,
-      season,
-      episode,
-      position_s: duration,
-      duration_s: duration,
-      last_played_at: Math.floor(Date.now() / 1000),
-      meta_json: {
-        title: data.title,
-        year: data.year,
-        poster: data.poster,
-        rating: data.imdb_rating,
+    // Mark watched routes through the F-012 canonical writer so the
+    // locked rules apply: movies stay at duration (the 24h sweep
+    // expires them), series at the last episode trigger the
+    // remove-series rule, series mid-list advance to the next episode.
+    const episodes: ReadonlyArray<readonly [number, number]> =
+      data.kind === "series"
+        ? data.episodes.map((ep) => [ep.season, ep.episode] as const)
+        : [];
+    cwRecordPosition(
+      {
+        title_id: data.stremio_id,
+        kind: data.kind,
+        season,
+        episode,
+        position_s: duration,
+        duration_s: duration,
+        last_played_at: Math.floor(Date.now() / 1000),
+        meta_json: {
+          title: data.title,
+          year: data.year,
+          poster: data.poster,
+          rating: data.imdb_rating,
+        },
       },
-    }).catch((e) => console.warn("cw_upsert failed", e));
+      episodes,
+    ).catch((e) => console.warn("cw_record_position failed", e));
   };
 
   return (

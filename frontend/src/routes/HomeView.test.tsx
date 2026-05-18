@@ -35,6 +35,7 @@ vi.mock("../lib/tauri", async (importOriginal) => {
     ...actual,
     hasTauri: () => true,
     cwList: vi.fn(),
+    cwRemoveTitle: vi.fn(),
     getTrendingPools: vi.fn(),
     getWeeklyTrending: vi.fn(),
     listHomeCatalogs: vi.fn(),
@@ -43,6 +44,7 @@ vi.mock("../lib/tauri", async (importOriginal) => {
 
 const tauri = await import("../lib/tauri");
 const mockedCwList = vi.mocked(tauri.cwList);
+const mockedCwRemoveTitle = vi.mocked(tauri.cwRemoveTitle);
 const mockedGetTrendingPools = vi.mocked(tauri.getTrendingPools);
 const mockedGetWeeklyTrending = vi.mocked(tauri.getWeeklyTrending);
 const mockedListHomeCatalogs = vi.mocked(tauri.listHomeCatalogs);
@@ -66,6 +68,25 @@ function cw(title_id: string, kind: TitleKind): ContinueWatching {
     episode: 0,
     position_s: 0,
     duration_s: 0,
+    last_played_at: 0,
+    meta_json: { title: title_id, year: 2024, poster: null },
+  };
+}
+
+function cwEpisode(
+  title_id: string,
+  season: number,
+  episode: number,
+  position: number,
+  duration: number,
+): ContinueWatching {
+  return {
+    title_id,
+    kind: "series",
+    season,
+    episode,
+    position_s: position,
+    duration_s: duration,
     last_played_at: 0,
     meta_json: { title: title_id, year: 2024, poster: null },
   };
@@ -117,10 +138,12 @@ describe("HomeView (F-009)", () => {
     _resetFocus();
     _resetProfile();
     mockedCwList.mockReset();
+    mockedCwRemoveTitle.mockReset();
     mockedGetTrendingPools.mockReset();
     mockedGetWeeklyTrending.mockReset();
     mockedListHomeCatalogs.mockReset();
     mockedCwList.mockResolvedValue([]);
+    mockedCwRemoveTitle.mockResolvedValue(0);
     mockedGetTrendingPools.mockResolvedValue(pools([]));
     mockedGetWeeklyTrending.mockResolvedValue([]);
     mockedListHomeCatalogs.mockResolvedValue([]);
@@ -386,6 +409,112 @@ describe("HomeView addon catalog rows (F-008 row 5)", () => {
       '[data-testid^="row-cat-"]',
     );
     expect(catRows.length).toBe(0);
+  });
+});
+
+describe("HomeView Continue Watching row (F-012)", () => {
+  let host: HTMLDivElement | null = null;
+  let dispose: (() => void) | null = null;
+
+  beforeEach(() => {
+    _resetFocus();
+    _resetProfile();
+    mockedCwList.mockReset();
+    mockedCwRemoveTitle.mockReset();
+    mockedGetTrendingPools.mockReset();
+    mockedGetWeeklyTrending.mockReset();
+    mockedListHomeCatalogs.mockReset();
+    mockedCwRemoveTitle.mockResolvedValue(1);
+    mockedGetTrendingPools.mockResolvedValue(pools([]));
+    mockedGetWeeklyTrending.mockResolvedValue([]);
+    mockedListHomeCatalogs.mockResolvedValue([]);
+  });
+
+  afterEach(() => {
+    dispose?.();
+    host?.remove();
+    host = null;
+    dispose = null;
+  });
+
+  it("renders a Resume Sxx Eyy badge on a series CW tile with in-progress playback", async () => {
+    mockedCwList.mockResolvedValue([cwEpisode("tt_series", 1, 3, 900, 1800)]);
+
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    dispose = mount(host, null);
+    await flushAsync();
+
+    // The tile becomes focused (Home claims initial focus on the
+    // first CW tile), which is the only state in which the badge is
+    // visible. The Tile renders the badge inside `tile-badge`.
+    const badge = host.querySelector('[data-testid="tile-badge"]');
+    expect(badge).not.toBeNull();
+    expect(badge?.textContent).toContain("Resume");
+    expect(badge?.textContent).toContain("S01");
+    expect(badge?.textContent).toContain("E03");
+  });
+
+  it("renders an Up next badge for an advanced-to-next-episode CW row", async () => {
+    // PRD §F-012 advanced row: position_s = 0 (set by
+    // `cw_record_position` after the previous episode completed).
+    mockedCwList.mockResolvedValue([cwEpisode("tt_series", 2, 5, 0, 0)]);
+
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    dispose = mount(host, null);
+    await flushAsync();
+
+    const badge = host.querySelector('[data-testid="tile-badge"]');
+    expect(badge).not.toBeNull();
+    expect(badge?.textContent).toContain("Up next");
+    expect(badge?.textContent).toContain("S02");
+    expect(badge?.textContent).toContain("E05");
+  });
+
+  it("right-click on a CW tile calls cw_remove_title with the title id", async () => {
+    mockedCwList.mockResolvedValueOnce([cwEpisode("tt_series", 1, 3, 900, 1800)]);
+    // After the remove, refetched list is empty.
+    mockedCwList.mockResolvedValue([]);
+
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    dispose = mount(host, null);
+    await flushAsync();
+
+    const tile = host.querySelector(
+      '[data-testid="row-continue-watching"] button',
+    ) as HTMLButtonElement;
+    expect(tile).not.toBeNull();
+    tile.dispatchEvent(
+      new MouseEvent("contextmenu", { bubbles: true, cancelable: true }),
+    );
+    await flushAsync();
+    expect(mockedCwRemoveTitle).toHaveBeenCalledWith("tt_series");
+    // After the refetch, the CW row should be gone.
+    await flushAsync();
+    expect(
+      host.querySelector('[data-testid="row-continue-watching"]'),
+    ).toBeNull();
+  });
+
+  it("movies on the CW row do NOT show a badge (only series get Resume/Up next labels)", async () => {
+    mockedCwList.mockResolvedValue([cw("tt_movie", "movie")]);
+
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    dispose = mount(host, null);
+    await flushAsync();
+
+    // CW row visible (movie row exists).
+    expect(
+      host.querySelector('[data-testid="row-continue-watching"]'),
+    ).not.toBeNull();
+    // But no badge — movies show just the title.
+    const badge = host.querySelector(
+      '[data-testid="row-continue-watching"] [data-testid="tile-badge"]',
+    );
+    expect(badge).toBeNull();
   });
 });
 
