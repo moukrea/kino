@@ -2343,6 +2343,7 @@ dependencies = [
  "kino-addons",
  "kino-core",
  "kino-metadata",
+ "kino-player",
  "kino-server",
  "kino-torrent",
  "mime_guess",
@@ -2394,6 +2395,20 @@ dependencies = [
  "tokio",
  "tracing",
  "wiremock",
+]
+
+[[package]]
+name = "kino-player"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

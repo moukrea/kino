@@ -6,6 +6,7 @@ members = [
     "crates/kino-server",
     "crates/kino-addons",
     "crates/kino-metadata",
+    "crates/kino-player",
     "src-tauri",
 ]
 

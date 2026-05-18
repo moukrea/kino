@@ -3736,6 +3736,389 @@ fn extract_filename_from_url(url: &str) -> Option<String> {
     }
 }
 
+// ---- F-015: native player driver ---------------------------------------
+
+#[cfg(target_os = "linux")]
+use kino_player::MpvPlayer;
+use kino_player::{OpenRequest, PlayerError, PlayerEvent, PlayerHandle, PlayerSnapshot, TrackList};
+use tokio::sync::Mutex as AsyncMutex;
+
+/// Holder for the active player session. Built lazily on the first
+/// `player_open` call so the host doesn't spawn an mpv subprocess at
+/// boot — the user might never play anything in this session.
+///
+/// One session is active at a time (PRD §F-015 lifecycle: open replaces
+/// existing). The bridge task forwards [`PlayerEvent`]s to Tauri events
+/// + Continue Watching writes + buffer-monitor position updates.
+#[derive(Default)]
+pub struct PlayerRuntime {
+    /// The active driver. `None` between sessions.
+    active: AsyncMutex<Option<ActivePlayer>>,
+}
+
+struct ActivePlayer {
+    /// Type-erased handle so future backends (libmpv-in-process, Android
+    /// `ExoPlayer` via Tauri plugin) can drop in without touching this
+    /// struct.
+    handle: Arc<dyn PlayerHandle>,
+    /// Tauri-event + CW + buffer-monitor bridge task. Aborted on close.
+    bridge: JoinHandle<()>,
+}
+
+/// Continue-Watching context the frontend attaches to a `player_open`
+/// call. Mirrors the fields the F-012 [`cw_record_position_inner`]
+/// writer expects.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CwContextWire {
+    pub title_id: String,
+    pub kind: TitleKind,
+    pub season: i64,
+    pub episode: i64,
+    pub meta_json: serde_json::Value,
+    /// Series episode list `(season, episode)` — used for the F-012
+    /// next-episode advance. Empty for movies.
+    pub episodes: Vec<(i64, i64)>,
+}
+
+/// Wire request for `player_open`. Camel-cased on the JS side.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayerOpenRequest {
+    /// Stable token for the session. Matches the `start_playback` token
+    /// for torrent-backed playback; empty for direct URLs.
+    pub token: String,
+    /// Stream URL — the local HTTP URL or the direct addon URL.
+    pub url: String,
+    /// Resume position in seconds. `0.0` for fresh playback.
+    pub resume_position_s: f64,
+    /// Optional file name surfaced to the player window / info panel.
+    pub file_name: Option<String>,
+    /// Optional duration hint (the demuxer still detects the real
+    /// duration; this is purely for first-paint UI sizing).
+    pub duration_hint_s: Option<f64>,
+    /// Continue-Watching context. Omit for ad-hoc playback.
+    pub cw_context: Option<CwContextWire>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayerStatusResponse {
+    pub snapshot: PlayerSnapshot,
+    pub tracks: TrackList,
+}
+
+/// `player_open(request)` — boot the platform player and start playback
+/// (PRD §F-015). On Linux the driver is the mpv subprocess shipped in
+/// [`kino_player::MpvPlayer`]. On Android the host's Tauri plugin wraps
+/// `PlayerActivity` and registers itself with the same `PlayerRuntime`
+/// — this command is platform-uniform.
+///
+/// Idempotent: if a session is already active it is closed before the
+/// new one opens.
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri owns the State.
+pub async fn player_open(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    runtime: State<'_, TorrentRuntime>,
+    player: State<'_, Arc<PlayerRuntime>>,
+    request: PlayerOpenRequest,
+) -> Result<(), String> {
+    // PRD §F-015 "open replaces existing": close any active session
+    // before booting the new driver.
+    close_active_player(&player).await;
+
+    let handle: Arc<dyn PlayerHandle> = spawn_platform_player()
+        .await
+        .map_err(|e| format!("player driver: {e}"))?;
+    handle
+        .open(OpenRequest {
+            token: request.token.clone(),
+            url: request.url.clone(),
+            resume_position_s: request.resume_position_s,
+            file_name: request.file_name.clone(),
+            duration_hint_s: request.duration_hint_s,
+        })
+        .await
+        .map_err(|e| format!("player open: {e}"))?;
+
+    let app_clone = app.clone();
+    let db_clone = (*db).clone();
+    let monitors = Arc::clone(&runtime.monitors);
+    let rx = handle.subscribe();
+    let bridge = tokio::spawn(player_bridge_task(
+        app_clone,
+        db_clone,
+        monitors,
+        rx,
+        request.token.clone(),
+        request.cw_context.clone(),
+    ));
+
+    let mut guard = player.active.lock().await;
+    *guard = Some(ActivePlayer { handle, bridge });
+    Ok(())
+}
+
+/// `player_close()` — close the active session. Idempotent: returns
+/// `false` when nothing was running.
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri owns the State.
+pub async fn player_close(player: State<'_, Arc<PlayerRuntime>>) -> Result<bool, String> {
+    Ok(close_active_player(&player).await)
+}
+
+/// `player_pause(paused)` — toggle the playback paused state.
+#[tauri::command]
+pub async fn player_pause(
+    player: State<'_, Arc<PlayerRuntime>>,
+    paused: bool,
+) -> Result<(), String> {
+    let handle = active_handle(&player).await?;
+    handle.set_paused(paused).await.map_err(|e| e.to_string())
+}
+
+/// `player_seek(position_s)` — seek to an absolute time in seconds.
+#[tauri::command]
+pub async fn player_seek(
+    player: State<'_, Arc<PlayerRuntime>>,
+    position_s: f64,
+) -> Result<(), String> {
+    let handle = active_handle(&player).await?;
+    handle.seek(position_s).await.map_err(|e| e.to_string())
+}
+
+/// `player_set_audio_track(track_id)` — select an audio track by
+/// backend id. Passing `null` disables audio.
+#[tauri::command]
+pub async fn player_set_audio_track(
+    player: State<'_, Arc<PlayerRuntime>>,
+    track_id: Option<i64>,
+) -> Result<(), String> {
+    let handle = active_handle(&player).await?;
+    handle
+        .select_audio_track(track_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// `player_set_subtitle_track(track_id)` — select a subtitle track by
+/// backend id. Passing `null` disables subtitles.
+#[tauri::command]
+pub async fn player_set_subtitle_track(
+    player: State<'_, Arc<PlayerRuntime>>,
+    track_id: Option<i64>,
+) -> Result<(), String> {
+    let handle = active_handle(&player).await?;
+    handle
+        .select_subtitle_track(track_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// `player_status()` — snapshot of the active session. Returns `None`
+/// when no session is active.
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri owns the State.
+pub async fn player_status(
+    player: State<'_, Arc<PlayerRuntime>>,
+) -> Result<Option<PlayerStatusResponse>, String> {
+    let guard = player.active.lock().await;
+    Ok(guard.as_ref().map(|a| PlayerStatusResponse {
+        snapshot: a.handle.snapshot(),
+        tracks: a.handle.tracks(),
+    }))
+}
+
+async fn active_handle(
+    player: &State<'_, Arc<PlayerRuntime>>,
+) -> Result<Arc<dyn PlayerHandle>, String> {
+    let guard = player.active.lock().await;
+    guard
+        .as_ref()
+        .map(|a| Arc::clone(&a.handle))
+        .ok_or_else(|| "no active player session".to_string())
+}
+
+async fn close_active_player(player: &State<'_, Arc<PlayerRuntime>>) -> bool {
+    let active = {
+        let mut guard = player.active.lock().await;
+        guard.take()
+    };
+    let Some(active) = active else {
+        return false;
+    };
+    let _ = active.handle.close().await;
+    active.bridge.abort();
+    true
+}
+
+#[cfg(target_os = "linux")]
+async fn spawn_platform_player() -> Result<Arc<dyn PlayerHandle>, PlayerError> {
+    let player = MpvPlayer::spawn().await?;
+    Ok(Arc::new(player))
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn spawn_platform_player() -> Result<Arc<dyn PlayerHandle>, PlayerError> {
+    // PRD §F-015 Android path lives in `android/player-plugin/` and
+    // wires its own `PlayerHandle` impl through a Tauri plugin once it
+    // lands. Until then, surface a clear error.
+    Err(PlayerError::Spawn(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "native player driver not implemented for this platform",
+    )))
+}
+
+/// Fan player events to the four downstream consumers:
+///
+/// * Tauri events `player:position`, `player:state`, `player:tracks`,
+///   `player:exit`, `player:error` (the `SolidJS` overlay listens).
+/// * `cw_record_position` writes when a `CwContextWire` is present, on
+///   the PRD §8 `PLAYER_POSITION_INTERVAL_S = 5 s` cadence the driver
+///   already enforces — the bridge writes on every tick (no extra
+///   rate-limit) and ALWAYS on the terminal `Exit` event so the final
+///   position lands in CW.
+/// * `BufferMonitor::update_position` calls when a buffer monitor is
+///   registered for the same token — this is the F-014 "recomputed on
+///   events" path.
+///
+/// The bridge runs as a `tokio::spawn` task; it terminates when the
+/// player's event sender drops or after a terminal event is forwarded.
+async fn player_bridge_task(
+    app: tauri::AppHandle,
+    db: Db,
+    monitors: Arc<StdMutex<HashMap<uuid::Uuid, MonitorEntry>>>,
+    mut rx: tokio::sync::broadcast::Receiver<PlayerEvent>,
+    playback_token: String,
+    cw_context: Option<CwContextWire>,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+    let monitor_uuid = uuid::Uuid::parse_str(&playback_token).ok();
+
+    loop {
+        match rx.recv().await {
+            Ok(ev) => {
+                let terminal = ev.is_terminal();
+                handle_player_event(&app, &db, &monitors, monitor_uuid, cw_context.as_ref(), &ev)
+                    .await;
+                if terminal {
+                    break;
+                }
+            }
+            Err(RecvError::Closed) => break,
+            Err(RecvError::Lagged(n)) => {
+                tracing::warn!(skipped = n, "player event channel lagged");
+            }
+        }
+    }
+}
+
+async fn handle_player_event(
+    app: &tauri::AppHandle,
+    db: &Db,
+    monitors: &Arc<StdMutex<HashMap<uuid::Uuid, MonitorEntry>>>,
+    monitor_uuid: Option<uuid::Uuid>,
+    cw_context: Option<&CwContextWire>,
+    ev: &PlayerEvent,
+) {
+    match ev {
+        PlayerEvent::Position {
+            position_s,
+            duration_s,
+            paused: _,
+        } => {
+            emit_player_event(app, "player:position", ev);
+            // Feed the F-014 buffer monitor.
+            if let Some(uuid) = monitor_uuid {
+                if let Ok(g) = monitors.lock() {
+                    if let Some(entry) = g.get(&uuid) {
+                        entry.monitor.update_position(position_s.max(0.0));
+                    }
+                }
+            }
+            // Persist Continue Watching.
+            if let Some(ctx) = cw_context {
+                let now = i64::try_from(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                )
+                .unwrap_or(i64::MAX);
+                let entry = ContinueWatching {
+                    title_id: ctx.title_id.clone(),
+                    kind: ctx.kind,
+                    season: ctx.season,
+                    episode: ctx.episode,
+                    position_s: *position_s,
+                    duration_s: *duration_s,
+                    last_played_at: now,
+                    meta_json: ctx.meta_json.clone(),
+                };
+                if let Err(e) = cw_record_position_inner(db, entry, &ctx.episodes).await {
+                    tracing::warn!(error = %e, "cw_record_position on tick failed");
+                }
+            }
+        }
+        PlayerEvent::State { .. } => {
+            emit_player_event(app, "player:state", ev);
+        }
+        PlayerEvent::Tracks { .. } => {
+            emit_player_event(app, "player:tracks", ev);
+        }
+        PlayerEvent::Exit {
+            position_s,
+            duration_s,
+            reached_eof,
+        } => {
+            // Persist the final position before emitting Exit so any
+            // listener that responds to the event (frontend navigating
+            // back, etc.) finds Continue Watching already up to date.
+            if let Some(ctx) = cw_context {
+                let now = i64::try_from(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                )
+                .unwrap_or(i64::MAX);
+                let entry = ContinueWatching {
+                    title_id: ctx.title_id.clone(),
+                    kind: ctx.kind,
+                    season: ctx.season,
+                    episode: ctx.episode,
+                    // PRD §F-012: a clean EOF should look like a watched
+                    // title (>= 95% threshold) so the auto-removal sweep
+                    // picks it up. Bump position to duration on EOF.
+                    position_s: if *reached_eof {
+                        duration_s.max(*position_s)
+                    } else {
+                        *position_s
+                    },
+                    duration_s: *duration_s,
+                    last_played_at: now,
+                    meta_json: ctx.meta_json.clone(),
+                };
+                if let Err(e) = cw_record_position_inner(db, entry, &ctx.episodes).await {
+                    tracing::warn!(error = %e, "cw_record_position on exit failed");
+                }
+            }
+            emit_player_event(app, "player:exit", ev);
+        }
+        PlayerEvent::Error { .. } => {
+            emit_player_event(app, "player:error", ev);
+        }
+    }
+}
+
+fn emit_player_event(app: &tauri::AppHandle, name: &str, ev: &PlayerEvent) {
+    if let Err(e) = app.emit(name, ev) {
+        tracing::warn!(error = %e, event = name, "player event emit failed");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

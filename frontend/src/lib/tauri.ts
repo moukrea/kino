@@ -707,3 +707,213 @@ export async function onBufferStatus(
   const { listen } = await import("@tauri-apps/api/event");
   return listen<BufferStatusEvent>("buffer:status", (e) => handler(e.payload));
 }
+
+// ---- F-015: native player driver ----------------------------------------
+
+/**
+ * Possible player states. Camel-cased on the wire to match the Rust
+ * `PlayerState` enum and the Tauri event payloads from
+ * `src-tauri/src/commands.rs` / `kino_player::PlayerState`.
+ */
+export type PlayerState =
+  | "idle"
+  | "loading"
+  | "playing"
+  | "paused"
+  | "buffering"
+  | "ended"
+  | "error";
+
+/**
+ * Snapshot returned by [`playerStatus`]. Mirrors
+ * `kino_player::PlayerSnapshot`.
+ */
+export type PlayerSnapshot = {
+  token: string;
+  state: PlayerState;
+  positionS: number;
+  durationS: number;
+  paused: boolean;
+};
+
+/**
+ * Audio / subtitle track descriptor returned by the player. Camel-cased
+ * mirror of `kino_player::AudioTrack` / `SubtitleTrack`.
+ */
+export type AudioTrack = {
+  id: number;
+  title: string | null;
+  language: string | null;
+  codec: string | null;
+  channels: number | null;
+  isDefault: boolean;
+  isSelected: boolean;
+};
+
+export type SubtitleTrack = {
+  id: number;
+  title: string | null;
+  language: string | null;
+  codec: string | null;
+  isDefault: boolean;
+  isForced: boolean;
+  isSelected: boolean;
+};
+
+export type PlayerTrackList = {
+  audio: AudioTrack[];
+  subtitles: SubtitleTrack[];
+};
+
+export type PlayerStatusResponse = {
+  snapshot: PlayerSnapshot;
+  tracks: PlayerTrackList;
+};
+
+/**
+ * Continue-Watching context attached to a `playerOpen` call. The
+ * backend fans every position tick + the terminal Exit event into
+ * `cw_record_position` so the user's Continue Watching row is always
+ * up to date without the frontend issuing its own writes.
+ */
+export type PlayerCwContext = {
+  titleId: string;
+  kind: "movie" | "series";
+  season: number;
+  episode: number;
+  metaJson: unknown;
+  /** Sorted list of `[season, episode]` tuples for next-episode advance. */
+  episodes: [number, number][];
+};
+
+/**
+ * Wire request for `playerOpen`. Mirrors `PlayerOpenRequest` in
+ * `src-tauri/src/commands.rs`.
+ */
+export type PlayerOpenRequest = {
+  token: string;
+  url: string;
+  resumePositionS: number;
+  fileName?: string | null;
+  durationHintS?: number | null;
+  cwContext?: PlayerCwContext | null;
+};
+
+/**
+ * `player_open` (PRD §F-015). Boots the platform driver (mpv on Linux;
+ * the Tauri-plugin-wrapped `PlayerActivity` on Android) and starts
+ * playback. Idempotent — calling twice closes the prior session first.
+ */
+export async function playerOpen(request: PlayerOpenRequest): Promise<void> {
+  await invoke<void>("player_open", { request });
+}
+
+/**
+ * `player_close` — close the active session. Returns `false` when
+ * nothing was running.
+ */
+export async function playerClose(): Promise<boolean> {
+  return invoke<boolean>("player_close");
+}
+
+/** `player_pause(paused)` — toggle the pause state. */
+export async function playerPause(paused: boolean): Promise<void> {
+  await invoke<void>("player_pause", { paused });
+}
+
+/** `player_seek(positionS)` — seek to an absolute time in seconds. */
+export async function playerSeek(positionS: number): Promise<void> {
+  await invoke<void>("player_seek", { positionS });
+}
+
+/** `player_set_audio_track(trackId)` — select an audio track (null = disable). */
+export async function playerSetAudioTrack(
+  trackId: number | null,
+): Promise<void> {
+  await invoke<void>("player_set_audio_track", { trackId });
+}
+
+/** `player_set_subtitle_track(trackId)` — select a subtitle track (null = disable). */
+export async function playerSetSubtitleTrack(
+  trackId: number | null,
+): Promise<void> {
+  await invoke<void>("player_set_subtitle_track", { trackId });
+}
+
+/** `player_status()` — snapshot of the active session, or `null`. */
+export async function playerStatus(): Promise<PlayerStatusResponse | null> {
+  return invoke<PlayerStatusResponse | null>("player_status");
+}
+
+/**
+ * Discriminated player-event payload (PRD §F-015). Tauri events are
+ * emitted on the channels `player:position`, `player:state`,
+ * `player:tracks`, `player:exit`, `player:error`. Subscribers can
+ * use [`onPlayerEvent`] to subscribe to all of them at once, or the
+ * channel-specific helpers below.
+ */
+export type PlayerEvent =
+  | {
+      kind: "position";
+      positionS: number;
+      durationS: number;
+      paused: boolean;
+    }
+  | { kind: "state"; state: PlayerState }
+  | { kind: "tracks"; tracks: PlayerTrackList }
+  | {
+      kind: "exit";
+      positionS: number;
+      durationS: number;
+      reachedEof: boolean;
+    }
+  | { kind: "error"; message: string };
+
+/**
+ * Subscribe to one of the `player:*` Tauri events. Returns a Promise
+ * of an `unlisten` function the caller should invoke from `onCleanup`.
+ *
+ * Resolves to a no-op `unlisten` when the Tauri bridge isn't present
+ * (vitest jsdom / plain `vite dev`), so consumer code can `await` it
+ * unconditionally.
+ */
+async function subscribePlayerEvent<T extends PlayerEvent>(
+  channel: string,
+  handler: (event: T) => void,
+): Promise<() => void> {
+  if (!hasTauri()) {
+    return () => {};
+  }
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<T>(channel, (e) => handler(e.payload));
+}
+
+export async function onPlayerPosition(
+  handler: (event: Extract<PlayerEvent, { kind: "position" }>) => void,
+): Promise<() => void> {
+  return subscribePlayerEvent("player:position", handler);
+}
+
+export async function onPlayerState(
+  handler: (event: Extract<PlayerEvent, { kind: "state" }>) => void,
+): Promise<() => void> {
+  return subscribePlayerEvent("player:state", handler);
+}
+
+export async function onPlayerTracks(
+  handler: (event: Extract<PlayerEvent, { kind: "tracks" }>) => void,
+): Promise<() => void> {
+  return subscribePlayerEvent("player:tracks", handler);
+}
+
+export async function onPlayerExit(
+  handler: (event: Extract<PlayerEvent, { kind: "exit" }>) => void,
+): Promise<() => void> {
+  return subscribePlayerEvent("player:exit", handler);
+}
+
+export async function onPlayerError(
+  handler: (event: Extract<PlayerEvent, { kind: "error" }>) => void,
+): Promise<() => void> {
+  return subscribePlayerEvent("player:error", handler);
+}
