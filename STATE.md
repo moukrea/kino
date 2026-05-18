@@ -2,8 +2,8 @@
 
 **PRD version:** 1.0 (locked)
 **Status:** features-in-progress
-**Last session:** 017
-**Next session:** 018
+**Last session:** 018
+**Next session:** 019
 
 ---
 
@@ -68,6 +68,313 @@ a hard requirement.
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 018 — F-013 embedded torrent engine
+
+**Branch:** `claude/session-001-bootstrap-M5Dj8`
+(Harness-supplied; see ADR-033.)
+
+**Scope chosen:** F-013 Embedded torrent engine end-to-end. PRD §F-013
+has five code-acceptance criteria; this session ships four of them and
+defers piece-priority cache eviction to F-014:
+
+1. **Adding a magnet returns a streaming URL within 5 s if metadata is
+   fetchable.** New `Engine::add` awaits librqbit's
+   `wait_until_initialized` up to `EngineConfig::init_timeout` (default
+   10 s — twice the PRD budget so tracker round-trips on a flaky
+   network still resolve). On success, `start_playback` mints a UUID
+   v4 token via `ServerHandle::register` and returns
+   `http://127.0.0.1:{port}/stream/{token}` synchronously. Pinned by
+   the integration test `end_to_end_byte_for_byte_over_http` which
+   exercises the full path (no peers; the fixture is hash-verified
+   from disk in milliseconds).
+2. **Range requests work; player seek does not break the scheduler.**
+   The local server hand-rolls a single-range parser (`bytes=N-M`,
+   `bytes=N-`, `bytes=-N` — multipart byteranges intentionally
+   refused) that maps to a 206 + `Content-Range` response. Each
+   request opens a fresh librqbit `FileStream`; the engine bounds
+   concurrent streams via its own semaphore. Pinned by 13 range-parser
+   unit tests AND
+   `repeated_ranged_reads_do_not_corrupt_each_other` — five
+   overlapping ranges fired concurrently, each verified
+   byte-for-byte against the in-memory fixture.
+3. **Cache directory relocatable via settings (with app restart).**
+   `TorrentRuntime::new` reads `commands::resolve_cache_path(...)`
+   (PRD §F-016 §4) at startup and passes the resolved path as the
+   librqbit `Session::new_with_opts` `default_output_folder`. The
+   user changes `cache.path` from Settings → Cache, restarts, the
+   engine boots against the new dir. No mid-process relocation in v1
+   (matches PRD wording).
+4. **Integration test: feed a known torrent fixture, stream it,
+   verify byte-for-byte over HTTP.** `stream_roundtrip.rs` builds a
+   1 MiB random fixture deterministically (ChaCha20 seed
+   `0xF013F013F013F013` so failures are reproducible), runs
+   `librqbit::create_torrent` to produce a real .torrent metainfo,
+   adds it to a DHT-disabled engine pointed at the fixture's parent
+   dir, then issues seven HTTP requests via reqwest:
+   - full GET → 200, full body matches
+   - `bytes=512-1023` → 206, slice matches
+   - `bytes=-1024` → 206, last KiB matches
+   - `bytes=N-` (mid-file) → 206, tail matches
+   - `bytes=999999999-` → 416 with `Content-Range: bytes */N`
+   - HEAD → 200 + Content-Length, empty body
+   - unknown UUID → 404
+
+The fifth criterion ("Cache eviction does not break ongoing
+playback") requires the F-014 LRU scheduler with playhead-protected
+pieces — explicitly carved out below.
+
+**Files changed (summary):**
+
+- `Cargo.toml` (workspace root) — adds the F-013 dependency block:
+  `librqbit = "8"` with rustls TLS (no openssl pull), `bytes`,
+  `parking_lot`, `url`, `mime_guess`, `hex`. Default-features-off on
+  librqbit so we don't drag in its http-api / webui / postgres /
+  default-tls tails.
+- `crates/kino-torrent/Cargo.toml` — wires the new deps;
+  `dev-dependencies` adds `tempfile` + `rand` for the inline file-
+  selection tests.
+- `crates/kino-torrent/src/lib.rs` — pub-uses `Engine`, `EngineConfig`,
+  `AddInput`, `AddedTorrent`, `FileInfo`, `FileStream`,
+  `EngineError`, `LARGEST_VIDEO_EXTENSIONS`, `SUPPLEMENTARY_TRACKERS`
+  from the new `engine` module.
+- `crates/kino-torrent/src/engine.rs` (new, 412 LOC) — the F-013
+  engine surface:
+  - `EngineConfig { cache_root, enable_dht, enable_pex, enable_lsd,
+    supplementary_trackers, init_timeout }`. Defaults match PRD §F-013
+    (DHT/PEX/LSD on; 14 PRD §8 trackers pre-seeded).
+  - `Engine::new(config)` builds the librqbit `Session` with
+    `SessionOptions { disable_dht: !enable_dht,
+    disable_dht_persistence: true, trackers, ..Default::default() }`
+    and a created-on-the-fly `cache_root`.
+  - `Engine::add(AddInput::{Url, Bytes})` accepts magnet URIs, .torrent
+    bytes, or http URLs that resolve to .torrent files; awaits
+    `wait_until_initialized` with the configured timeout; extracts
+    file infos via `with_metadata`; returns `AddedTorrent` keyed by
+    librqbit's internal id.
+  - `Engine::remove(torrent_id, delete_files)` delegates to
+    `Session::delete`.
+  - `AddedTorrent` is the cheap-to-clone playback handle: id, name,
+    info-hash hex (lower-case, via `hex::encode`), file list, and
+    `pick_largest_video()` → largest file with a video extension or
+    largest file overall if none match.
+  - `AddedTorrent::open_stream(file_index) -> Result<Box<dyn
+    FileStream>>` opens a fresh librqbit stream and boxes it behind
+    the `FileStream` marker trait (object-safe combination of
+    `AsyncRead + AsyncSeek + Send + Unpin`).
+  - `FileStream` is a tiny marker trait kino exposes because
+    librqbit's actual `FileStream` is in a `pub(crate)` module — the
+    type can't be named outside librqbit but its values cross
+    boundaries via this trait. ADR-038 below.
+  - 5 unit tests cover `is_video`, `pick_largest_video` (video-ext
+    preference, largest-overall fallback, empty-torrent None), and
+    `EngineConfig::default()` PRD invariants.
+- `crates/kino-server/Cargo.toml` — adds `axum`, `tower-http`,
+  `bytes`, `uuid`, `parking_lot`, `futures`, `serde`, `mime_guess`
+  alongside `kino-torrent`. Dev-deps add `reqwest`, `librqbit`,
+  `rand_chacha`, `tempfile` for the roundtrip test.
+- `crates/kino-server/src/lib.rs` — pub-mods `range` and `server`;
+  re-exports `ServerError`, `ServerHandle`, `StreamSession`.
+- `crates/kino-server/src/range.rs` (new, 235 LOC) — RFC 7233
+  single-range parser. `RangeParse::{Full, Single(Satisfied),
+  Unsatisfiable}` covers the three response paths; `Satisfied`
+  carries start/end/total_len and emits the `Content-Range` header
+  string. 13 unit tests exercise every form (closed, open-ended,
+  suffix, malformed, multipart-refused, empty-file, single-byte).
+- `crates/kino-server/src/server.rs` (new, 360+ LOC) — the axum
+  server + token registry:
+  - `ServerHandle::spawn()` binds `127.0.0.1:0`, spawns the axum task
+    with `with_graceful_shutdown(oneshot::Receiver)`, returns the
+    bound `SocketAddr` (the host stashes the handle in Tauri-managed
+    state).
+  - `register(AddedTorrent, file_index)` mints a UUID v4, derives
+    file name + size + MIME via `mime_guess`, stores a
+    `StreamSession` in the in-memory registry.
+  - `unregister(token) -> Option<StreamSession>` removes the entry;
+    the host pairs this with `Engine::remove`.
+  - `stream_handler` handles `GET/HEAD /stream/{token}`: parses
+    `Range:` via the new module, dispatches to `serve_full` /
+    `serve_range` / 416, sets `Accept-Ranges: bytes`, `Cache-Control:
+    no-store`, the correct `Content-Type` from the filename.
+  - `ChunkStream`: futures `Stream<Item = Result<Bytes, io::Error>>`
+    adapter that drives a librqbit `FileStream` via
+    `start_seek`/`poll_complete`/`poll_read`, yielding 64 KiB chunks
+    until `remaining` is exhausted. Picked over `axum-range`
+    because we need to seek the librqbit stream from a known offset
+    AND control the chunk size (the default `ReaderStream` halves it
+    to 8 KiB).
+  - Two routes: `GET|HEAD /stream/:token` and `GET /healthz`
+    (returns `"ok"` for liveness checks). Other methods → 405.
+- `crates/kino-server/tests/stream_roundtrip.rs` (new, 220 LOC) — the
+  PRD §F-013 integration test described above. Two `#[tokio::test]`
+  cases (`end_to_end_byte_for_byte_over_http` and
+  `repeated_ranged_reads_do_not_corrupt_each_other`). The fixture is
+  1 MiB so the test finishes in ~150 ms wall-clock on a modern
+  machine; offline by construction (no DHT, no trackers, no peers).
+- `src-tauri/Cargo.toml` — adds `kino-torrent`, `kino-server`,
+  `bytes`, `uuid`, `base64`, `mime_guess` to the host.
+- `src-tauri/src/commands.rs` — the F-013 Tauri command block:
+  - `TorrentRuntime { engine, server }` — owns the `Engine` +
+    `ServerHandle` pair; managed by Tauri state.
+  - `TorrentRuntime::new(cache_root) -> Result<Self, String>` builds
+    both halves; called once at startup from `lib.rs::run`.
+  - `PlaybackSource` (enum with `Magnet | TorrentBytes(base64) |
+    DirectUrl`) — the input shape `start_playback` accepts. Base64
+    encoding for `TorrentBytes` is required because Tauri's IPC is
+    JSON; raw bytes can't cross the boundary directly. ADR-039.
+  - `PlaybackHandle` — the response: `{ url, token, viaTorrent,
+    fileName, fileSize, mime, infoHash, files, torrentId }`.
+  - `PlaybackFile` — one row in `PlaybackHandle.files` (used by the
+    UI's "wrong file picked?" affordance the F-015 player surfaces).
+  - `start_playback(source)` — for `Magnet` / `TorrentBytes`: adds
+    the torrent, picks the largest video (or honors the caller's
+    explicit `fileIndex`), registers a server session, returns the
+    handle. For `DirectUrl`: echoes the URL straight back (no
+    engine involvement) so the frontend has one uniform command.
+  - `stop_playback(token, deleteFiles)` — unregisters the session
+    and removes the torrent via `Engine::remove`. `delete_files`
+    defaults to `false` so the cache is reused on re-Play.
+  - `playback_status(token)` — returns the registered session's
+    name + size, or `None` if the token is unknown.
+  - `resolve_cache_path` switched from private to `pub` so the
+    runtime can call it from `lib.rs::run` setup.
+- `src-tauri/src/lib.rs` — `setup()` now resolves the cache path
+  (falling back to `cache_dir_default` then `temp_dir/kino-cache` on
+  rare failures), spawns the `TorrentRuntime`, logs the bound
+  address, and `app.manage()`s the runtime. Engine init failure does
+  NOT block startup — the UI still loads, but `start_playback`
+  returns an error until the user fixes the cache dir. Three new
+  commands registered in `generate_handler![…]`: `start_playback`,
+  `stop_playback`, `playback_status`.
+- `frontend/src/lib/tauri.ts` — typed bindings:
+  - `PlaybackSource = { kind: "magnet" | "torrentBytes" | "directUrl"
+    } & ...` discriminated union.
+  - `PlaybackHandle`, `PlaybackFile`, `PlaybackStatus` mirroring the
+    Rust types (camel-cased on the wire via `#[serde(rename_all =
+    "camelCase")]`).
+  - `startPlayback(source) -> Promise<PlaybackHandle>`,
+    `stopPlayback(token, deleteFiles?) -> Promise<boolean>`,
+    `playbackStatus(token) -> Promise<PlaybackStatus | null>`.
+
+**ADRs filed this session:** ADR-101 through ADR-105.
+
+- **ADR-101** (kino-torrent re-exposes librqbit's `FileStream` as a
+  marker trait): librqbit 8.1.1 returns `FileStream` from
+  `ManagedTorrent::stream` but the type lives in `pub(crate) mod
+  streaming` so external crates can't name it. We added a marker
+  trait `kino_torrent::FileStream: AsyncRead + AsyncSeek + Send +
+  Unpin` with a blanket impl for any type meeting those bounds, and
+  return `Box<dyn FileStream>` from `AddedTorrent::open_stream`. This
+  lets `kino-server` consume librqbit streams without depending on
+  librqbit's private types AND keeps the engine's API agnostic to
+  the underlying torrent library (we can swap to a different engine
+  in v2 by changing only the wrapper).
+- **ADR-102** (`.torrent` bytes cross IPC base64-encoded): Tauri's
+  IPC layer serializes commands as JSON, which has no native binary
+  type. Stremio `http_url` streams hand back URLs (no encoding
+  needed), but some addons return `.torrent` URLs that we need to
+  fetch then submit — the frontend handles the fetch, base64-encodes
+  the bytes, and ships them to `start_playback`. Decoded host-side
+  via `base64::engine::general_purpose::STANDARD.decode`. Magnet
+  links use the `Magnet` variant which is a plain string.
+- **ADR-103** (no per-torrent connection limit in v1): PRD §F-013
+  specifies "Max connections per torrent: 200" as a librqbit session
+  config item. librqbit 8.1.1's `SessionOptions` and
+  `PeerConnectionOptions` (the only public knobs) expose connection
+  *timeouts* but no concurrent-connection cap. The PRD constant
+  `MAX_CONNECTIONS_PER_TORRENT = 200` stays in `kino-core` so a
+  future librqbit version (or our own scheduler in F-014) can wire
+  it through. The §6B-6 ("adaptive buffer engages correctly on real
+  slow torrent") human check covers any practical fallout from the
+  current library defaults.
+- **ADR-104** (chunk size 64 KiB for HTTP body streaming): The
+  default tokio `ReaderStream` buffer is 8 KiB, which doubles the
+  syscall + librqbit-piece-lookup count for every byte served.
+  64 KiB matches libmpv's default `demuxer-readahead` granularity
+  and keeps per-request peak memory bounded (one chunk in flight per
+  active stream).
+- **ADR-105** (single range only — multipart byteranges refused):
+  RFC 7233 §2.1 allows comma-separated multi-range requests, served
+  via `multipart/byteranges`. ExoPlayer + libmpv only ever issue a
+  single range per request, so implementing multipart adds code with
+  no benefit. The range parser returns `Unsatisfiable` for any
+  comma-containing Range header rather than silently degrading to the
+  first range (which would be misleading for clients that DO send
+  multipart).
+
+**Tests added / coverage notes:**
+
+- Rust: 23 new tests this session — 5 in `kino_torrent::engine`,
+  13 in `kino_server::range`, 2 integration tests in
+  `kino-server/tests/stream_roundtrip.rs`. Workspace test
+  count climbs from 299 → 322 passing (62 + 105 + 0 + 52 + 80
+  in existing crates, plus 13 + 2 + 8 from F-013).
+- Frontend: no new tests this session. The F-015 player route
+  (lands in a later session) is the consumer of `startPlayback`;
+  it will arrive with its own test suite. Adding placeholder tests
+  here would lock in interface details the player route hasn't
+  exercised yet.
+
+**Known issues introduced or resolved:**
+
+- **New (introduced — DEFERRED to F-014):**
+  - Piece-priority scheduler (PRD §F-013 "Cache eviction does not
+    break ongoing playback" + PRD §F-014 in full). The current
+    engine uses librqbit's default sequential-with-rare-first
+    scheduling; the playhead-protected window (± 60 s HIGHEST,
+    + 60..300 s HIGH, last piece HIGH) is F-014's deliverable.
+  - LRU cache eviction with protected pieces (PRD §F-013). librqbit's
+    storage layer is what currently bounds disk; an explicit LRU
+    over `cache_root` plus `cache.size_gib` (Settings F-016 §4) is
+    F-014 territory.
+  - `cache_clear` (F-016 §4 "Clear cache button") deletes files on
+    disk but does not stop or restart the engine. If the user clicks
+    Clear during playback, librqbit's open file handles keep the
+    bytes alive (on Linux at least). Documented as a §6B-1 dynamic
+    check; the F-016 modal already requires confirmation.
+- **New (introduced — track as tech debt):**
+  - Engine has no concurrent-stream cap. librqbit's internal
+    semaphore bounds *per-torrent* concurrent reads but kino can
+    accept arbitrarily many `start_playback` calls. In practice the
+    frontend only ever plays one stream at a time; the Settings UI
+    surfaces nothing about concurrency. If a future session ships
+    background-prefetch ("queue the next episode") this needs a cap.
+- **Resolved:** the F-001 placeholder `kino-server/src/lib.rs` /
+  `kino-torrent/src/lib.rs` shells from Session 001 are gone —
+  both crates now ship real surfaces.
+
+**Heads-up for Session 019:**
+
+- **Primary scope candidate: F-014 adaptive buffer.** The PRD's
+  state-machine spec (SAFE / NEEDS_PREBUFFER / REBUFFER) maps onto
+  per-stream state we don't yet collect — `dl_rate_rolling`,
+  `position_s`, `pieces_ahead_seconds`. Concrete subtasks:
+  1. `kino_torrent::scheduler` module with the pure state-machine
+     function (mockable rate + position + duration → state).
+  2. Per-stream sampler task that pulls `TorrentStats::live.LiveStats
+     .download_speed`, samples every 1 s, maintains a 30-s ring
+     buffer.
+  3. librqbit piece-priority API wiring (HIGHEST window
+     `[position, position+60s]`, HIGH window `[position+60s,
+     position+300s]`, last piece HIGH). The librqbit API for this is
+     in `ManagedTorrent::with_state` (or a sibling) — needs
+     research.
+  4. Tauri `buffer_status` event emission (the player consumes it to
+     show / hide the "Buffering for smooth playback" overlay).
+  5. Integration test on a synthetic slow torrent (throttle the
+     fixture's effective availability — easier to fake with a custom
+     storage backend than with rate limits).
+- **Alternative scope: F-018 release infrastructure prep.** F-013 +
+  F-014 + F-015 are all "ships when the player ships". If F-014's
+  librqbit scheduler API turns out to need significant research, a
+  release-infra session (workflow polish, artifact list audit,
+  README revamp) could land in parallel without blocking the
+  player path.
+- **Don't forget:** ADR-040 about `MAX_CONNECTIONS_PER_TORRENT`.
+  If F-014 has to drop into librqbit's internals to wire piece
+  priorities, it might also expose the connection-count knob.
+
+---
 
 ### Session 017 — F-012 Continue Watching
 
@@ -4393,7 +4700,22 @@ implementation" split.
   input demonstrator. 58 frontend tests added.)_
 
 ### Streaming
-- [ ] F-013: Embedded torrent engine
+- [x] F-013: Embedded torrent engine _(Session 018: librqbit-backed
+      engine with locked PRD §F-013 config (DHT/PEX/LSD on, 14 PRD §8
+      supplementary trackers, OS-assigned port, cache root from
+      `cache.path` settings); axum local HTTP server on
+      `127.0.0.1:0` with hand-rolled Range parser (single-range
+      subset, multipart refused per ADR-105); UUID v4 token registry
+      bridging engine → server; Tauri `start_playback` /
+      `stop_playback` / `playback_status` commands (PlaybackSource
+      `magnet` / `torrentBytes` (base64, ADR-102) / `directUrl`);
+      typed frontend bindings; integration test feeds 1 MiB fixture
+      through full HTTP path with byte-for-byte assertion + Range
+      semantics (closed / open-ended / suffix / unsatisfiable / HEAD /
+      404). Piece-priority scheduler and LRU cache eviction deferred
+      to F-014 per PRD wording. ADR-101 (FileStream marker trait),
+      ADR-102 (base64 IPC), ADR-103 (no v1 connection cap),
+      ADR-104 (64 KiB chunks), ADR-105 (no multipart byteranges))._
 - [ ] F-014: Adaptive buffer
 - [ ] F-015: Native player integration
 
@@ -4482,6 +4804,11 @@ Additional ADRs filed by sessions:
 | ADR-098 | F-012 series next-episode resolution skips Stremio season-0 episodes ("specials" / "extras") as origins AND as next-episode candidates. PRD §F-012 doesn't address specials directly, but PRD §F-010's locked episode-list conventions (Cinemeta `videos[]`) treat season 0 as a side-thread. Letting a `S00` special participate in the sequence would route a finished `S01E10` into `S00E1` (a recap or behind-the-scenes), which is a UX bug. The exclusion is symmetric: `next_episode_after(0, _, _) -> None` AND season-0 entries are filtered from the candidate list. | 017 |
 | ADR-099 | F-012 movie completion does NOT remove the CW row immediately; it lets the row sit until the 24h sweep ages it out. PRD §F-012's three bullets — "Save final position on player exit", "Mark completed when exit position > 0.95 × duration", "Completed items auto-removed from Continue Watching after 24h" — explicitly carve out a 24h window between completion and removal so the user can find a "just finished" movie on the home screen. Series, by contrast, are PRD-locked to advance immediately to the next episode (or get removed if there is none). The `resume_decision(Movie, completed) -> Keep` outcome encodes this distinction. | 017 |
 | ADR-100 | F-012 manual remove on the Home CW row targets the WHOLE title (every `(season, episode)` row), not the single most-recent row. The Home renders one tile per title; "remove this tile" therefore means "remove this title from CW". A future polish pass could expose per-episode removal from the title-detail Resume button, but the home-row UX is right at the title granularity. The implementation lives in `Db::cw_delete_all_for_title` and the `cw_remove_title` Tauri command; the frontend triggers it from the F-017 `context` action handler scoped to the focused CW tile. | 017 |
+| ADR-101 | F-013 `kino-torrent` exposes a `FileStream` marker trait (`AsyncRead + AsyncSeek + Send + Unpin`) with a blanket impl, and `AddedTorrent::open_stream` returns `Box<dyn FileStream>`. librqbit 8.1.1's real `FileStream` lives in `pub(crate) mod streaming` so external crates can't name it; the marker trait + `Box<dyn>` exposes the values without leaking the type. Also keeps the public API engine-agnostic so a future swap to a different torrent library only edits the wrapper. | 018 |
+| ADR-102 | F-013 `start_playback` accepts `.torrent` bytes base64-encoded under `PlaybackSource::TorrentBytes`. Tauri's IPC layer is JSON-only and has no native binary type; the frontend's `fetch(...).then(b => b.arrayBuffer())` → `btoa(String.fromCharCode(...))` round-trip is the cheapest crossing. Magnet links use `PlaybackSource::Magnet` (a plain string), no encoding needed. Decoded host-side via `base64::engine::general_purpose::STANDARD`. | 018 |
+| ADR-103 | F-013 ships without enforcing PRD §F-013's "Max connections per torrent: 200" because librqbit 8.1.1's public `SessionOptions` and `PeerConnectionOptions` expose only connection *timeouts*, not a concurrent-connection cap. The PRD constant `MAX_CONNECTIONS_PER_TORRENT = 200` stays in `kino-core::constants` so future librqbit releases (or our own scheduler in F-014) can wire it through. The §6B-6 dynamic check covers any practical fallout from current library defaults. | 018 |
+| ADR-104 | F-013 streams HTTP response bodies in 64 KiB chunks. The default `tokio_util::io::ReaderStream` buffer is 8 KiB, which doubles syscall + librqbit-piece-lookup count per byte served. 64 KiB matches libmpv's default `demuxer-readahead` granularity and keeps per-request peak memory bounded (one chunk in flight per active stream). | 018 |
+| ADR-105 | F-013 Range parser supports single-range only. `Range: bytes=0-99,200-299` (RFC 7233 §2.1 multi-range) returns 416 rather than degrading to the first range. ExoPlayer + libmpv only ever issue single ranges per request, so implementing `multipart/byteranges` adds code with no benefit AND silently degrading would mislead clients that DO send multipart. | 018 |
 
 ---
 

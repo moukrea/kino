@@ -37,6 +37,14 @@ axum = "0.7"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 
+# Embedded torrent engine (per PRD §F-013)
+librqbit = { version = "8", default-features = false, features = ["rust-tls"] }
+bytes = "1"
+parking_lot = "0.12"
+url = "2"
+mime_guess = "2"
+hex = "0.4"
+
 # Persistence (per PRD §3)
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "macros", "migrate", "chrono"] }
 

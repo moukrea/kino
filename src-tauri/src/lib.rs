@@ -20,6 +20,8 @@ use kino_core::Db;
 use tauri::Manager;
 use tracing_appender::non_blocking::WorkerGuard;
 
+use commands::TorrentRuntime;
+
 /// Holder for the rolling-file-appender worker guard. The guard must outlive
 /// the process so the appender thread flushes buffered log lines on exit;
 /// stashing it in Tauri's managed state is the idiomatic pattern.
@@ -65,6 +67,37 @@ pub fn run() {
             // marker); failure here doesn't block startup — the user can
             // retry from Settings → Addons.
             tauri::async_runtime::block_on(commands::bootstrap_default_addons(&db));
+
+            // PRD §F-013: bring up the librqbit-backed torrent engine and
+            // local HTTP server. Cache root honors the user's
+            // `cache.path` setting (F-016 §4) with a fall-back to
+            // `cache_dir_default`. Engine init failure does NOT block
+            // startup — the UI still loads, but `start_playback` will
+            // return an error until the user fixes the cache dir.
+            let cache_root = tauri::async_runtime::block_on(async {
+                match commands::resolve_cache_path(&handle, &db).await {
+                    Ok(p) => std::path::PathBuf::from(p),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "cache path unresolved; using default");
+                        paths::cache_dir_default(&handle).unwrap_or_else(|_| {
+                            std::env::temp_dir().join("kino-cache")
+                        })
+                    }
+                }
+            });
+            match tauri::async_runtime::block_on(TorrentRuntime::new(cache_root)) {
+                Ok(runtime) => {
+                    tracing::info!(
+                        addr = %runtime.server.addr(),
+                        "kino torrent engine + HTTP server ready"
+                    );
+                    app.manage(runtime);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "torrent runtime failed to start; playback unavailable");
+                }
+            }
+
             app.manage(db);
             tracing::info!("kino host started (PRD §F-002 persistence ready)");
             Ok(())
@@ -111,6 +144,9 @@ pub fn run() {
             commands::cache_clear,
             commands::export_logs,
             commands::get_app_info,
+            commands::start_playback,
+            commands::stop_playback,
+            commands::playback_status,
         ])
         .run(tauri::generate_context!())
         .expect("kino: error while running tauri application");
