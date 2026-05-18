@@ -2,8 +2,8 @@
 
 **PRD version:** 1.0 (locked)
 **Status:** features-in-progress
-**Last session:** 021
-**Next session:** 022
+**Last session:** 022
+**Next session:** 023
 
 ---
 
@@ -68,6 +68,174 @@ a hard requirement.
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 022 — F-018 release pipeline (release.yml + SBOM)
+
+**Branch:** `claude/session-001-bootstrap-Ulkyp`
+(Harness-supplied; see ADR-033.)
+
+**Scope chosen:** F-018 release pipeline scaffolding. The remaining v1
+features are F-015 (Android Tauri plugin half) and F-018 (release
+infrastructure). F-015 Android is a large ExoPlayer-based Kotlin
+plugin + DV / HDR / audio passthrough / subtitle parsers / tunneling
+surface, much of which is only verifiable via §6B human hardware
+testing (Shield Pro). F-018 by contrast is small, well-scoped, and
+PRD-locked end-to-end: it produces the 9 named release artifacts and
+the GitHub Release wiring. Shipping F-018 first means the eventual
+release session has the pipeline it needs the moment F-015 closes;
+the inverse ordering would leave the release session blocked on
+release infra after a long F-015 session.
+
+This session ships `.github/workflows/release.yml` covering every
+PRD §F-018 release-side requirement. F-018 transitions
+`not started → in progress`; full completion lands at the release
+session, which validates the workflow end-to-end by tagging
+`v1.0.0-alpha.1` and confirming all 9 artifacts attach to the
+GitHub Release.
+
+**Files added:**
+
+- `.github/workflows/release.yml` (~370 LOC) — six-job pipeline keyed
+  on `v*` tags:
+  1. **`version`** — extracts the version from `github.ref_name`
+     (`v1.0.0-alpha.1 → 1.0.0-alpha.1`), detects `-(alpha|beta|rc)(\.|$)`
+     to set the `prerelease` output. Exposes `version` + `prerelease`
+     as job outputs consumed by downstream jobs.
+  2. **`build-linux-x86_64`** — installs Tauri 2 system deps + Node 22,
+     runs `cargo tauri build --target x86_64-unknown-linux-gnu`,
+     stages the AppImage from `bundle/appimage/` and the .deb from
+     `bundle/deb/`, builds a `kino-${VERSION}-linux-x86_64.tar.gz`
+     containing `kino-app` + `LICENSE` + a brief launch README,
+     uploads as `kino-linux-x86_64` artifact.
+  3. **`build-android-universal`** — installs JDK 17 + Android SDK
+     (platforms;android-34 build-tools;34.0.0 ndk;27.0.12077973
+     platform-tools), runs `cargo tauri android build --apk` (no
+     `--target` → all 4 ABIs in one APK), stages the universal APK
+     from `app/build/outputs/apk/universal/release/`, uploads as
+     `kino-android-universal`.
+  4. **`build-android-per-abi`** (matrix: `arm64-v8a` / `armeabi-v7a`
+     / `x86_64`) — runs `cargo tauri android build --apk --target
+     <tauri_target>` per ABI; Tauri's single-target restriction
+     limits gradle's jniLibs assembly to one ABI so the resulting
+     "universal"-flavor APK is effectively per-ABI. Uploaded as
+     `kino-android-${abi}`. The PRD-locked ABIs are arm64-v8a /
+     armeabi-v7a / x86_64; the i686 (x86) target is reserved for
+     emulator testing and is NOT shipped as a release artifact
+     (PRD §F-018's release manifest lists x86_64 only on the
+     Android side).
+  5. **`generate-sbom`** — installs `cargo-cyclonedx` and `syft`,
+     generates `kino-${VERSION}-sbom-cyclonedx.json` rooted at
+     `src-tauri/Cargo.toml` (workspace dep closure, 483 components
+     including transitive deps, CycloneDX 1.5 spec), downloads the
+     universal APK from the upstream job, runs `syft scan` on it to
+     produce `kino-${VERSION}-sbom-syft.spdx.json`. Uploaded as
+     `kino-sbom`.
+  6. **`release`** — `fetch-depth: 0` to enable `gh release create
+     --generate-notes`, downloads all five upstream artifact bundles,
+     flattens into a single `release/` directory, structurally
+     verifies all 9 PRD-locked artifact names are present (fails
+     fast on any missing file), then `gh release create <tag>` with
+     `--generate-notes` and `--prerelease` (when the version
+     extraction flagged a pre-release suffix). Re-runs use
+     `gh release upload --clobber` so a transient failure followed
+     by a re-run keeps the release in sync (PRD §F-018 "idempotent
+     or fail fast" — we picked idempotent).
+
+**Files modified:**
+
+- `STATE.md` — this session entry; status / last-session / next-session
+  bumps; F-018 status tracker line; ADR-110 + ADR-111.
+
+**Verification:**
+
+- `python3 -c "import yaml; yaml.safe_load(open('.github/workflows/release.yml'))"`
+  → valid YAML, six jobs.
+- `cargo fmt --check` clean (no Rust changes; safety re-run clean).
+- `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- `cargo test --workspace --all-targets` → 371 / 371 pass (unchanged).
+- `cd frontend && npm run lint && npm run typecheck && npm test -- --run`
+  → lint clean, typecheck clean, 215 / 215 tests pass (unchanged).
+- `cargo cyclonedx --manifest-path src-tauri/Cargo.toml --format json
+  --spec-version 1.5` exercised locally; produces
+  `src-tauri/kino-app.cdx.json` (483 components) — confirms the path
+  + flag combination the workflow's `generate-sbom` job relies on.
+  Local artifacts cleaned up; SBOM generation is CI-only.
+
+**PRD §F-018 code acceptance after this session:**
+
+- ✅ CI passes on a clean main checkout — unchanged; ci.yml already
+  ships and is green.
+- ⏳ "Tag `v1.0.0-alpha.1` produces a GitHub Release with all 9
+  artifacts above" — pipeline shipped; validation happens at the
+  release session when the tag is pushed.
+- ⏳ §6B (APK installs on phone / Shield / AppImage on Ubuntu /
+  reinstall over previous version) — human verification.
+
+F-018 status: **not started → in progress**. The release session
+will close it (mark `[x]`) once `v1.0.0-alpha.1` is pushed and the
+9 artifacts attach.
+
+**Architectural decisions filed:**
+
+- **ADR-110: .deb produced by Tauri 2 bundler rather than cargo-deb.**
+  PRD §F-018 parenthetical mentions "(cargo-deb)" as the tool of
+  choice. Tauri 2's bundler already produces a fully integrated .deb
+  with desktop entry, icon, MIME types, and dependency declarations
+  derived from `tauri.conf.json`'s `bundle.linux.deb.depends`.
+  Replicating that via cargo-deb would require duplicating Tauri's
+  desktop integration as `[package.metadata.deb.assets]` entries on
+  `src-tauri/Cargo.toml` — five-plus assets per binary plus a
+  hand-written desktop file. The PRD's spirit (a working Debian
+  package users can `dpkg -i`) is best served by Tauri's bundler;
+  the "(cargo-deb)" hint is treated as informational, not
+  prescriptive. Both produce a `.deb`; the Tauri one is closer to
+  user-installable.
+
+- **ADR-111: Per-ABI APKs produced via `--target <abi>` single-ABI
+  restriction, not `--split-per-abi`.** Tauri 2 `--split-per-abi` is
+  documented but requires the gradle scaffold to configure
+  `splits.abi { enable = true; reset(); include("arm64-v8a", ...); }`,
+  which the committed `src-tauri/gen/android/app/build.gradle.kts`
+  does NOT. Passing `--target <one>` alone causes gradle to assemble
+  jniLibs for only that ABI; the resulting APK lands at the
+  "universal" gradle flavor path with effective per-ABI content.
+  This avoids editing the scaffold AND keeps the per-ABI vs
+  universal job logic uniform (both probe the same output path).
+  If a future Tauri 2 upgrade ships a scaffold with `splits.abi` on
+  by default, the workflow can switch to `--split-per-abi` without
+  changing the artifact-rename step.
+
+**Out of scope for Session 022 (still queued):**
+
+- **F-015 Android `PlayerActivity` Tauri plugin** under
+  `android/player-plugin/` — Kotlin ExoPlayer wrapper with DV /
+  HDR / audio passthrough / subtitle parsers / tunneling. PRD
+  §F-015 code-acceptance items 1-3 (Android playback + SRT +
+  SSA/ASS) depend on this. Closes F-015.
+- **F-018 release-session execution** — bump `Cargo.toml` workspace
+  version to `1.0.0-alpha.1`, push tag, watch the release.yml
+  pipeline produce all 9 artifacts, mark F-018 `[x]`. The release
+  session is gated on F-015 closure (so all F-001..F-018 are `[x]`
+  before State B triggers).
+
+**Cross-session conventions established:**
+
+- **GitHub Actions workflow YAML is validated against `yaml.safe_load`
+  locally before commit.** No project-level YAML linter is shipped;
+  Python's `yaml` library is the lowest-friction validator. The
+  release.yml file specifically uses `${{ env.VARIABLE }}` /
+  `${{ matrix.var }}` substitutions that are GitHub-Actions-runtime
+  expressions, not YAML — `safe_load` validates the YAML grammar
+  only, not Actions semantics. CI's first tag-push is the integration
+  test.
+- **Release-pipeline artifact naming is PRD-locked.** Every artifact
+  attached to a GitHub Release MUST match one of the 9 PRD §F-018
+  names exactly. The `release` job's structural-verification step
+  is the gate; missing or extra artifacts fail the run. Future
+  sessions adding to the release pipeline must update both the PRD
+  (out of scope — locked) AND this step. The locked names live
+  in the `expected` bash array in `.github/workflows/release.yml`
+  and as the "9 artifacts" reference in PRD §F-018.
 
 ### Session 021 — F-015 Player.tsx overlay route (Linux frontend)
 
@@ -5452,7 +5620,23 @@ implementation" split.
       test fixtures stay Session-022+ follow-ups.)_
 
 ### Release
-- [ ] F-018: Build, packaging, distribution
+- [ ] F-018: Build, packaging, distribution _(Session 022:
+      `.github/workflows/release.yml` six-job pipeline keyed on `v*` tags
+      — `version` extracts + flags prerelease; `build-linux-x86_64`
+      stages AppImage / .deb / tar.gz from the Tauri 2 bundler;
+      `build-android-universal` produces the all-ABI APK;
+      `build-android-per-abi` matrix produces arm64-v8a /
+      armeabi-v7a / x86_64 APKs by passing `--target <abi>` to
+      Tauri (ADR-111); `generate-sbom` runs cargo-cyclonedx
+      (workspace closure rooted at kino-app, CycloneDX 1.5) +
+      syft (SPDX over the universal APK); `release` flattens
+      artifacts, structurally verifies all 9 PRD-locked names,
+      then `gh release create --generate-notes` (with
+      `--prerelease` for alpha/beta/rc). Idempotent re-run via
+      `gh release upload --clobber`. The .deb comes from Tauri's
+      bundler rather than cargo-deb because Tauri's bundler ships
+      desktop integration that cargo-deb would require duplicating
+      (ADR-110). Closes at the release session.)_
 
 ---
 
@@ -5545,6 +5729,8 @@ Additional ADRs filed by sessions:
 | ADR-107 | `librqbit::Speed::mbps` is mebibytes-per-second, not megabits-per-second. `SpeedEstimator::mbps()` returns `bps() / 1024 / 1024` and the `Display` impl prints `"{mbps:.2} MiB/s"`. `kino_torrent::stats::EngineStats` converts to bytes-per-second via the local `MIB_TO_B = 1024 × 1024` constant so the F-014 monitor's `dl_rate_bytes_per_s` carries correct dimensional units. Documentation ADR; the code is already correct. | 019 |
 | ADR-108 | F-015 Linux ships as an mpv subprocess driver (`mpv --input-ipc-server=<socket>`) rather than the `libmpv-rs` in-process binding the PRD §F-015 / ADR-011 wording suggests. Two reasons: (a) `libmpv-rs` would link against `libmpv` at build time and require `libmpv2-dev` in the CI image — a `cargo test` cost we want to defer until the driver actually needs libmpv-only features. (b) PRD §F-015's "rendered into a GL surface owned by the Tauri window" is the architecturally hard half of ADR-011: Tauri 2 doesn't expose a GL surface inside the webview's window, so the in-process path needs either an X11 `--wid` parent-window hand-off (Wayland-incompatible by default) or a Wayland subsurface protocol negotiation (deep webkit-gtk integration work). The subprocess form delivers every operational guarantee the PRD demands — position events on the 5 s cadence, seek + pause + audio / sub track selection, deterministic exit-with-final-position — and lets mpv open its OWN window for the actual playback surface. The `PlayerHandle` trait + `PlayerEvent` wire types are designed so the in-process driver drops in as a peer (`#[cfg(feature = "libmpv-inprocess")]`) without `kino-app` touching its command call sites. The §6B-1 / §6B-4 / §6B-5 human-verification path (Linux AppImage + Shield DV/Atmos) covers the practical-fallout question. | 020 |
 | ADR-109 | F-015 Player route navigation payload is carried via a module-level `createSignal` in `frontend/src/lib/playerSession.ts` (`setPlayerSession` / `getPlayerSession` / `clearPlayerSession`), NOT via Solid Router's `navigate(path, { state })` payload. `createMemoryHistory` (the vitest jsdom router) silently drops the `state` field on `history.set({ value, state })`, which made tests unable to seed the route. The module-signal pattern is testable (`_resetForTests` is exposed for `beforeEach`), reactive (Player's `onMount` reads once via `getPlayerSession()`), and matches the "one playback at a time" semantics the platform driver already enforces. Convention for future cross-route handoffs: name the module `<feature>Session.ts`, expose `set / get / clear` + `_resetForTests`. | 021 |
+| ADR-110 | F-018 release pipeline produces the locked `.deb` artifact via the Tauri 2 bundler rather than cargo-deb. PRD §F-018 parenthetical mentions "(cargo-deb)" but Tauri 2's bundler already produces a fully integrated `.deb` with desktop entry, icon, MIME types, and dependency declarations derived from `tauri.conf.json`'s `bundle.linux.deb.depends`. Replicating that via cargo-deb would require duplicating Tauri's desktop integration as `[package.metadata.deb.assets]` entries on `src-tauri/Cargo.toml` plus a hand-written `kino.desktop`. The PRD's spirit (a user-installable Debian package) is best served by Tauri's bundler; the parenthetical is treated as informational rather than prescriptive. | 022 |
+| ADR-111 | F-018 per-ABI APKs are produced by restricting `cargo tauri android build --apk --target <abi>` to a single target rather than using Tauri's `--split-per-abi` flag. `--split-per-abi` requires the gradle scaffold to configure `android { splits.abi { ... } }`, which the committed `src-tauri/gen/android/app/build.gradle.kts` does NOT. Passing `--target aarch64` (or `armv7` / `x86_64`) alone causes gradle to assemble jniLibs for only that ABI; the resulting APK lands at the "universal" gradle flavor path and is effectively per-ABI by content. This avoids scaffold edits AND keeps the per-ABI and universal jobs' artifact-staging logic uniform. A future Tauri 2 upgrade that ships `splits.abi` by default would let the workflow switch to `--split-per-abi` without changing the staging step. | 022 |
 
 ---
 
