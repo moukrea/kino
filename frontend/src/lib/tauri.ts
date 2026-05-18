@@ -377,6 +377,11 @@ export type DisplayView = {
   nsfw: boolean;
   input_override: "auto" | "touch" | "dpad" | "kbm" | string;
   high_contrast: boolean;
+  /**
+   * PRD §5 Logging "advanced logging" toggle. When true, the host
+   * switches the runtime `tracing` `EnvFilter` to `debug`.
+   */
+  advanced_logging: boolean;
 };
 
 export type SettingsView = {
@@ -431,6 +436,7 @@ export const SETTING_KEYS = {
   displayNsfw: "display.nsfw",
   displayInputOverride: "display.input_override",
   displayHighContrast: "display.high_contrast",
+  displayAdvancedLogging: "display.advanced_logging",
 } as const;
 
 export async function settingsGetAll(): Promise<SettingsView> {

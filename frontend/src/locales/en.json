@@ -2,7 +2,10 @@
   "app": {
     "name": "kino",
     "placeholderHome": "kino",
-    "placeholderTagline": "Streaming, your way."
+    "placeholderTagline": "Streaming, your way.",
+    "errorTitle": "Something went wrong",
+    "errorBody": "kino hit an unexpected error. The details below have been logged. You can retry, or restart the app if the problem persists.",
+    "errorRetry": "Try again"
   },
   "nav": {
     "label": "Main navigation",
@@ -166,7 +169,8 @@
       "inputTouch": "Touch",
       "inputDpad": "D-pad",
       "inputKbm": "Keyboard + mouse",
-      "highContrast": "High-contrast theme"
+      "highContrast": "High-contrast theme",
+      "advancedLogging": "Advanced logging (debug)"
     },
     "about": {
       "version": "Version",

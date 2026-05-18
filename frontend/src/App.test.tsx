@@ -3,10 +3,11 @@
 // boundary; per-component behavior (focus, virtualization, 600ms info
 // overlay) is covered by the component-level test files.
 
+import { ErrorBoundary, type Component } from "solid-js";
 import { render } from "solid-js/web";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import App from "./App";
+import App, { RootErrorFallback } from "./App";
 import { _resetForTests as _resetFocus } from "./input/focus";
 import {
   _resetForTests as _resetKeyboard,
@@ -76,6 +77,54 @@ describe("App", () => {
       '[data-testid="nav-item-movies"]',
     ) as HTMLElement | null;
     expect(moviesItem?.dataset.focused).toBe("true");
+  });
+
+  it("the root ErrorBoundary catches render errors and renders the fallback (PRD §5 Reliability)", () => {
+    // The root boundary wraps the SolidJS <Router> in App.tsx. We can't
+    // easily make a routed component throw from a test without re-mounting
+    // App with a stubbed route, so we exercise the same boundary contract
+    // here directly: an ErrorBoundary using App's exported fallback catches
+    // a render-time throw, paints the testable fallback markup, and logs
+    // the error via console.error (the Tauri runtime relays that into the
+    // `tracing` file appender).
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const Boom: Component = () => {
+      throw new Error("kino test boom");
+    };
+
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    dispose = render(
+      () => (
+        <ErrorBoundary
+          fallback={(err, reset) => (
+            <RootErrorFallback error={err} reset={reset} />
+          )}
+        >
+          <Boom />
+        </ErrorBoundary>
+      ),
+      host,
+    );
+
+    const fallback = host.querySelector('[data-testid="app-error-boundary"]');
+    expect(fallback).not.toBeNull();
+    const message = host.querySelector('[data-testid="app-error-message"]');
+    expect(message?.textContent ?? "").toContain("kino test boom");
+    // PRD §5 "Frontend errors caught at root error boundary and logged":
+    // the fallback emits via console.error.
+    expect(
+      errorSpy.mock.calls.some((args) =>
+        args.some((a) =>
+          a instanceof Error
+            ? a.message.includes("kino test boom")
+            : String(a).includes("kino test boom"),
+        ),
+      ),
+    ).toBe(true);
+
+    errorSpy.mockRestore();
   });
 
   it("the '/' search shortcut navigates to /search from another route (PRD §F-011)", async () => {
