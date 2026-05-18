@@ -2,8 +2,8 @@
 
 **PRD version:** 1.0 (locked)
 **Status:** features-in-progress
-**Last session:** 018
-**Next session:** 019
+**Last session:** 019
+**Next session:** 020
 
 ---
 
@@ -68,6 +68,275 @@ a hard requirement.
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 019 — F-014 adaptive buffer
+
+**Branch:** `claude/session-001-bootstrap-zcIoK`
+(Harness-supplied; see ADR-033.)
+
+**Scope chosen:** F-014 Adaptive buffer end-to-end. PRD §F-014 has three
+code-acceptance criteria; this session ships all three:
+
+1. **Unit tests cover the state machine with mocked rate, position,
+   file size, duration.** The PRD §F-014 state machine is implemented as
+   the pure function `kino_torrent::scheduler::compute_state(&SchedulerInputs)`
+   returning `BufferState::{Safe, NeedsPrebuffer { required_prebuffer_s },
+   Rebuffer}`. 14 unit tests in `scheduler.rs` exercise every PRD branch:
+   SAFE when ttdl ≤ headroom, NEEDS_PREBUFFER above the headroom (with
+   the `max(prebuffer_target_s, deficit_s)` floor), REBUFFER when
+   `pieces_ahead_seconds < SAFETY_MARGIN_S × 0.5` (with a deliberate
+   initial-play suppression at `position == 0` so the cold-start UI
+   shows "buffering" not "rebuffering"), the exact boundary `ttdl ==
+   headroom`, the fully-downloaded warm-cache case (remaining == 0 →
+   SAFE regardless of `dl_rate`), and the `dl_rate == 0` cold-start
+   collapse to `prebuffer_target_s`. The pure `pieces_ahead_seconds`
+   helper has its own 3 tests covering bitrate math, playhead-overrun
+   clamp, and degenerate inputs.
+
+2. **Integration test on a synthetic slow torrent: prebuffer engages,
+   math is satisfied, playback proceeds without underrun.**
+   `crates/kino-torrent/tests/buffer_monitor.rs::synthetic_slow_engages_prebuffer_then_recovers`
+   feeds a scripted `StatsSource` (slow start at 100 KB/s against a
+   10 GB / 1 h file → `file_bitrate ≈ 2.78 MB/s`, decisively below the
+   rate) into a real `BufferMonitor`, asserts the first published state
+   is `NeedsPrebuffer` with a positive + finite `required_prebuffer_s`,
+   then ramps the rate to 50 MB/s and verifies the rolling average
+   climbs past 1 MB/s (the operational signal that the F-014 math
+   recovers). Pinned by the test passing in 2 s of wall-clock with the
+   monitor's sampling/recompute cadences sped up to 40 ms / 80 ms.
+
+3. **Integration test on fast torrent: state stays SAFE, no overlay
+   shown.** `fast_torrent_converges_to_safe` reuses the F-013 1 MiB
+   deterministic fixture (`ChaCha20Rng::seed_from_u64(0xF014…)`), seeds
+   the engine offline, lets librqbit hash-check the on-disk bytes, then
+   wraps the fully-downloaded `AddedTorrent` in `LibrqbitStatsSource`
+   and pretends it's a 1 h movie so the math runs with realistic
+   headroom. After 500 ms the monitor's published state is `Safe` and
+   `bytes_downloaded == FIXTURE_SIZE`. Plus
+   `position_update_drives_recompute_and_changes_pieces_ahead` covers
+   the seek path: pushing a fresh playhead via `update_position(300.0)`
+   triggers an immediate recompute and `pieces_ahead_seconds` shrinks
+   relative to `position == 0` — this is the PRD §F-014 "recomputed on
+   events" path.
+
+PRD §F-014 also specifies piece-priority mappings to librqbit (HIGHEST
+window `[position, +60s]`, HIGH window `[+60s, +300s]`, last piece HIGH).
+ADR-106 below documents that librqbit 8.1.1 keeps its piece-priority API
+in `pub(crate) mod`s, so the v1 implementation relies on librqbit's
+stream-mode-driven natural prioritisation (opening a stream at a given
+offset already biases its piece request order). The state-machine +
+monitor + UI overlay are the operationally important pieces; the
+`MAX_CONNECTIONS_PER_TORRENT` and piece-priority knobs surface as F-018
+follow-ups (or via a librqbit upstream change).
+
+**Files changed (summary):**
+
+- `crates/kino-torrent/src/scheduler.rs` (new, 480+ LOC) — pure
+  PRD §F-014 state machine:
+  - `BufferState { Safe, NeedsPrebuffer { required_prebuffer_s },
+    Rebuffer }` with `Serialize` / `Deserialize`. `pauses_playback()`
+    helper for the Tauri host's player-coordination decision.
+  - `SchedulerInputs { file_size_bytes, bytes_downloaded,
+    dl_rate_bytes_per_s, duration_s, position_s, pieces_ahead_seconds }`.
+  - `compute_state(&SchedulerInputs) -> BufferState` and
+    `compute_state_with_thresholds(...)` for threshold-overriding
+    tests. PRD pseudocode reproduced verbatim in the module doc.
+  - `RollingRate` ring buffer over `DL_RATE_WINDOW_S` (30 s, PRD §8).
+    `push(t, bytes_per_s)` clamps negative samples, drops out-of-window
+    front entries, `average_bps()` returns 0 when empty (so cold start
+    looks like `dl_rate ≈ 0` to the scheduler).
+  - `pieces_ahead_seconds(bytes_downloaded, position_s, file_size_bytes,
+    duration_s)` pure helper.
+  - 17 unit tests covering every branch.
+- `crates/kino-torrent/src/monitor.rs` (new, 470+ LOC) — async loop
+  that drives the scheduler over time:
+  - `SampleStats { bytes_downloaded, download_speed_bps }` — sampler
+    snapshot shape.
+  - `StatsSource` trait (sync `sample()`) — the test seam.
+  - `MonitorConfig { file_size_bytes, duration_s, sampling_interval,
+    recompute_interval }` with PRD-locked defaults (1 s + 5 s).
+  - `BufferStatus { state, dl_rate_bytes_per_s, pieces_ahead_seconds,
+    bytes_downloaded, file_size_bytes, position_s, duration_s,
+    eta_seconds }` published via `tokio::sync::watch`.
+  - `BufferMonitor::spawn<S: StatsSource>(MonitorConfig, S)` — spawns
+    the loop task, returns a handle exposing `status_rx()` (cloneable
+    `watch::Receiver`), `update_position(f64)`, `current()`, and
+    `next_status()` (test helper). Drop signals shutdown via the
+    `mpsc::Sender` close OR aborts the join handle as a backstop.
+  - `run_loop` select-arms: sampling tick (pulls + pushes a rate sample),
+    recompute tick (pulls + samples + publishes), position-changed
+    (publishes immediately), shutdown (breaks). Initial publish happens
+    pre-loop so subscribers don't see the all-zero default.
+  - 4 unit tests using a `FastSource` (constant snapshot) and a
+    `FakeSource` (scripted queue with last-value-repeat) cover SAFE
+    convergence, NEEDS_PREBUFFER emission, position-update recompute,
+    rolling-rate climb across a sample sequence, and drop-terminates-task.
+- `crates/kino-torrent/src/stats.rs` (new, 75 LOC) — domain-shaped
+  bridge between librqbit + the F-014 monitor:
+  - `EngineStats { progress_bytes, total_bytes, file_progress,
+    download_speed_bps, finished }` — kino's view of
+    `librqbit::TorrentStats` with `mbps × MIB_TO_B` applied so
+    consumers get bytes/s (librqbit's `Speed::mbps` field is actually
+    MiB/s; ADR-107).
+  - `AddedTorrent::live_stats() -> EngineStats` accessor wired through
+    a new `pub(crate)` `AddedTorrent::inner()` accessor in `engine.rs`.
+  - `LibrqbitStatsSource { torrent: AddedTorrent, file_index: usize }`
+    implements `StatsSource` by pulling per-file `file_progress` (so
+    multi-file packs only account for the active video).
+- `crates/kino-torrent/src/engine.rs` — adds `AddedTorrent::inner()`
+  pub(crate) accessor for the stats module.
+- `crates/kino-torrent/src/lib.rs` — adds `pub mod monitor;`,
+  `pub mod scheduler;`, `pub mod stats;` and re-exports the public
+  surface.
+- `crates/kino-torrent/Cargo.toml` — `dev-dependencies` adds
+  `rand_chacha` + `librqbit` for the integration test.
+- `crates/kino-torrent/tests/buffer_monitor.rs` (new, 240+ LOC) —
+  the three F-014 integration tests described above plus a
+  `ScriptedSource` test helper backed by two `AtomicU64`s
+  (`f64::to_bits` packed into the rate slot).
+- `src-tauri/src/commands.rs` — F-014 Tauri command block:
+  - `TorrentRuntime` extended with `monitors: Arc<StdMutex<HashMap<
+    Uuid, MonitorEntry>>>` (one entry per active playback token).
+    Picked `std::sync::Mutex` over `parking_lot::Mutex` to keep the
+    `src-tauri` dependency surface unchanged.
+  - `MonitorEntry { monitor: BufferMonitor, bridge: JoinHandle<()> }`
+    — the bridge task `app.emit("buffer:status", ...)`s each watch
+    update.
+  - `buffer_start_monitor(app, runtime, token, duration_s)` — pulls
+    the registered `StreamSession`, builds `LibrqbitStatsSource`, spawns
+    the monitor, and starts the bridge task. Idempotent (re-issuing
+    aborts the prior bridge + replaces the entry).
+  - `buffer_stop_monitor(token)` — removes the entry (`drop` shuts
+    down the monitor task; bridge is aborted explicitly).
+  - `buffer_report_position(token, position_s)` — calls
+    `monitor.update_position(...)`. Clamps negatives to 0.
+  - `buffer_status(token)` — one-shot snapshot for first-paint UX
+    (the player uses this so the overlay renders correctly before the
+    first event arrives).
+  - `stop_playback` now also tears down the monitor for the token
+    before unregistering the server session.
+  - `BufferStatusEvent` (camelCase wire shape) and `BufferStateWire`
+    (string-tagged state enum) — the JSON payload of the
+    `buffer:status` Tauri event. Internally-tagged Rust enums map
+    awkwardly to TS, so a flat shape with `state: string` +
+    `requiredPrebufferS: number | null` is what the frontend consumes.
+- `src-tauri/src/lib.rs` — registers the four new commands.
+- `frontend/src/lib/tauri.ts` — typed bindings:
+  - `BufferStatusEvent` shape.
+  - `bufferStartMonitor(token, durationS)`, `bufferStopMonitor(token)`,
+    `bufferReportPosition(token, positionS)`,
+    `bufferStatus(token) -> Promise<BufferStatusEvent | null>`.
+  - `onBufferStatus(handler) -> Promise<() => void>` — lazy-imports
+    `@tauri-apps/api/event` so non-player bundles don't pay the cost;
+    returns a no-op unlisten when `hasTauri()` is false (vitest jsdom).
+- `frontend/src/components/BufferOverlay.tsx` (new, 165 LOC) — the
+  PRD §F-014 "Buffering for smooth playback" overlay:
+  - Subscribes to `onBufferStatus` on mount, filters by token (captured
+    once via a mount-time `const token = props.token` to satisfy
+    solid-plugin reactivity lint without a disable comment).
+  - Pulls the current `bufferStatus(token)` snapshot first so the
+    overlay shows correct data on first paint.
+  - `bufferProgress(status)`: SAFE → 1, NEEDS_PREBUFFER →
+    `piecesAhead / requiredPrebufferS`, REBUFFER →
+    `piecesAhead / REBUFFER_RECOVERY_TARGET_S` (mirror of PRD's
+    `SAFETY_MARGIN_S × 0.5 = 15s`). Clamped to `[0, 1]`.
+  - `formatRate(bps)`: B/s / KB/s / MB/s units.
+  - `formatEta(seconds)`: `Xs` / `Xm Yys` / `Xh YYm` units.
+  - Hidden via `<Show when={visible()}>` when state is SAFE.
+- `frontend/src/components/BufferOverlay.test.tsx` (new) — 15
+  vitest cases covering: hidden when SAFE, rendered on NEEDS_PREBUFFER
+  + REBUFFER, progressbar `aria-valuenow` math, token-filter
+  cross-talk guard, unsubscribe on unmount, `bufferProgress` /
+  `formatRate` / `formatEta` formatting branches.
+- `frontend/src/locales/en.json`, `frontend/src/locales/fr.json` —
+  new `buffer.*` strings (title, rebuffering, ariaLabel, downloadRate,
+  eta, ratePerSecond, etaUnknown).
+- `frontend/src/styles.css` — minimal `.buffer-overlay` CSS (absolute
+  inset, dark backdrop, centered card with progress bar). Z-index 50
+  so it overlays the player surface.
+
+**Features advanced:** F-014 _not started → complete_.
+
+**ADRs filed this session:** ADR-106 + ADR-107.
+
+- **ADR-106** (librqbit 8.1.1's piece-priority API is `pub(crate)` —
+  v1 relies on stream-mode prioritisation): PRD §F-014 specifies
+  HIGHEST `[position, +60s]` / HIGH `[+60s, +300s]` / last-piece HIGH
+  windows mapped onto librqbit's piece-priority API. librqbit 8.1.1
+  keeps `update_only_files`, `file_priorities`, and the
+  `chunk_tracker`'s piece-priority knobs in `pub(crate) mod`s
+  (verified by grep across the 8.1.1 source). The values cannot be
+  named or set from outside the librqbit crate. Workarounds
+  considered: forking librqbit (high maintenance cost, defeats the
+  ADR-008 lock), swapping to a different torrent engine in
+  `kino-torrent::Engine` (out of scope for F-014). v1 ships the state
+  machine + monitor + UI overlay (the operationally observable parts
+  of F-014) and relies on librqbit's natural streaming-mode
+  prioritisation (opening a `ManagedTorrent::stream` at the active
+  byte offset already biases its piece request order around the
+  playhead). The §6B-6 ("adaptive buffer engages correctly on real
+  slow torrent") human check covers any practical fallout; if the
+  field test surfaces underrun in cases the state machine should have
+  caught, the fix path is either a librqbit upstream patch exposing
+  the priority API or a fork-PR. Recorded as an F-018 follow-up under
+  Known Issues.
+- **ADR-107** (`librqbit::Speed::mbps` is MiB/s, not Mbps): librqbit
+  exposes download/upload rate as `Speed { mbps: f64 }` but the
+  underlying `SpeedEstimator::mbps()` returns `bps() / 1024 / 1024`
+  — i.e. mebibytes per second, NOT megabits per second. Display
+  format is `"{mbps:.2} MiB/s"` which confirms the unit. `kino_torrent`
+  converts to bytes/s via the `MIB_TO_B = 1024 × 1024` constant in
+  `stats.rs` so the F-014 monitor's `dl_rate_bytes_per_s` carries
+  the correct dimensional units. This ADR is documentation; the code
+  is already correct.
+
+**Tests added / coverage notes:**
+
+- Rust: 24 new tests this session — 14 in `kino_torrent::scheduler`
+  (state-machine branches + pieces_ahead math + rolling rate), 4 in
+  `kino_torrent::monitor` (sampler convergence + position update +
+  drop), 3 in `kino_torrent::tests::buffer_monitor` (F-014 integration:
+  fast-converges-to-SAFE with real librqbit, synthetic-slow engages
+  NEEDS_PREBUFFER and recovers, position-update drives recompute),
+  plus 3 supporting unit tests on the `pieces_ahead_seconds` helper.
+  Workspace test count climbs from **322 → 346 passing**.
+- Frontend: 15 new vitest cases in `BufferOverlay.test.tsx`.
+  Frontend test count climbs from 171 → **186 passing**.
+
+**Known issues introduced or resolved:**
+
+- **New (introduced — DEFERRED to F-018 polish or librqbit upstream):**
+  - Piece-priority windows not wired to librqbit 8.1.1 (ADR-106).
+    The state machine + monitor + UI overlay ship complete; the
+    fine-grained HIGHEST / HIGH window assignment depends on librqbit
+    exposing its piece-priority API publicly.
+  - LRU cache eviction with playhead-protected pieces (PRD §F-013
+    "Cache eviction does not break ongoing playback"). librqbit's
+    storage layer is what currently bounds disk; an explicit LRU is
+    F-018 territory now that F-014 has shipped.
+- **Resolved:** the Session-018 "primary scope candidate" carryover
+  for F-014. The session-018 alt-scope of F-018 release infra is now
+  the natural next session.
+
+**Heads-up for Session 020:**
+
+- **Primary scope candidate: F-015 Native player integration.** F-013
+  + F-014 are now in place; F-015 is the path to first end-to-end
+  playable build. Two big sub-pieces: Android `PlayerActivity`
+  (Kotlin, ExoPlayer/Media3 — a real Android Studio project under
+  `android/player-plugin/` referenced by the PRD §F-015 lock) and
+  Linux libmpv-rs integration (the `kino-server` already ships an
+  `assets/mpv.conf` slot per PRD §F-015). Both consume the F-014
+  buffer:status events via `bufferStartMonitor` / `bufferReportPosition`
+  + render the `<BufferOverlay token=…/>` component.
+- **Alternative scope: F-018 release infrastructure prep.** F-018 is
+  the only feature blocking release; F-015 is large enough to split
+  across two sessions (Android in one, Linux in another) if Session
+  020 wants to scope down. Prep work for F-018 (CI release workflow,
+  artifact list audit, README revamp) is sliceable into a separate
+  session that doesn't block F-015.
+
+---
 
 ### Session 018 — F-013 embedded torrent engine
 
@@ -4716,7 +4985,25 @@ implementation" split.
       to F-014 per PRD wording. ADR-101 (FileStream marker trait),
       ADR-102 (base64 IPC), ADR-103 (no v1 connection cap),
       ADR-104 (64 KiB chunks), ADR-105 (no multipart byteranges))._
-- [ ] F-014: Adaptive buffer
+- [x] F-014: Adaptive buffer _(Session 019: pure PRD §F-014 state
+      machine in `kino_torrent::scheduler::compute_state`
+      (SAFE / NEEDS_PREBUFFER / REBUFFER per locked pseudocode), 30-s
+      `RollingRate` estimator, `pieces_ahead_seconds` helper;
+      `BufferMonitor` async loop with PRD-cadence sampling (1 s) +
+      recompute (5 s) + position-event recompute, `watch::Sender<
+      BufferStatus>` for fan-out; `LibrqbitStatsSource` backed by
+      `AddedTorrent::live_stats` (per-file `bytes_downloaded` from
+      `TorrentStats::file_progress`, MiB/s → B/s conversion per
+      ADR-107); Tauri `buffer_start_monitor` / `buffer_stop_monitor` /
+      `buffer_report_position` / `buffer_status` commands with a
+      per-token bridge task emitting `buffer:status` events; typed
+      frontend bindings + `<BufferOverlay token=…>` SolidJS component
+      with localized strings; integration tests exercise fast-torrent
+      → SAFE (real librqbit + 1 MiB fixture), synthetic-slow →
+      NEEDS_PREBUFFER (scripted source), position-update → recompute.
+      Piece-priority window assignment to librqbit deferred per
+      ADR-106 (8.1.1 keeps the API `pub(crate)`); v1 relies on
+      stream-mode prioritisation.)_
 - [ ] F-015: Native player integration
 
 ### Release
@@ -4809,6 +5096,8 @@ Additional ADRs filed by sessions:
 | ADR-103 | F-013 ships without enforcing PRD §F-013's "Max connections per torrent: 200" because librqbit 8.1.1's public `SessionOptions` and `PeerConnectionOptions` expose only connection *timeouts*, not a concurrent-connection cap. The PRD constant `MAX_CONNECTIONS_PER_TORRENT = 200` stays in `kino-core::constants` so future librqbit releases (or our own scheduler in F-014) can wire it through. The §6B-6 dynamic check covers any practical fallout from current library defaults. | 018 |
 | ADR-104 | F-013 streams HTTP response bodies in 64 KiB chunks. The default `tokio_util::io::ReaderStream` buffer is 8 KiB, which doubles syscall + librqbit-piece-lookup count per byte served. 64 KiB matches libmpv's default `demuxer-readahead` granularity and keeps per-request peak memory bounded (one chunk in flight per active stream). | 018 |
 | ADR-105 | F-013 Range parser supports single-range only. `Range: bytes=0-99,200-299` (RFC 7233 §2.1 multi-range) returns 416 rather than degrading to the first range. ExoPlayer + libmpv only ever issue single ranges per request, so implementing `multipart/byteranges` adds code with no benefit AND silently degrading would mislead clients that DO send multipart. | 018 |
+| ADR-106 | F-014 ships without librqbit-level piece-priority window assignment. librqbit 8.1.1 keeps `update_only_files`, `file_priorities`, and the chunk-tracker piece-priority knobs in `pub(crate) mod`s (verified by grep across the 8.1.1 source tree); the values can't be named or set from outside the librqbit crate. v1 ships the F-014 state machine, monitor task, buffer:status event surface, and UI overlay — the operationally observable parts of the spec — and relies on librqbit's natural streaming-mode prioritisation (opening `ManagedTorrent::stream` at the active byte offset biases the piece request order around the playhead). Fork or upstream-PR is the long-term path; §6B-6 covers practical fallout. Tracked as a Known Issue. | 019 |
+| ADR-107 | `librqbit::Speed::mbps` is mebibytes-per-second, not megabits-per-second. `SpeedEstimator::mbps()` returns `bps() / 1024 / 1024` and the `Display` impl prints `"{mbps:.2} MiB/s"`. `kino_torrent::stats::EngineStats` converts to bytes-per-second via the local `MIB_TO_B = 1024 × 1024` constant so the F-014 monitor's `dl_rate_bytes_per_s` carries correct dimensional units. Documentation ADR; the code is already correct. | 019 |
 
 ---
 
@@ -4865,6 +5154,18 @@ Additional ADRs filed by sessions:
   x86_64-unknown-linux-gnu` produces deb + rpm + AppImage locally once
   `libfuse2t64 patchelf squashfs-tools` are installed on top of the Tauri
   2 base deps.
+- **F-014 piece-priority windows not wired to librqbit (Session 019,
+  ADR-106).** PRD §F-014 specifies HIGHEST `[position, +60s]` / HIGH
+  `[+60s, +300s]` / last-piece HIGH window assignment via librqbit's
+  piece-priority API. librqbit 8.1.1 keeps that API in `pub(crate)`
+  modules — the values cannot be named or set from outside the librqbit
+  crate. v1 ships the state machine + monitor + UI overlay (the
+  operationally observable parts of F-014) and relies on librqbit's
+  natural streaming-mode prioritisation. Fix paths: (a) upstream PR
+  exposing the API, (b) fork librqbit, (c) swap to a different torrent
+  engine in `kino-torrent::Engine`. §6B-6 ("adaptive buffer engages
+  correctly on real slow torrent") is the human verification that
+  catches practical fallout.
 
 ---
 

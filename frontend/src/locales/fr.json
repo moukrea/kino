@@ -191,5 +191,14 @@
     "lastActionLabel": "Dernière action",
     "lastActionNone": "(aucune)",
     "demoHint": "Utilisez les flèches, Entrée, Échap, F10, /, Espace — ou branchez une manette."
+  },
+  "buffer": {
+    "title": "Mise en mémoire tampon pour une lecture fluide",
+    "rebuffering": "Mise en tampon…",
+    "ariaLabel": "État du tampon",
+    "downloadRate": "Téléchargement : {{rate}}",
+    "eta": "Temps restant : {{eta}}",
+    "ratePerSecond": "{{n}}/s",
+    "etaUnknown": "inconnu"
   }
 }

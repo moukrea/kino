@@ -147,6 +147,10 @@ pub fn run() {
             commands::start_playback,
             commands::stop_playback,
             commands::playback_status,
+            commands::buffer_start_monitor,
+            commands::buffer_stop_monitor,
+            commands::buffer_report_position,
+            commands::buffer_status,
         ])
         .run(tauri::generate_context!())
         .expect("kino: error while running tauri application");

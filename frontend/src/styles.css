@@ -19,3 +19,54 @@ body,
     Roboto,
     sans-serif;
 }
+
+/* PRD §F-014: adaptive-buffer overlay shown over the player surface
+   whenever the adaptive scheduler reports NEEDS_PREBUFFER or REBUFFER. */
+.buffer-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: rgba(0, 0, 0, 0.55);
+  pointer-events: none;
+  z-index: 50;
+}
+
+.buffer-overlay__card {
+  background-color: rgba(10, 10, 10, 0.92);
+  color: #fafafa;
+  padding: 1.5rem 2rem;
+  border-radius: 0.75rem;
+  min-width: 18rem;
+  max-width: 32rem;
+  text-align: center;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+}
+
+.buffer-overlay__title {
+  font-size: 1.125rem;
+  font-weight: 600;
+  margin: 0 0 1rem;
+}
+
+.buffer-overlay__bar {
+  height: 6px;
+  background-color: rgba(250, 250, 250, 0.15);
+  border-radius: 3px;
+  overflow: hidden;
+  margin: 0 0 0.75rem;
+}
+
+.buffer-overlay__bar-fill {
+  height: 100%;
+  background-color: #4f9aff;
+  transition: width 250ms ease-out;
+}
+
+.buffer-overlay__meta {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.875rem;
+  color: rgba(250, 250, 250, 0.75);
+}

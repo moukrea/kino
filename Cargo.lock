@@ -2431,6 +2431,7 @@ dependencies = [
  "librqbit",
  "parking_lot",
  "rand 0.8.6",
+ "rand_chacha 0.3.1",
  "serde",
  "tempfile",
  "thiserror 1.0.69",
