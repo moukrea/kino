@@ -1,0 +1,500 @@
+name: release
+
+# PRD §F-018: triggered on tag matching `v*`. Produces all 9 locked
+# artifacts and attaches them to a GitHub Release auto-generated from
+# the commit log since the previous tag.
+#
+# Locked artifact names (PRD §F-018):
+#   kino-${version}-linux-x86_64.AppImage
+#   kino-${version}-linux-x86_64.deb
+#   kino-${version}-linux-x86_64.tar.gz
+#   kino-${version}-android-universal.apk
+#   kino-${version}-android-arm64-v8a.apk
+#   kino-${version}-android-armeabi-v7a.apk
+#   kino-${version}-android-x86_64.apk
+#   kino-${version}-sbom-cyclonedx.json
+#   kino-${version}-sbom-syft.spdx.json
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: write
+
+jobs:
+  # PRD §F-018: tag format `v*`; pre-releases match `v*-alpha.*`,
+  # `v*-beta.*`, `v*-rc.*` and are marked as such in the GitHub Release.
+  version:
+    name: extract version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.extract.outputs.version }}
+      prerelease: ${{ steps.extract.outputs.prerelease }}
+    steps:
+      - id: extract
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${TAG}" =~ ^v ]]; then
+            echo "Tag ${TAG} must start with 'v'" >&2
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          if [[ "${VERSION}" =~ -(alpha|beta|rc)(\.|$) ]]; then
+            PRE="true"
+          else
+            PRE="false"
+          fi
+          echo "prerelease=${PRE}" >> "${GITHUB_OUTPUT}"
+          echo "Resolved: version=${VERSION} prerelease=${PRE}"
+
+  build-linux-x86_64:
+    name: build-linux-x86_64
+    needs: version
+    runs-on: ubuntu-24.04
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Tauri 2 Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libfuse2t64 \
+            patchelf \
+            squashfs-tools
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-linux-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-linux-
+            ${{ runner.os }}-cargo-build-linux-
+            ${{ runner.os }}-cargo-
+
+      - name: Install tauri-cli
+        run: cargo install tauri-cli --version "^2.0.0" --locked
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: cargo tauri build
+        run: cargo tauri build --target x86_64-unknown-linux-gnu
+
+      - name: Stage release artifacts (AppImage / .deb / .tar.gz)
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          BUNDLE_DIR=target/x86_64-unknown-linux-gnu/release/bundle
+
+          # AppImage — Tauri 2 bundler output
+          appimage=$(find "${BUNDLE_DIR}/appimage" -maxdepth 1 -name "*.AppImage" -print -quit || true)
+          if [[ -z "${appimage}" ]]; then
+            echo "AppImage not found under ${BUNDLE_DIR}/appimage" >&2
+            find "${BUNDLE_DIR}" -maxdepth 3 -type f 1>&2 || true
+            exit 1
+          fi
+          cp "${appimage}" "artifacts/kino-${VERSION}-linux-x86_64.AppImage"
+
+          # .deb — Tauri 2 bundler output. PRD §F-018 parenthetical mentions
+          # cargo-deb; we ship the Tauri-bundler .deb instead because it
+          # includes the desktop entry + icons + .so jniLibs that cargo-deb
+          # would otherwise need duplicate metadata to assemble. See
+          # session 022 ADR.
+          deb=$(find "${BUNDLE_DIR}/deb" -maxdepth 2 -name "*.deb" -print -quit || true)
+          if [[ -z "${deb}" ]]; then
+            echo ".deb not found under ${BUNDLE_DIR}/deb" >&2
+            find "${BUNDLE_DIR}" -maxdepth 3 -type f 1>&2 || true
+            exit 1
+          fi
+          cp "${deb}" "artifacts/kino-${VERSION}-linux-x86_64.deb"
+
+          # tar.gz — portable archive of the binary + LICENSE + a brief README.
+          stagedir="$(mktemp -d)"
+          appdir="${stagedir}/kino-${VERSION}-linux-x86_64"
+          mkdir -p "${appdir}"
+          cp target/x86_64-unknown-linux-gnu/release/kino-app "${appdir}/kino-app"
+          cp LICENSE "${appdir}/LICENSE"
+          {
+            printf 'kino %s for linux-x86_64.\n\n' "${VERSION}"
+            printf 'Launch:   ./kino-app\n'
+            printf 'Docs:     https://github.com/moukrea/kino\n'
+            printf 'License:  see LICENSE (MIT)\n'
+          } > "${appdir}/README"
+          tar -C "${stagedir}" -czf \
+            "artifacts/kino-${VERSION}-linux-x86_64.tar.gz" \
+            "kino-${VERSION}-linux-x86_64"
+          rm -rf "${stagedir}"
+
+          ls -la artifacts/
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kino-linux-x86_64
+          path: artifacts/*
+          if-no-files-found: error
+
+  build-android-universal:
+    name: build-android-universal
+    needs: version
+    runs-on: ubuntu-24.04
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "platforms;android-34 build-tools;34.0.0 ndk;27.0.12077973 platform-tools"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            src-tauri/gen/android/app/build
+            src-tauri/gen/android/.gradle
+          key: ${{ runner.os }}-cargo-release-android-universal-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml', 'src-tauri/gen/android/**/*.gradle*') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-android-universal-
+            ${{ runner.os }}-cargo-build-android-
+            ${{ runner.os }}-cargo-
+
+      - name: Install tauri-cli
+        run: cargo install tauri-cli --version "^2.0.0" --locked
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: cargo tauri android build (universal)
+        env:
+          NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
+        run: cargo tauri android build --apk
+        working-directory: src-tauri
+
+      - name: Stage universal APK
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          apk=$(find src-tauri/gen/android/app/build/outputs/apk -path "*/universal/release/*.apk" -print -quit || true)
+          if [[ -z "${apk}" ]]; then
+            echo "Universal APK not found" >&2
+            find src-tauri/gen/android/app/build/outputs -type f 1>&2 || true
+            exit 1
+          fi
+          cp "${apk}" "artifacts/kino-${VERSION}-android-universal.apk"
+          ls -la artifacts/
+
+      - name: Upload universal APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: kino-android-universal
+          path: artifacts/*
+          if-no-files-found: error
+
+  build-android-per-abi:
+    name: build-android-${{ matrix.abi }}
+    needs: version
+    runs-on: ubuntu-24.04
+    env:
+      RUSTFLAGS: "-D warnings"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            tauri_target: aarch64
+          - abi: armeabi-v7a
+            tauri_target: armv7
+          - abi: x86_64
+            tauri_target: x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "platforms;android-34 build-tools;34.0.0 ndk;27.0.12077973 platform-tools"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            src-tauri/gen/android/app/build
+            src-tauri/gen/android/.gradle
+          key: ${{ runner.os }}-cargo-release-android-${{ matrix.abi }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml', 'src-tauri/gen/android/**/*.gradle*') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-android-${{ matrix.abi }}-
+            ${{ runner.os }}-cargo-build-android-
+            ${{ runner.os }}-cargo-
+
+      - name: Install tauri-cli
+        run: cargo install tauri-cli --version "^2.0.0" --locked
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: cargo tauri android build (${{ matrix.abi }})
+        env:
+          NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
+        # Restricting `--target` to a single ABI causes the gradle build to
+        # link jniLibs for only that ABI, producing an effective per-ABI
+        # APK at the "universal" gradle flavor path. Skip `--split-per-abi`
+        # because the Tauri 2 scaffold does not configure `splits.abi`; the
+        # per-ABI distinction is achieved by the target restriction alone.
+        run: cargo tauri android build --apk --target ${{ matrix.tauri_target }}
+        working-directory: src-tauri
+
+      - name: Stage per-ABI APK
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          ABI: ${{ matrix.abi }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          apk=$(find src-tauri/gen/android/app/build/outputs/apk -path "*/universal/release/*.apk" -print -quit || true)
+          if [[ -z "${apk}" ]]; then
+            echo "Per-ABI APK not found for ${ABI}" >&2
+            find src-tauri/gen/android/app/build/outputs -type f 1>&2 || true
+            exit 1
+          fi
+          cp "${apk}" "artifacts/kino-${VERSION}-android-${ABI}.apk"
+          ls -la artifacts/
+
+      - name: Upload per-ABI APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: kino-android-${{ matrix.abi }}
+          path: artifacts/*
+          if-no-files-found: error
+
+  generate-sbom:
+    name: generate-sbom
+    needs:
+      - version
+      - build-android-universal
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked
+
+      - name: Generate CycloneDX SBOM (workspace dep closure rooted at kino-app)
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          cargo cyclonedx \
+            --manifest-path src-tauri/Cargo.toml \
+            --format json \
+            --spec-version 1.5
+          # cargo-cyclonedx writes ${crate_name}.cdx.json next to Cargo.toml.
+          src="src-tauri/kino-app.cdx.json"
+          if [[ ! -f "${src}" ]]; then
+            echo "CycloneDX output not found at ${src}" >&2
+            find src-tauri -maxdepth 2 -name "*.cdx.json" 1>&2 || true
+            exit 1
+          fi
+          cp "${src}" "artifacts/kino-${VERSION}-sbom-cyclonedx.json"
+
+      - name: Download Android universal APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: kino-android-universal
+          path: apk-input
+
+      - name: Install syft
+        run: |
+          set -euo pipefail
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sudo sh -s -- -b /usr/local/bin
+
+      - name: Generate SPDX SBOM (syft over the universal APK)
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          apk=$(find apk-input -maxdepth 2 -name "*.apk" -print -quit || true)
+          if [[ -z "${apk}" ]]; then
+            echo "Universal APK not found in apk-input" >&2
+            find apk-input -type f 1>&2 || true
+            exit 1
+          fi
+          syft scan "file:${apk}" -o "spdx-json=artifacts/kino-${VERSION}-sbom-syft.spdx.json"
+          ls -la artifacts/
+
+      - name: Upload SBOMs
+        uses: actions/upload-artifact@v4
+        with:
+          name: kino-sbom
+          path: artifacts/*
+          if-no-files-found: error
+
+  release:
+    name: release
+    needs:
+      - version
+      - build-linux-x86_64
+      - build-android-universal
+      - build-android-per-abi
+      - generate-sbom
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifact directories
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          # Each upload-artifact job creates a subdirectory under artifacts/.
+          find artifacts -mindepth 2 -type f -exec cp -v {} release/ \;
+          ls -la release/
+
+      - name: Verify all 9 PRD-locked artifacts are present
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          expected=(
+            "kino-${VERSION}-linux-x86_64.AppImage"
+            "kino-${VERSION}-linux-x86_64.deb"
+            "kino-${VERSION}-linux-x86_64.tar.gz"
+            "kino-${VERSION}-android-universal.apk"
+            "kino-${VERSION}-android-arm64-v8a.apk"
+            "kino-${VERSION}-android-armeabi-v7a.apk"
+            "kino-${VERSION}-android-x86_64.apk"
+            "kino-${VERSION}-sbom-cyclonedx.json"
+            "kino-${VERSION}-sbom-syft.spdx.json"
+          )
+          missing=0
+          for f in "${expected[@]}"; do
+            if [[ ! -f "release/${f}" ]]; then
+              echo "MISSING: release/${f}"
+              missing=$((missing + 1))
+            else
+              echo "OK: release/${f}"
+            fi
+          done
+          if (( missing > 0 )); then
+            echo "${missing} required artifact(s) missing" >&2
+            exit 1
+          fi
+
+      - name: Create or update GitHub Release (idempotent)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.version.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          # PRD §F-018: "Re-running release for the same tag: idempotent
+          # (skip if release exists) or fail fast." We pick idempotent: if
+          # the release exists, re-upload artifacts with --clobber so a
+          # workflow re-run after a transient failure keeps the release
+          # in sync. Auto-generated notes are produced on first creation
+          # only.
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists; re-uploading artifacts with --clobber."
+            gh release upload "${TAG}" release/* --clobber
+          else
+            args=("${TAG}" --title "${TAG}" --generate-notes)
+            if [[ "${PRERELEASE}" == "true" ]]; then
+              args+=(--prerelease)
+            fi
+            gh release create "${args[@]}" release/*
+          fi
+          echo
+          echo "Release contents:"
+          gh release view "${TAG}" --json assets --jq '.assets[].name'
