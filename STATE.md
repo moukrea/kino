@@ -1,9 +1,9 @@
 # kino — Agent State
 
 **PRD version:** 1.0 (locked)
-**Status:** v1.0.0-alpha.1 release pipeline shipped, BUT Session 027's §6A audit found six features re-opened and three §5 non-functional reliability/logging items missing. **Session 028 closes the §5 reliability bundle** (Rust panic hook, frontend root `<ErrorBoundary>`, runtime-reloadable `tracing` filter wired to the new `display.advanced_logging` toggle). The six §6A feature regressions (F-003, F-006, F-013, F-014, F-015, F-016) remain open. **§6A is still not claimable.** See ADR-119 + ADR-120.
-**Last session:** 028 (§5 reliability bundle — Rust panic hook installed; SolidJS root `<ErrorBoundary>` wrapping `<Router>`; `tracing_subscriber::reload::Layer` + new `display.advanced_logging` setting flipping `info`↔`debug` at runtime via `settings_set`; ADR-119 + ADR-120)
-**Next session:** 029 — recommended order from the §6A Code-Acceptance Regressions section: (1) F-006 frontend availability filter (entire UI surface missing — single largest gap), (2) F-016 directory picker + license-text accessor (~55 LOC total), (3) F-003 ETag handling, (4) F-015 Android DV decoder selector (~60 LOC), (5) F-013 / F-014 librqbit-blocked items (need an upstream PR, a fork, or a human PRD revision — file under "PRD Issues" if blocked).
+**Status:** v1.0.0-alpha.1 release pipeline shipped. Session 028 closed the §5 reliability bundle. **Session 029 closes the F-016 §4 directory picker AND F-016 §8 LICENSE-text accessor** in one tight bundle (~150 LOC counting the new `tauri-plugin-dialog` wiring + vite fs.allow widening), flipping **F-016** back to `[x]` in the Feature Tracker. Five §6A feature regressions remain open: F-003 (ETag handling), F-006 (frontend availability filter — single largest gap), F-013 / F-014 (librqbit-blocked: max-connections cap + piece-priority window assignment), F-015 (Android DV decoder selector + Linux libmpv in-window GL). **§6A is still not claimable.** See the F-016-closure rationale in the Session 029 entry below.
+**Last session:** 029 (F-016 §4 + §8 closure — `tauri-plugin-dialog` plugin wired on both Rust + frontend sides; "Browse…" Focusable button next to the cache-path TextField; Vite `?raw` LICENSE inline + in-app scrollable LICENSE modal; `dialog:allow-open` permission added to the default capability; `server.fs.allow: ['..']` in `vite.config.ts` so the cross-boundary import resolves under vitest; F-016 Feature Tracker checkbox flipped back to `[x]`)
+**Next session:** 030 — recommended order from the remaining §6A Code-Acceptance Regressions section: (1) F-006 frontend availability filter (entire UI surface missing — single largest gap remaining), (2) F-003 ETag handling (medium scope: thread `etag` through `cache-set` + `If-None-Match` + `304` path in `kino-core::http`), (3) F-015 Android DV decoder selector (~60 LOC), (4) F-013 / F-014 librqbit-blocked items (need an upstream PR, a fork, or a human PRD revision — file under "PRD Issues" if blocked), (5) F-015 Linux libmpv in-window GL surface (multi-session, ADR-108 deviation).
 
 ---
 
@@ -68,6 +68,186 @@ a hard requirement.
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 029 — F-016 §4 directory picker + F-016 §8 LICENSE-text accessor
+
+**Branch:** `claude/session-001-bootstrap-tWdcx` (harness-supplied; see
+ADR-033 — the harness reuses a single branch name across all sessions
+for this checkout, the branch name does NOT track the session number).
+
+**Scope chosen:** the two F-016 §6A regressions filed by Session 027 —
+§F-016 §4 "Path (with directory picker)" and §F-016 §8 "License: MIT,
+full text accessible". Picked over the larger F-006 frontend
+availability surface (Session 028's recommended #1 remaining) because
+the F-016 bundle clears **two** §6A regressions in one session at
+~150 LOC total (including the `tauri-plugin-dialog` Rust + npm
+plumbing and the vite fs-allow tweak), with both items confined to
+`Settings.tsx` and the existing `settings_set` channel — higher
+leverage per session and lower failure risk than the single-feature
+F-006 path. Session 028's "Next session" guidance called the F-016
+bundle out as fitting one session; this session is the realization
+of that plan, mirroring Session 028's own bundling pattern.
+
+**Implementation:**
+
+1. **Directory picker (PRD §F-016 §4).** Added `tauri-plugin-dialog
+   = "2"` to `src-tauri/Cargo.toml` (Tauri 2 first-party plugin —
+   `rfd` under the hood on desktop, SAF on Android, no new manifest
+   permissions). Registered via `.plugin(tauri_plugin_dialog::init())`
+   in `lib.rs::run()` right after the existing `kino-player` plugin.
+   Added `dialog:allow-open` to the default capability's
+   `permissions` array in `src-tauri/capabilities/default.json`.
+   Added `@tauri-apps/plugin-dialog@^2.0.0` to
+   `frontend/package.json` (installs `2.7.1`). Exported
+   `pickDirectory(initialPath?)` from `frontend/src/lib/tauri.ts` —
+   a thin wrapper around the plugin's `open({ directory: true,
+   multiple: false, defaultPath })` that returns `Promise<string |
+   null>` (null on user-cancel or non-Tauri host). In
+   `Settings.tsx::CacheSection`, replaced the bare `<TextField>` with
+   a horizontal flex containing the TextField AND a new `<Focusable
+   id="settings-section-cache-path-browse">` "Browse…" button whose
+   `onActivate` calls `pickDirectory(props.view().cache.path)` and,
+   on a non-null result, routes it through the same `props.persist(
+   SETTING_KEYS.cachePath, picked)` channel the TextField already
+   uses — so live cache-root rebind in `lib.rs` (resolved each boot
+   via `commands::resolve_cache_path`) stays on a single code path
+   regardless of input modality. Error path announces via
+   `settings.cache.browseError` i18n key. Added the new browse id to
+   the D-pad-coverage assertion in `Settings.test.tsx`.
+
+2. **LICENSE viewer (PRD §F-016 §8).** Imported the repo-root LICENSE
+   file at build time via Vite's `?raw` query
+   (`import licenseText from "../../../LICENSE?raw"`). Widened
+   `server.fs.allow` to `[".."]` in `vite.config.ts` so the
+   cross-boundary import resolves under the dev server AND under
+   vitest (both use the same Vite config; the default `fs.allow` is
+   the frontend project root, which would refuse the cross-boundary
+   read at request time). Production `vite build` was already
+   unaffected — Rollup resolves the module at bundle time without
+   the dev-server fs gate. In `Settings.tsx::AboutSection`, the
+   literal `{props.appInfo().license}` row gained a Focusable "View
+   license" button next to the license value; activation toggles a
+   local `showLicense` signal that renders a new `<LicenseModal>`
+   component — fixed-positioned overlay with `role="dialog"`
+   `aria-modal="true"`, a scrollable `<pre data-testid="settings-
+   about-license-body">{licenseText}</pre>` constrained to `max-
+   h-[80vh]`, and a "Close" Focusable that flips the signal back.
+   `setInitialFocus("settings-about-license-close")` on mount so the
+   F-017 manager doesn't lose focus when the modal opens.
+
+**Files changed:**
+
+- `src-tauri/Cargo.toml` — `tauri-plugin-dialog = "2"` added with a
+  comment block citing PRD §F-016 §4 and ADR-118's regression
+  reclassification.
+- `src-tauri/src/lib.rs` — `.plugin(tauri_plugin_dialog::init())`
+  registered right after the `kino-player` plugin in the Tauri
+  builder.
+- `src-tauri/capabilities/default.json` — `dialog:allow-open` added
+  to the default capability's `permissions` array.
+- `frontend/package.json` — `@tauri-apps/plugin-dialog`
+  `"^2.0.0"` added to dependencies.
+- `frontend/package-lock.json` — auto-updated by `npm install`
+  (10 lines for the new plugin's manifest entry; no transitive deps
+  since the plugin reuses `@tauri-apps/api`).
+- `frontend/src/lib/tauri.ts` — new top-level
+  `import { open as openDialog } from "@tauri-apps/plugin-dialog"`
+  and new exported `async function pickDirectory(initialPath?:
+  string): Promise<string | null>`.
+- `frontend/src/routes/Settings.tsx` — `pickDirectory` added to the
+  `../lib/tauri` named-import group; new top-level
+  `import licenseText from "../../../LICENSE?raw"`; `CacheSection`
+  signature gained `announce: AnnounceFn` (forwarded by the
+  `SettingsContent` call site); new `browseCachePath()` handler;
+  cache-path FieldShell now wraps a flex row with the TextField +
+  Browse Focusable; `AboutSection` gained `showLicense` signal + a
+  Focusable "View license" trigger next to the license value + a
+  `<Show when={showLicense()}>` mounting the new `LicenseModal`
+  component; `LicenseModal` defined inline alongside `ConfirmModal`,
+  same modal-shell idiom, exports the LICENSE body via a styled
+  `<pre>` with `whitespace-pre-wrap` and `overflow-auto`.
+- `frontend/vite.config.ts` — `server.fs.allow: [".."]` added with
+  comment block explaining the F-016 §8 cross-boundary read.
+- `frontend/src/locales/en.json` — 5 new keys: `settings.cache.
+  browse` ("Browse…"), `settings.cache.browseError` ("Could not
+  open file picker: {{reason}}"), `settings.about.viewLicense`
+  ("View license"), `settings.about.licenseTitle` ("License (MIT)"),
+  `settings.about.licenseClose` ("Close").
+- `frontend/src/locales/fr.json` — French translations for the same
+  five keys.
+- `frontend/src/routes/Settings.test.tsx` — `pickDirectory` added to
+  the `vi.mock("../lib/tauri", ...)` surface + bound to
+  `mockedPickDirectory` and `mockReset`-ed in `beforeEach`; three
+  new tests:
+  - "PRD §F-016 §4: Browse button picks a directory and persists
+    cache.path" — mocks `pickDirectory` to resolve `/picked/cache/
+    dir`, clicks the Browse button, asserts both the picker and
+    `settingsSet("cache.path", "/picked/cache/dir")` were called.
+  - "PRD §F-016 §4: Browse cancel (null) leaves cache.path
+    untouched" — mocks `pickDirectory` to resolve `null`, asserts
+    `settingsSet` was NOT called with the `cache.path` key.
+  - "PRD §F-016 §8: View license opens a modal containing the
+    LICENSE body" — asserts the modal is hidden by default,
+    appears on Trigger click with the LICENSE body containing
+    "MIT License" and "Permission is hereby granted", and is
+    dismissed by the Close button.
+  - D-pad coverage assertion expanded with two new ids
+    (`settings-section-cache-path-browse`,
+    `settings-about-license-view`).
+- `Cargo.lock` — auto-updated for `tauri-plugin-dialog` `2.7.1` and
+  its transitive deps (most notably `rfd` `0.16.0`).
+
+**Features advanced:** **F-016 toggled `[ ] → [x]`** in the Feature
+Tracker — the only two F-016 regressions filed by Session 027
+("F-016 §4 / Cache directory picker" and "F-016 §8 / LICENSE full
+text accessible") are both closed by this session, so the feature
+is fully PRD-locked again. No other `F-XXX` toggles.
+
+**ADRs filed:** None. Both items follow the closure plans Session
+027 dictated verbatim; the implementation choices (Tauri 2
+first-party `tauri-plugin-dialog` over a third-party crate; Vite
+`?raw` inline over a Tauri `read_text_file` round-trip) are the
+prescribed paths, not unilateral decisions.
+
+**Tests added:** 3 frontend (vitest):
+- "PRD §F-016 §4: Browse button picks a directory and persists
+  cache.path"
+- "PRD §F-016 §4: Browse cancel (null) leaves cache.path untouched"
+- "PRD §F-016 §8: View license opens a modal containing the
+  LICENSE body"
+
+Plus the D-pad coverage assertion gained two new ids.
+
+**Verification:**
+
+- `cargo fmt --check` ✓
+- `cargo clippy --workspace --all-targets -- -D warnings` ✓
+- `cargo test --workspace` ✓ (399 unit + integration tests across
+  the workspace pass; unchanged count from Session 028 since this
+  session only touched the Tauri host builder + capabilities, not
+  any Rust unit-tested module).
+- `npm run typecheck` ✓
+- `npm run lint` ✓ (0 errors, 0 warnings)
+- `npm test -- --run` ✓ (220 tests across 20 files, +3 from
+  Session 028's 217)
+- `npm run build` ✓ (`tsc --noEmit && vite build` clean; LICENSE
+  body inlined into `dist/assets/index-*.js`)
+- `cargo tauri build` / `cargo tauri android build` not run locally
+  per the Standing Authorizations (build matrix is CI's job; merge
+  gate is `lint` + `test` only). Android-side risk: `tauri-plugin-
+  dialog` requires Gradle integration on the Android build, which
+  the Tauri 2 plugin auto-wires via its `build.rs` — if this
+  surfaces a §6B regression on the `build-android` CI job, the
+  next session addresses it as the highest-priority scope per the
+  protocol.
+
+**Known follow-ups / future sessions:** F-006 (largest single §6A
+regression remaining), F-003 ETag, F-015 Android DV selector,
+F-013 + F-014 librqbit-blocked items, F-015 Linux libmpv in-window
+GL. Order is documented in the top preamble's "Next session"
+guidance.
+
+---
 
 ### Session 028 — §5 reliability bundle (panic hook + ErrorBoundary + advanced logging)
 
@@ -6585,7 +6765,7 @@ implementation" split.
   "Up next: Sxx Eyy") + per-tile manual remove via Y / Menu /
   right-click / long-press wired through the new `<Focusable>
   onContext` prop. 24 new Rust tests + 16 new frontend tests.)_
-- [ ] F-016: Settings screen _(Session 016: full PRD §F-016 §1-§8
+- [x] F-016: Settings screen _(Session 016: full PRD §F-016 §1-§8
   form tree (API keys / Addons / Language / Cache / Buffer / Player
   (Android-only) / Display / About) with 28 KV-backed user-tunable
   settings, validation + normalization via `settings::validate_setting`,
@@ -6596,14 +6776,15 @@ implementation" split.
   Reset, App.tsx boot-time `settingsGetAll()` for UI language +
   input override persistence, full D-pad navigability via the F-017
   `<Focusable>` primitive. 29 new Rust tests + 20 new frontend tests.
-  **Re-opened by Session 027 audit:** two PRD-locked widgets are
-  not implemented — (a) §F-016 §4 "Path (with directory picker)"
-  ships as a plain text input (ADR-095; `tauri-plugin-dialog` not
-  on the dependency tree), and (b) §F-016 §8 "License: MIT, full
-  text accessible" surfaces only the string `"MIT"` at
-  `Settings.tsx:1334` with no link / dialog rendering the LICENSE
-  body. See "§6A Code-Acceptance Regressions / F-016" for the
-  closure plan.)_
+  Re-opened by Session 027 audit; **closed again by Session 029**:
+  the §F-016 §4 directory picker now ships via `tauri-plugin-dialog`
+  (Browse… Focusable next to the cache-path TextField calls
+  `pickDirectory()` and routes the result through `settingsSet(
+  cache.path, …)`), and §F-016 §8 LICENSE accessibility ships via a
+  Vite `?raw` inline + an in-app scrollable `<LicenseModal>` opened
+  by a Focusable "View license" trigger in the About section. The
+  two §6A Code-Acceptance Regressions entries are flipped to
+  **RESOLVED** below.)_
 - [x] F-017: Input handling _(Session 010: per-platform input
   profile detection + auto-adaptation, locked PRD §F-017
   keyboard / gamepad action maps, focus manager with geometric
@@ -7292,43 +7473,62 @@ Expect this to be a multi-session effort — likely split as
 N+1: implement render-context-aware driver", "Session N+2: wire
 behind feature flag + CI matrix".
 
-### F-016 §4 / Cache directory picker
+### ~~F-016 §4 / Cache directory picker~~ — RESOLVED in Session 029
 
 **PRD §F-016 §4 (locked):** "Path (with directory picker)".
 
-**Actual:** `frontend/src/routes/Settings.tsx:1014` ships a plain
-`<TextField>` for the cache-path value. No
-`@tauri-apps/plugin-dialog` is on the dependency tree
-(`frontend/package.json` does not declare it, `src-tauri/Cargo.toml`
-does not declare `tauri-plugin-dialog`). ADR-095 documented the
-shortcut.
+**Resolution (Session 029):** `tauri-plugin-dialog = "2"` added to
+`src-tauri/Cargo.toml` (Tauri 2 first-party plugin; uses `rfd` on
+desktop, SAF on Android — no new manifest permissions). Registered
+via `.plugin(tauri_plugin_dialog::init())` in `lib.rs::run()`.
+`dialog:allow-open` added to the default capability's permissions
+array in `src-tauri/capabilities/default.json`.
+`@tauri-apps/plugin-dialog ^2.0.0` added to `frontend/package.json`
+(installs `2.7.1`). New `pickDirectory(initialPath?: string):
+Promise<string | null>` helper exported from
+`frontend/src/lib/tauri.ts` wraps the plugin's `open({ directory:
+true, multiple: false, defaultPath })` call and returns `null` on
+user-cancel or non-Tauri host. `Settings.tsx::CacheSection` now
+renders a horizontal flex containing the existing `<TextField>`
+PLUS a new `<Focusable id="settings-section-cache-path-browse">`
+"Browse…" button; the button's `onActivate` calls
+`pickDirectory(props.view().cache.path)` and, on a non-null
+result, routes it through `props.persist(SETTING_KEYS.cachePath,
+picked)` so the live cache-root rebind in `lib.rs` (via
+`commands::resolve_cache_path`) stays on a single code path
+regardless of input modality. Error path announces via the new
+`settings.cache.browseError` i18n key. ADR-095's text-only
+fallback is preserved (the user can still type/paste a path); the
+picker is layered convenience. Three Settings test cases added
+(see Session 029 entry above).
 
-**Closure plan:** add `tauri-plugin-dialog` (Tauri 2 first-party
-plugin, no third-party trust concern). Register it on both the
-Rust side (`tauri_plugin_dialog::init()` in the builder) and the
-frontend side (`@tauri-apps/plugin-dialog` in `package.json`).
-Wire a "Browse…" Focusable button next to the cache-path
-TextField that calls `open({ directory: true })` and writes the
-returned path back through the existing `settingsSet` channel.
-Android-side: SAF picker is acceptable per ADR-095's
-permission-audit note; ensure no NEW manifest permissions are
-declared without explicit re-audit. ~30 LOC.
-
-### F-016 §8 / LICENSE full text accessible
+### ~~F-016 §8 / LICENSE full text accessible~~ — RESOLVED in Session 029
 
 **PRD §F-016 §8 (locked):** "License: MIT, full text accessible".
 
-**Actual:** `frontend/src/routes/Settings.tsx:1334` renders only
-the literal string `"MIT"`. No link to `/LICENSE`, no in-app
-viewer, no scroll dialog.
-
-**Closure plan:** import the LICENSE body as a Vite
-`?raw` string import (`import licenseText from "../../../LICENSE?raw"`)
-and add a Focusable "View license" button that opens an in-app
-modal with a scrollable `<pre>{licenseText}</pre>`. Confirm the
-LICENSE file is also packaged into the AppImage / APK (Tauri's
-bundler already includes the file when present at repo root,
-since it's a sibling of `Cargo.toml`). ~25 LOC.
+**Resolution (Session 029):** the repo-root LICENSE file is
+inlined at build time via Vite's `?raw` query
+(`import licenseText from "../../../LICENSE?raw"` in
+`frontend/src/routes/Settings.tsx`). `vite.config.ts` widened
+`server.fs.allow` to `[".."]` so the cross-boundary import
+resolves under both the dev server AND vitest (default is the
+frontend project root, which would refuse the read at request
+time; production `vite build` was already unaffected — Rollup
+resolves the module at bundle time). `Settings.tsx::AboutSection`
+gained a new `showLicense` signal AND a Focusable
+"View license" button next to the literal license value;
+activation mounts a new `<LicenseModal>` component (a fixed-
+positioned `role="dialog"` overlay with a scrollable `<pre>` of
+the LICENSE body, constrained to `max-h-[80vh]`, and a Focusable
+"Close" button that dismisses the modal). `setInitialFocus(
+"settings-about-license-close")` on mount keeps the F-017 focus
+manager pointed at the dismiss button. The LICENSE file remains
+at the repo root, so Tauri's bundler still includes it in
+AppImage / APK builds via its default packaging rule. New i18n
+keys (`settings.about.viewLicense`, `settings.about.licenseTitle`,
+`settings.about.licenseClose`) in both `en.json` and `fr.json`.
+One Settings test case asserts the modal hide/show cycle and the
+LICENSE body content (see Session 029 entry above).
 
 ### ~~§5 Reliability / Rust panic hook~~ — RESOLVED in Session 028
 

@@ -54,6 +54,7 @@ vi.mock("../lib/tauri", async (importOriginal) => {
     cacheUsageBytes: vi.fn(),
     cacheClear: vi.fn(),
     exportLogs: vi.fn(),
+    pickDirectory: vi.fn(),
     testTmdb: vi.fn(),
     testTrakt: vi.fn(),
     testTvdb: vi.fn(),
@@ -70,6 +71,7 @@ const mockedSet = vi.mocked(tauri.settingsSet);
 const mockedReset = vi.mocked(tauri.settingsResetDefaults);
 const mockedUsage = vi.mocked(tauri.cacheUsageBytes);
 const mockedCacheClear = vi.mocked(tauri.cacheClear);
+const mockedPickDirectory = vi.mocked(tauri.pickDirectory);
 const mockedTestTmdb = vi.mocked(tauri.testTmdb);
 const mockedInstallAddon = vi.mocked(tauri.installAddon);
 const mockedUninstallAddon = vi.mocked(tauri.uninstallAddon);
@@ -184,6 +186,7 @@ describe("Settings route (F-016)", () => {
     mockedReset.mockReset();
     mockedUsage.mockReset();
     mockedCacheClear.mockReset();
+    mockedPickDirectory.mockReset();
     mockedTestTmdb.mockReset();
     mockedInstallAddon.mockReset();
     mockedUninstallAddon.mockReset();
@@ -590,6 +593,113 @@ describe("Settings route (F-016)", () => {
     expect(mockedSet).toHaveBeenCalledWith("display.tile_size", "large");
   });
 
+  it("PRD §F-016 §4: Browse button picks a directory and persists cache.path", async () => {
+    // ADR-118 reclassified ADR-095's text-only fallback as a §6A
+    // regression; this asserts the closure plan: clicking Browse calls
+    // `pickDirectory` (which wraps `tauri-plugin-dialog`'s `open`) and
+    // routes a successful pick through the same `settingsSet` channel
+    // the manual TextField uses, so persistence + validation + live
+    // cache-root rebind in `lib.rs` all stay on a single code path.
+    mockedPickDirectory.mockResolvedValue("/picked/cache/dir");
+    const { host, dispose } = mount();
+    activeHost = host;
+    activeDispose = dispose;
+    await flushAsync();
+    await waitFor(
+      () =>
+        !!host.querySelector(
+          '[data-testid="settings-section-cache-path-browse"]',
+        ),
+    );
+
+    host
+      .querySelector<HTMLButtonElement>(
+        '[data-testid="settings-section-cache-path-browse"]',
+      )!
+      .click();
+    await flushAsync();
+
+    expect(mockedPickDirectory).toHaveBeenCalledTimes(1);
+    expect(mockedSet).toHaveBeenCalledWith("cache.path", "/picked/cache/dir");
+  });
+
+  it("PRD §F-016 §4: Browse cancel (null) leaves cache.path untouched", async () => {
+    mockedPickDirectory.mockResolvedValue(null);
+    const { host, dispose } = mount();
+    activeHost = host;
+    activeDispose = dispose;
+    await flushAsync();
+    await waitFor(
+      () =>
+        !!host.querySelector(
+          '[data-testid="settings-section-cache-path-browse"]',
+        ),
+    );
+
+    host
+      .querySelector<HTMLButtonElement>(
+        '[data-testid="settings-section-cache-path-browse"]',
+      )!
+      .click();
+    await flushAsync();
+
+    expect(mockedPickDirectory).toHaveBeenCalledTimes(1);
+    expect(mockedSet).not.toHaveBeenCalledWith(
+      "cache.path",
+      expect.any(String),
+    );
+  });
+
+  it("PRD §F-016 §8: View license opens a modal containing the LICENSE body", async () => {
+    // ADR-118 reclassified the literal "MIT" string as a §6A regression;
+    // closure ships an in-app scrollable modal with the inlined LICENSE
+    // text imported via Vite `?raw`. The modal trigger is Focusable so
+    // the F-017 D-pad manager can reach it; closing the modal restores
+    // the underlying page.
+    const { host, dispose } = mount();
+    activeHost = host;
+    activeDispose = dispose;
+    await flushAsync();
+    await waitFor(
+      () =>
+        !!host.querySelector('[data-testid="settings-about-license-view"]'),
+    );
+
+    // Modal not visible until trigger fires.
+    expect(
+      host.querySelector('[data-testid="settings-about-license-modal"]'),
+    ).toBeNull();
+
+    host
+      .querySelector<HTMLButtonElement>(
+        '[data-testid="settings-about-license-view"]',
+      )!
+      .click();
+    await flushAsync();
+
+    const modal = host.querySelector(
+      '[data-testid="settings-about-license-modal"]',
+    );
+    expect(modal).not.toBeNull();
+    const body = host.querySelector(
+      '[data-testid="settings-about-license-body"]',
+    );
+    expect(body?.textContent).toContain("MIT License");
+    expect(body?.textContent).toContain("Permission is hereby granted");
+
+    // Close button collapses the modal back.
+    host
+      .querySelector<HTMLButtonElement>(
+        '[data-testid="settings-about-license-close"]',
+      )!
+      .click();
+    await flushAsync();
+
+    expect(
+      host.querySelector('[data-testid="settings-about-license-modal"]'),
+    ).toBeNull();
+  });
+
   it("renders the About section with version + commit from get_app_info", async () => {
     const { host, dispose } = mount({ appInfo: defaultAppInfo() });
     activeHost = host;
@@ -628,6 +738,7 @@ describe("Settings route (F-016)", () => {
       "settings-section-language-primary-input",
       "settings-section-language-ui-select",
       "settings-section-cache-path-input",
+      "settings-section-cache-path-browse",
       "settings-section-cache-size-input",
       "settings-cache-clear",
       "settings-section-buffer-safety-input",
@@ -638,6 +749,7 @@ describe("Settings route (F-016)", () => {
       "settings-section-display-tile-select",
       "settings-section-display-nsfw",
       "settings-section-display-input-select",
+      "settings-about-license-view",
       "settings-about-export-input",
       "settings-about-export-submit",
     ];

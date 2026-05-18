@@ -97,6 +97,14 @@ pub fn run() {
         // so a future libmpv-in-process driver can land behind the same
         // plugin-as-feature-flag interface.
         .plugin(tauri_plugin_kino_player::init())
+        // PRD §F-016 §4: native directory picker for the Cache → Path
+        // setting. The dialog plugin's `open({ directory: true })` call
+        // is invoked from the frontend "Browse…" button next to the
+        // path TextField; the returned path flows back through the
+        // standard `settingsSet` channel. ADR-095's text-only fallback
+        // is preserved (the user can still type/paste a path); the
+        // picker is a layered convenience.
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let handle = app.handle().clone();
             let db_path = paths::db_path(&handle).map_err(|e| {

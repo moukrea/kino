@@ -130,6 +130,8 @@
     "cache": {
       "path": "Chemin du cache",
       "pathHint": "Où sont stockés les torrents et les visuels résolus.",
+      "browse": "Parcourir…",
+      "browseError": "Impossible d’ouvrir le sélecteur de fichiers : {{reason}}",
       "size": "Taille maximale",
       "sizeLabel": "{{n}} Gio",
       "usage": "Utilisation actuelle",
@@ -179,6 +181,9 @@
       "repo": "Source",
       "openRepo": "Ouvrir le dépôt",
       "license": "Licence",
+      "viewLicense": "Afficher la licence",
+      "licenseTitle": "Licence (MIT)",
+      "licenseClose": "Fermer",
       "exportLogs": "Exporter les journaux",
       "exportLogsHint": "Regroupe les fichiers journaux dans une archive .zip.",
       "exportLogsPathPlaceholder": "kino-logs.zip",
