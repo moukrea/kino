@@ -16,11 +16,13 @@ mod logs;
 mod paths;
 mod settings;
 
+use std::sync::Arc;
+
 use kino_core::Db;
 use tauri::Manager;
 use tracing_appender::non_blocking::WorkerGuard;
 
-use commands::TorrentRuntime;
+use commands::{PlayerRuntime, TorrentRuntime};
 
 /// Holder for the rolling-file-appender worker guard. The guard must outlive
 /// the process so the appender thread flushes buffered log lines on exit;
@@ -37,6 +39,7 @@ struct LogGuard(WorkerGuard);
 /// failure here means the user is on an unsupported platform and there is
 /// no recovery short of crashing with a clear backtrace.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+#[allow(clippy::too_many_lines)] // setup() block lists every Tauri command + manages every state.
 pub fn run() {
     // Subscriber init lives in setup() rather than at function entry so the
     // PRD §F-016 §8 file appender can be wired in the SAME init call as the
@@ -99,6 +102,13 @@ pub fn run() {
             }
 
             app.manage(db);
+            // PRD §F-015: an empty PlayerRuntime is registered so the
+            // first `player_open` call lazily boots the platform driver
+            // (mpv on Linux; the Android Tauri plugin elsewhere). The
+            // runtime is `Arc`d so command handlers and the bridge task
+            // can hold cheap clones without contesting the Tauri state
+            // lock.
+            app.manage(Arc::new(PlayerRuntime::default()));
             tracing::info!("kino host started (PRD §F-002 persistence ready)");
             Ok(())
         })
@@ -151,6 +161,13 @@ pub fn run() {
             commands::buffer_stop_monitor,
             commands::buffer_report_position,
             commands::buffer_status,
+            commands::player_open,
+            commands::player_close,
+            commands::player_pause,
+            commands::player_seek,
+            commands::player_set_audio_track,
+            commands::player_set_subtitle_track,
+            commands::player_status,
         ])
         .run(tauri::generate_context!())
         .expect("kino: error while running tauri application");

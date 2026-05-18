@@ -2,8 +2,8 @@
 
 **PRD version:** 1.0 (locked)
 **Status:** features-in-progress
-**Last session:** 019
-**Next session:** 020
+**Last session:** 020
+**Next session:** 021
 
 ---
 
@@ -68,6 +68,260 @@ a hard requirement.
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 020 — F-015 Linux mpv player driver (backend)
+
+**Branch:** `claude/session-001-bootstrap-Nva3w`
+(Harness-supplied; see ADR-033.)
+
+**Scope chosen:** F-015 Native player integration — backend / Linux side.
+PRD §F-015 has six code-acceptance items spanning Android `PlayerActivity`,
+Linux `libmpv` integration, subtitle rendering, seek-safe interaction with
+the F-014 adaptive buffer, and final-position persistence. The Linux
+backend driver + the cross-platform `PlayerHandle` surface + the Tauri host
+event bridge are this session; the frontend `Player.tsx` overlay route
+and the Android `PlayerActivity` Tauri plugin are deliberate Session-021+
+follow-ups (see ADR-108).
+
+**Files added (new):**
+
+- `crates/kino-player/Cargo.toml` — new workspace member;
+  `serde` / `serde_json` / `thiserror` / `tracing` / `tokio` /
+  `async-trait` / `uuid` deps.
+- `crates/kino-player/src/lib.rs` — module wiring + public re-exports.
+  `MpvPlayer` is cfg-gated to `target_os = "linux"` so non-Linux builds
+  still compile against the shared types.
+- `crates/kino-player/src/error.rs` — `PlayerError` enum
+  (`Spawn / Io / Closed / IpcWrite / IpcRead / Backend / Parse /
+  NoMedia / Busy`) bridging spawn / wire / parse / backend failures
+  with `#[from]` style transports.
+- `crates/kino-player/src/state.rs` — `PlayerState`
+  (`Idle / Loading / Playing / Paused / Buffering / Ended / Error`)
+  with `has_media()` predicate, `PlayerSnapshot { token, state,
+  position_s, duration_s, paused }` returned by `player_status`.
+- `crates/kino-player/src/event.rs` — wire-tagged `PlayerEvent` enum
+  (`Position / State / Tracks / Exit / Error`) serialized with
+  `#[serde(tag = "kind", rename_all = "camelCase",
+  rename_all_fields = "camelCase")]` so JS sees flat camelCase objects
+  like `{ "kind": "position", "positionS": 12.34, "durationS": 5800,
+  "paused": false }`. `PositionTick` carrier struct +
+  `PlayerEvent::{position,state,tracks}(...)` convenience
+  constructors. `is_terminal()` predicate so the bridge task knows
+  when to break the recv loop.
+- `crates/kino-player/src/tracks.rs` — `AudioTrack` / `SubtitleTrack`
+  / `TrackList`. `TrackList::from_mpv_tracks(raw)` translates the mpv
+  `track-list` property payload (typed JSON array with `type` /
+  `id` / `lang` / `codec` / `demux-channel-count` / `default` /
+  `selected` / `forced` fields) into the shared shape.
+- `crates/kino-player/src/handle.rs` — `OpenRequest { token, url,
+  resume_position_s, file_name, duration_hint_s }` plus the
+  `async_trait` `PlayerHandle: Send + Sync` trait (`snapshot`,
+  `subscribe`, `open`, `close`, `set_paused`, `seek`,
+  `select_audio_track`, `select_subtitle_track`, `tracks`). The whole
+  trait takes `&self` so the Tauri host can store an `Arc<dyn
+  PlayerHandle>` and dispatch from any command without an outer lock.
+- `crates/kino-player/src/ipc.rs` — pure (no-I/O) JSON-IPC framer for
+  mpv. `parse_frame(line) -> Result<Frame>` covers responses
+  (`{"request_id", "error", "data"}`), `property-change` events
+  (`time-pos`, `duration`, `pause`, `paused-for-cache`, `track-list`,
+  …), `shutdown`, `end-file` (with `reason` / `file_error`
+  destructuring), and an `Event::Other { name }` catch-all so
+  unmodeled events don't poison the reader. `Command::new(id, args)`
+  + `to_line()` produces the newline-terminated outbound frame. 13
+  unit tests including malformed-JSON / non-object / missing-fields
+  rejection paths.
+- `crates/kino-player/src/mpv.rs` — the Linux driver. `MpvBuilder`
+  builds the spawn command (idle, no-terminal, force-window-
+  immediate, keep-open, hwdec=auto-safe, cache=yes, demuxer-max-
+  bytes=200MiB, demuxer-readahead-secs=20, audio-spdif PRD set,
+  sub-auto fuzzy, sub-ass on, optional `--include=<mpv.conf>`).
+  `KINO_MPV_PATH` env override for sandboxes (`MpvBuilder::with_binary`
+  is the test-friendly path that doesn't touch env). `MpvPlayer`
+  owns an `Arc<MpvInner>` with: `mpsc::UnboundedSender<OutboundCommand>`
+  to the writer task, `broadcast::Sender<PlayerEvent>` for
+  subscribers, a `tokio::sync::Mutex<PlayerSnapshot>` kept in sync by
+  the reader task, a `Mutex<TrackList>` likewise, a one-shot
+  `shutdown_tx` for the writer task, the `socket_path` (cleaned up in
+  `Drop for MpvInner`), and an `AtomicU64 next_id` for `request_id`
+  generation. `start()` spawns writer + reader tasks, then issues six
+  `observe_property` calls so subsequent property changes arrive as
+  events. The reader task parses frames, dispatches responses to a
+  `PendingReplies` map, and translates property-change events into
+  `PlayerEvent`s — `time-pos` updates the snapshot AND rate-limits
+  emission to one `Position` event per `PLAYER_POSITION_INTERVAL_S =
+  5 s` (with an immediate emission on the first tick out of
+  `Loading`); `pause` and `paused-for-cache` flip the state and fan
+  state + immediate position events; `track-list` rebuilds the
+  TrackList and emits `Tracks`; `end-file` with reason `"eof"`
+  flips state to `Ended`, with `"error"` flips to `Error` + emits
+  `PlayerEvent::Error`; `shutdown` synthesises a terminal `Exit`.
+  Socket-connect waits with exponential backoff up to a 5 s deadline.
+  `MpvBuilder::with_binary("/nonexistent")` is a unit-test seam for
+  exercising the spawn-error path without spawning a real mpv.
+- `crates/kino-server/assets/mpv.conf` — PRD §F-015 Linux config
+  verbatim (`profile=high-quality`, `hwdec=auto-safe`, `keep-open=yes`,
+  `cache=yes`, `demuxer-max-bytes=200M`, `demuxer-readahead-secs=20`,
+  `audio-spdif=…`, `sub-auto=fuzzy`, `sub-ass=yes`). Driver-side
+  flags duplicate the same set so test environments without the
+  asset still get PRD-compliant behaviour.
+
+**Files modified:**
+
+- `Cargo.toml` — `[workspace.members]` adds `crates/kino-player`.
+- `src-tauri/Cargo.toml` — pulls `kino-player = { path = … }` for
+  F-015 commands.
+- `src-tauri/src/lib.rs` — imports `commands::{PlayerRuntime,
+  TorrentRuntime}` and `std::sync::Arc`; the `setup()` callback now
+  `app.manage(Arc::new(PlayerRuntime::default()))` so the platform
+  driver boots lazily on the first `player_open`. `invoke_handler`
+  registers all seven F-015 commands. `#[allow(clippy::too_many_lines)]`
+  on `run()` covers the long but linear setup block (commands +
+  managed state).
+- `src-tauri/src/commands.rs` — F-015 command block (~370 LOC):
+  - `PlayerRuntime { active: AsyncMutex<Option<ActivePlayer>> }`
+    — managed Tauri state holding the active session.
+  - `ActivePlayer { handle: Arc<dyn PlayerHandle>, bridge:
+    JoinHandle<()> }` — closing aborts the bridge; replacing
+    swaps the entry atomically.
+  - `CwContextWire { title_id, kind, season, episode, meta_json,
+    episodes }` deserialized from the frontend's open request, so
+    every position tick AND the terminal Exit event can flow into
+    `cw_record_position_inner` without an extra round-trip. Empty
+    `episodes` is the movie case.
+  - `PlayerOpenRequest { token, url, resume_position_s, file_name?,
+    duration_hint_s?, cw_context? }`.
+  - Commands: `player_open` / `player_close` / `player_pause` /
+    `player_seek` / `player_set_audio_track` /
+    `player_set_subtitle_track` / `player_status`. Open replaces
+    any active session before booting the new driver, matching
+    PRD §F-015's "open replaces existing" semantics.
+  - `spawn_platform_player()` is cfg-gated: `target_os = "linux"`
+    boots `MpvPlayer::spawn()`; everything else returns
+    `PlayerError::Spawn(io::ErrorKind::Unsupported)` so the
+    surface is clean for the Session-021 Android Tauri-plugin
+    work to drop in its own backend.
+  - `player_bridge_task(app, db, monitors, rx, playback_token,
+    cw_context)` is the per-session bridge. Receives `PlayerEvent`s
+    from the broadcast channel, dispatches each to
+    `handle_player_event(...)`, breaks the loop on a terminal
+    event. `Lagged(n)` is logged via `tracing::warn!` and the loop
+    continues (no events lost beyond the unavoidable broadcast-
+    channel slide).
+  - `handle_player_event(...)` is the fan-out:
+    * `Position { … }`: emit `player:position`, call
+      `entry.monitor.update_position(position_s.max(0))` on the
+      F-014 buffer monitor entry keyed by the playback token, and
+      write a CW row via `cw_record_position_inner` when a
+      `CwContextWire` is attached.
+    * `State { … }`: emit `player:state`.
+    * `Tracks { … }`: emit `player:tracks`.
+    * `Exit { position_s, duration_s, reached_eof }`: write the
+      final CW row first (with `position_s = duration_s` when
+      `reached_eof` so the F-012 24 h auto-removal sweep catches
+      it) THEN emit `player:exit` so listeners that respond to
+      the event find CW already up to date.
+    * `Error { message }`: emit `player:error`.
+- `frontend/src/lib/tauri.ts` — F-015 typed bindings (~220 LOC):
+  `PlayerState` / `PlayerSnapshot` / `AudioTrack` / `SubtitleTrack` /
+  `PlayerTrackList` / `PlayerStatusResponse` / `PlayerCwContext` /
+  `PlayerOpenRequest` types; `playerOpen` / `playerClose` /
+  `playerPause` / `playerSeek` / `playerSetAudioTrack` /
+  `playerSetSubtitleTrack` / `playerStatus` invokers; discriminated
+  `PlayerEvent` union with `onPlayer{Position,State,Tracks,Exit,Error}`
+  listeners using the same lazy `@tauri-apps/api/event` import +
+  jsdom no-op fallback pattern the F-014 `onBufferStatus` helper
+  established (so consumer code can `await` unconditionally without
+  the Tauri bridge being present).
+
+**Tests added:** 26 new unit tests in `kino-player`:
+
+- `ipc::tests` (13): command line framing + newline; success response;
+  unavailable-property response; property-change event (with /
+  without data); shutdown event; end-file event with reason + error;
+  end-file with bare reason; unknown event falls into `Other`;
+  non-object frame rejection; malformed-JSON rejection; missing both
+  `request_id` and `event` rejection; `truncate` helper.
+- `state::tests` (2): `has_media()` covers the active states only;
+  `PlayerSnapshot::idle()` defaults.
+- `event::tests` (4): position serializes with `kind = "position"` +
+  camelCase fields; state event uses lowercase `state` string; exit
+  event JSON round-trips; `is_terminal()` predicate.
+- `tracks::tests` (3): mpv `track-list` payload → audio + subtitle
+  parse; empty / non-array payloads; unknown track types ignored.
+- `mpv::tests` (3): socket path is per-uuid and lives under
+  `std::env::temp_dir()`; `mpv_binary()` defaults to bare `"mpv"`
+  resolved via `$PATH` when env is unset; spawn with a nonexistent
+  binary yields `PlayerError::Spawn`. (Driving the full async
+  command-response cycle would require either a real mpv binary or
+  a fake-mpv UNIX-socket harness; the `parse_frame` unit tests
+  cover the wire-format surface, and the spawn-error test covers
+  the spawn-failure surface. A full integration test ships with the
+  Session-021 Android frontend wiring when there's a Player.tsx
+  route to exercise end-to-end.)
+
+All workspace tests pass: `cargo test --workspace` →
+**457 tests, 0 failed**. Frontend tests: 186 / 186.
+`cargo fmt --check` clean. `cargo clippy --workspace --all-targets
+-- -D warnings` clean.
+
+**PRD-locked content honored / referenced:**
+
+- PRD §8 `PLAYER_POSITION_INTERVAL_S = 5 s` — driver rate-limits
+  position emission to this cadence.
+- PRD §F-015 Linux mpv config — both the asset file and the
+  command-line driver default match the locked set.
+- PRD §F-015 Android `PlayerActivity` — scaffolding deferred to
+  Session 021 (see ADR-108).
+- PRD §F-012 — bridge writes CW on every position tick AND on Exit
+  via `cw_record_position_inner`; the inclusive `progress() >=
+  CW_COMPLETION_THRESHOLD` rule (ADR-097) catches the EOF case
+  because the bridge promotes `position_s = duration_s` when
+  `reached_eof`.
+- PRD §F-014 — bridge feeds `BufferMonitor::update_position` on
+  every position tick (the "recomputed on events" path).
+
+**Cross-session conventions established:**
+
+- Player drivers are crate-gated by `#[cfg(target_os = "...")]`
+  inside `kino-player`. The `PlayerHandle` trait + the wire types
+  (`OpenRequest`, `PlayerEvent`, `PlayerSnapshot`, `TrackList`) live
+  unconditionally; only the actual driver structs are gated.
+  Future Android / Tauri-plugin work registers its driver under
+  `#[cfg(target_os = "android")]` and adds the gated branch to
+  `spawn_platform_player()` in `src-tauri/src/commands.rs`.
+- Tauri events emitted by F-015 use the `player:*` namespace, plain
+  lower-case channel names (matching the F-014 `buffer:status`
+  convention). The payload is the same `PlayerEvent` JSON object
+  every channel carries — discriminated by the `kind` field — so
+  the frontend can either `onPlayer{Channel}` for type-narrowed
+  listeners or implement its own multiplexer if a route needs all
+  five.
+- The `kino-player` driver does NOT depend on `kino-core` to avoid
+  a workspace cycle (the Tauri host depends on both; `kino-core`
+  is the leaf). PRD-locked constants the driver needs are
+  duplicated as `const PLAYER_POSITION_INTERVAL_S` with an inline
+  comment pointing at `kino-core::constants`. The cross-constant
+  invariants in `kino-core::constants` (the `const _: () = assert!`
+  block) catch any future drift.
+
+**Out of scope for Session 020 (filed as follow-ups, see Known Issues):**
+
+- Android `PlayerActivity` + `android/player-plugin/` Tauri plugin.
+  PRD §3 workspace layout reserves the directory; the Kotlin
+  scaffold + Tauri-plugin shape land in Session 021.
+- Frontend `Player.tsx` route with overlay controls (play/pause
+  button, seek bar, audio/sub track pickers, info panel). The
+  typed bindings and event listeners exist; assembling the SolidJS
+  overlay is the Session-021 frontend pass.
+- Subtitle test fixtures (PRD §F-015 SRT + SSA/ASS code acceptance).
+  Once `Player.tsx` lands the end-to-end test set can drive a
+  shipped fixture through the player and assert subtitle rendering
+  via the player's `track-list` event.
+- In-Tauri-window GL surface for mpv (PRD §F-015 / ADR-011 "libmpv
+  on Linux in-window"). The subprocess driver lets mpv open its own
+  window — see ADR-108 for the deviation rationale + the migration
+  path to either an in-process libmpv-rs driver or X11 `--wid` /
+  Wayland subsurface embedding.
 
 ### Session 019 — F-014 adaptive buffer
 
@@ -5004,7 +5258,39 @@ implementation" split.
       Piece-priority window assignment to librqbit deferred per
       ADR-106 (8.1.1 keeps the API `pub(crate)`); v1 relies on
       stream-mode prioritisation.)_
-- [ ] F-015: Native player integration
+- [ ] F-015: Native player integration _(Session 020: new
+      `kino-player` crate with the platform-uniform `PlayerHandle`
+      async trait, `OpenRequest` / `PlayerSnapshot` / `PlayerEvent`
+      wire types, and a complete Linux `MpvPlayer` driver — spawns
+      `mpv --input-ipc-server` as a subprocess, parses the
+      newline-delimited JSON-IPC protocol with a unit-tested
+      `parse_frame`, observes `time-pos` / `duration` / `pause` /
+      `paused-for-cache` / `eof-reached` / `track-list`, maps to the
+      6-state `PlayerState` machine (`idle` / `loading` / `playing` /
+      `paused` / `buffering` / `ended` / `error`) and rate-limits
+      `time-pos` updates to the PRD §8 `PLAYER_POSITION_INTERVAL_S =
+      5 s` cadence with immediate ticks on seek / pause / resume.
+      `kino-server/assets/mpv.conf` ships the PRD §F-015 Linux config
+      verbatim. `src-tauri/src/commands.rs` adds the F-015 command
+      block: `player_open` / `player_close` / `player_pause` /
+      `player_seek` / `player_set_audio_track` /
+      `player_set_subtitle_track` / `player_status`, plus a per-
+      session `player_bridge_task` that fans every `PlayerEvent` to
+      (a) Tauri events `player:position` / `player:state` /
+      `player:tracks` / `player:exit` / `player:error`, (b) the F-012
+      `cw_record_position_inner` writer (every position tick AND the
+      terminal Exit event, with EOF promoting position to duration so
+      the 24h auto-removal sweep picks the row up), (c) the F-014
+      `BufferMonitor::update_position` so the buffer state machine
+      recomputes on the player's clock (PRD §F-014 "recomputed on
+      events"). Typed frontend bindings in `frontend/src/lib/tauri.ts`
+      cover every command and event with discriminated `PlayerEvent`
+      union + `onPlayer{Position,State,Tracks,Exit,Error}` listeners.
+      26 unit tests across IPC framing, track-list parsing, state
+      machine, event serialization. Android Tauri-plugin
+      `PlayerActivity` and the frontend Player.tsx overlay route are
+      Session-021+ follow-ups; see ADR-108 + the F-015 follow-ups
+      block.)_
 
 ### Release
 - [ ] F-018: Build, packaging, distribution
@@ -5098,6 +5384,7 @@ Additional ADRs filed by sessions:
 | ADR-105 | F-013 Range parser supports single-range only. `Range: bytes=0-99,200-299` (RFC 7233 §2.1 multi-range) returns 416 rather than degrading to the first range. ExoPlayer + libmpv only ever issue single ranges per request, so implementing `multipart/byteranges` adds code with no benefit AND silently degrading would mislead clients that DO send multipart. | 018 |
 | ADR-106 | F-014 ships without librqbit-level piece-priority window assignment. librqbit 8.1.1 keeps `update_only_files`, `file_priorities`, and the chunk-tracker piece-priority knobs in `pub(crate) mod`s (verified by grep across the 8.1.1 source tree); the values can't be named or set from outside the librqbit crate. v1 ships the F-014 state machine, monitor task, buffer:status event surface, and UI overlay — the operationally observable parts of the spec — and relies on librqbit's natural streaming-mode prioritisation (opening `ManagedTorrent::stream` at the active byte offset biases the piece request order around the playhead). Fork or upstream-PR is the long-term path; §6B-6 covers practical fallout. Tracked as a Known Issue. | 019 |
 | ADR-107 | `librqbit::Speed::mbps` is mebibytes-per-second, not megabits-per-second. `SpeedEstimator::mbps()` returns `bps() / 1024 / 1024` and the `Display` impl prints `"{mbps:.2} MiB/s"`. `kino_torrent::stats::EngineStats` converts to bytes-per-second via the local `MIB_TO_B = 1024 × 1024` constant so the F-014 monitor's `dl_rate_bytes_per_s` carries correct dimensional units. Documentation ADR; the code is already correct. | 019 |
+| ADR-108 | F-015 Linux ships as an mpv subprocess driver (`mpv --input-ipc-server=<socket>`) rather than the `libmpv-rs` in-process binding the PRD §F-015 / ADR-011 wording suggests. Two reasons: (a) `libmpv-rs` would link against `libmpv` at build time and require `libmpv2-dev` in the CI image — a `cargo test` cost we want to defer until the driver actually needs libmpv-only features. (b) PRD §F-015's "rendered into a GL surface owned by the Tauri window" is the architecturally hard half of ADR-011: Tauri 2 doesn't expose a GL surface inside the webview's window, so the in-process path needs either an X11 `--wid` parent-window hand-off (Wayland-incompatible by default) or a Wayland subsurface protocol negotiation (deep webkit-gtk integration work). The subprocess form delivers every operational guarantee the PRD demands — position events on the 5 s cadence, seek + pause + audio / sub track selection, deterministic exit-with-final-position — and lets mpv open its OWN window for the actual playback surface. The `PlayerHandle` trait + `PlayerEvent` wire types are designed so the in-process driver drops in as a peer (`#[cfg(feature = "libmpv-inprocess")]`) without `kino-app` touching its command call sites. The §6B-1 / §6B-4 / §6B-5 human-verification path (Linux AppImage + Shield DV/Atmos) covers the practical-fallout question. | 020 |
 
 ---
 
@@ -5166,6 +5453,36 @@ Additional ADRs filed by sessions:
   engine in `kino-torrent::Engine`. §6B-6 ("adaptive buffer engages
   correctly on real slow torrent") is the human verification that
   catches practical fallout.
+- **F-015 follow-ups: Android Tauri plugin + Linux frontend overlay
+  route (Session 020, ADR-108).** Session 020 shipped the F-015
+  cross-platform backend (Linux mpv subprocess driver + Tauri command
+  surface + event bridge + frontend type bindings). What remains to
+  satisfy PRD §F-015's six code-acceptance bullets:
+  - **Android `PlayerActivity` Tauri plugin** under
+    `android/player-plugin/` (PRD §3 workspace layout reserves it).
+    Kotlin `PlayerActivity` owning `ExoPlayer` per ADR-010, with
+    `MediaCodecSelector.DEFAULT` for hardware-decoder selection, DV
+    profile 5/8.1 detection, HDR10/HDR10+ passthrough, audio
+    passthrough for the locked codec list, subtitle parsers (tier 1
+    SRT / WebVTT / SSA-ASS basic dialogue), tunneling on Android TV.
+    A small Tauri plugin (Rust + Kotlin bindings) registers itself
+    as the platform `PlayerHandle` implementation under
+    `#[cfg(target_os = "android")]` in
+    `src-tauri/src/commands.rs::spawn_platform_player()`.
+  - **`frontend/src/routes/Player.tsx` overlay route**: SolidJS
+    overlay with play/pause + seek bar + audio/subtitle track
+    pickers + info panel. Subscribes to the `onPlayer*` event
+    helpers shipped this session. Routes from F-010 Play / Resume
+    buttons (ADR-083 stub currently writes a CW row only) into
+    `playerOpen(...)` with a `cwContext` payload so the F-012 CW
+    writer fires off the position-tick bridge.
+  - **In-window GL surface (Linux libmpv-rs)** — the PRD §F-015
+    architectural target per ADR-011. ADR-108 ships the subprocess
+    form for v1; the in-process replacement is a peer driver behind
+    a Cargo feature flag.
+  - **Subtitle test fixtures** (PRD §F-015 SRT + SSA/ASS rendering
+    bullets) — small-file fixtures + integration tests once
+    Player.tsx exists to drive them end-to-end.
 
 ---
 
