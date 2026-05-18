@@ -14,11 +14,26 @@ name: release
 #   kino-${version}-android-x86_64.apk
 #   kino-${version}-sbom-cyclonedx.json
 #   kino-${version}-sbom-syft.spdx.json
+#
+# The `workflow_dispatch` trigger is additive on top of the PRD-locked
+# `on: push: tags: v*` trigger. It exists so the release pipeline can
+# be fired from the Actions UI when a tag push isn't viable (e.g. the
+# session 024 follow-up: tag refs rejected by the local Git proxy
+# with HTTP 403 `ERR Unable to parse branch information from push
+# data`). The `version` input is used in place of `github.ref_name`
+# stripping; `gh release create` then creates the tag from this run's
+# commit (`github.sha`) as part of the release.
 
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version without the leading v (e.g. 1.0.0-alpha.1). The workflow creates tag v<version> on the run's commit."
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -30,23 +45,52 @@ permissions:
 jobs:
   # PRD §F-018: tag format `v*`; pre-releases match `v*-alpha.*`,
   # `v*-beta.*`, `v*-rc.*` and are marked as such in the GitHub Release.
+  #
+  # On `push: tags: v*` the version is derived from `github.ref_name`
+  # (the tag) with the leading `v` stripped. On `workflow_dispatch` the
+  # version comes from the `version` input; the tag name is constructed
+  # as `v${version}` and created at release time by `gh release create`.
   version:
     name: extract version
     runs-on: ubuntu-24.04
     outputs:
+      tag: ${{ steps.extract.outputs.tag }}
       version: ${{ steps.extract.outputs.version }}
       prerelease: ${{ steps.extract.outputs.prerelease }}
     steps:
       - id: extract
         env:
-          TAG: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          if [[ ! "${TAG}" =~ ^v ]]; then
-            echo "Tag ${TAG} must start with 'v'" >&2
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            # Strip a leading `v` if the user supplied one despite the input
+            # description ("without the leading v"); the rest of the
+            # pipeline keys off the un-prefixed version.
+            VERSION="${INPUT_VERSION#v}"
+            TAG="v${VERSION}"
+          else
+            TAG="${REF_NAME}"
+            if [[ ! "${TAG}" =~ ^v ]]; then
+              echo "Tag ${TAG} must start with 'v'" >&2
+              exit 1
+            fi
+            VERSION="${TAG#v}"
+          fi
+          # Sanity-check the version shape. The PRD locks tag names to
+          # `v*` only, but accepting arbitrary post-`v` content would let
+          # a typo silently corrupt every artifact filename. Allowed:
+          #   1.2.3
+          #   1.2.3-alpha.4
+          #   1.2.3-beta.4
+          #   1.2.3-rc.4
+          if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$ ]]; then
+            echo "Version '${VERSION}' must match X.Y.Z or X.Y.Z-(alpha|beta|rc).N" >&2
             exit 1
           fi
-          VERSION="${TAG#v}"
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           if [[ "${VERSION}" =~ -(alpha|beta|rc)(\.|$) ]]; then
             PRE="true"
@@ -54,7 +98,7 @@ jobs:
             PRE="false"
           fi
           echo "prerelease=${PRE}" >> "${GITHUB_OUTPUT}"
-          echo "Resolved: version=${VERSION} prerelease=${PRE}"
+          echo "Resolved: tag=${TAG} version=${VERSION} prerelease=${PRE} event=${EVENT_NAME}"
 
   build-linux-x86_64:
     name: build-linux-x86_64
@@ -475,8 +519,10 @@ jobs:
       - name: Create or update GitHub Release (idempotent)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ needs.version.outputs.tag }}
           PRERELEASE: ${{ needs.version.outputs.prerelease }}
+          EVENT_NAME: ${{ github.event_name }}
+          TARGET_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           # PRD §F-018: "Re-running release for the same tag: idempotent
@@ -492,6 +538,14 @@ jobs:
             args=("${TAG}" --title "${TAG}" --generate-notes)
             if [[ "${PRERELEASE}" == "true" ]]; then
               args+=(--prerelease)
+            fi
+            # On `workflow_dispatch` the tag does not exist yet — point
+            # gh at the run's commit so the tag is created there. On
+            # `push: tags: v*` the tag already exists at the push target;
+            # gh ignores `--target` in that case but we omit it to keep
+            # the command shape PRD-aligned.
+            if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+              args+=(--target "${TARGET_SHA}")
             fi
             gh release create "${args[@]}" release/*
           fi
