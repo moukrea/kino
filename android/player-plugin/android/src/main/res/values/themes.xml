@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  PRD §F-015 Android: PlayerActivity theme. Fullscreen, no title bar,
+  black background so letterboxing matches the cinematic feel of the
+  10-foot UI. The `windowLayoutInDisplayCutoutMode = shortEdges`
+  attribute makes the player fill notched displays.
+-->
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <style name="Theme.KinoPlayer" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowBackground">@android:color/black</item>
+        <item name="android:colorBackground">@android:color/black</item>
+        <item name="android:statusBarColor">@android:color/black</item>
+        <item name="android:navigationBarColor">@android:color/black</item>
+        <item name="android:windowLightStatusBar" tools:ignore="NewApi">false</item>
+        <item name="android:windowLayoutInDisplayCutoutMode" tools:ignore="NewApi">shortEdges</item>
+    </style>
+</resources>

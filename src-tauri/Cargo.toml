@@ -45,9 +45,10 @@ kino-addons = { path = "../crates/kino-addons" }
 kino-torrent = { path = "../crates/kino-torrent" }
 kino-server = { path = "../crates/kino-server" }
 # F-015: native player driver (Linux mpv subprocess). The Android side of
-# F-015 lives in `android/player-plugin/` and is wired through a Tauri
-# plugin, not this crate.
+# F-015 lives in `android/player-plugin/` and is wired through a Tauri 2
+# mobile plugin (`tauri-plugin-kino-player`) registered in `lib.rs`.
 kino-player = { path = "../crates/kino-player" }
+tauri-plugin-kino-player = { path = "../android/player-plugin" }
 bytes = { workspace = true }
 uuid = { workspace = true }
 base64 = "0.22"

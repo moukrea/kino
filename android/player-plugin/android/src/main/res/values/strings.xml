@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  PRD §F-015 Android: minimal string set for the PlayerActivity. The
+  user-facing UI label is the only one externally visible; the rest are
+  developer-facing log + content-description strings.
+
+  Internationalized strings for the player overlay UI live on the
+  SolidJS side (PRD §F-016 §3 language settings). PlayerActivity's
+  native Kotlin Views show a small number of icons + the title; the
+  title is supplied per-session via the OpenArgs `fileName` field, so
+  static resource strings are intentionally sparse.
+-->
+<resources>
+    <string name="kino_player_activity_label">kino player</string>
+    <string name="kino_player_loading">Loading…</string>
+    <string name="kino_player_error_generic">Playback error</string>
+    <string name="kino_player_play_content_description">Play</string>
+    <string name="kino_player_pause_content_description">Pause</string>
+    <string name="kino_player_audio_track_content_description">Audio track</string>
+    <string name="kino_player_subtitle_track_content_description">Subtitle track</string>
+    <string name="kino_player_seek_bar_content_description">Seek bar</string>
+    <string name="kino_player_subtitles_off">Off</string>
+</resources>

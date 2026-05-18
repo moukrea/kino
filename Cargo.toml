@@ -8,6 +8,7 @@ members = [
     "crates/kino-metadata",
     "crates/kino-player",
     "src-tauri",
+    "android/player-plugin",
 ]
 
 [workspace.package]

@@ -1,0 +1,157 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  PRD §F-015 Android controller layout.
+
+  Overrides Media3 PlayerView's default `exo_player_control_view`
+  layout with a kino-themed variant: large hit-targets for 10-foot UI,
+  play/pause + seek bar in the bottom band, audio / subtitle / info
+  buttons in the top band. Required Media3 child IDs:
+   - `@id/exo_play_pause`   (play / pause button)
+   - `@id/exo_progress`     (seek bar)
+   - `@id/exo_position`     (current position label)
+   - `@id/exo_duration`     (total duration label)
+
+  Additional buttons NOT inherited from Media3:
+   - `@id/kino_audio_track_btn`
+   - `@id/kino_subtitle_track_btn`
+   - `@id/kino_info_btn`
+   - `@id/kino_back_btn`
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@null"
+    android:layoutDirection="ltr"
+    tools:viewBindingIgnore="true">
+
+    <!-- Top band: back / info / audio / subtitle -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top"
+        android:orientation="horizontal"
+        android:padding="16dp"
+        android:background="#80000000">
+
+        <ImageButton
+            android:id="@+id/kino_back_btn"
+            android:layout_width="56dp"
+            android:layout_height="56dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/kino_player_activity_label"
+            android:focusable="true"
+            android:src="@android:drawable/ic_menu_revert"
+            android:tint="@android:color/white" />
+
+        <TextView
+            android:id="@+id/kino_title_text"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_gravity="center_vertical"
+            android:paddingStart="16dp"
+            android:paddingEnd="16dp"
+            android:singleLine="true"
+            android:ellipsize="end"
+            android:textColor="@android:color/white"
+            android:textSize="18sp"
+            tools:text="The Matrix (1999)" />
+
+        <ImageButton
+            android:id="@+id/kino_info_btn"
+            android:layout_width="56dp"
+            android:layout_height="56dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/kino_player_activity_label"
+            android:focusable="true"
+            android:src="@android:drawable/ic_dialog_info"
+            android:tint="@android:color/white" />
+
+        <ImageButton
+            android:id="@+id/kino_audio_track_btn"
+            android:layout_width="56dp"
+            android:layout_height="56dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/kino_player_audio_track_content_description"
+            android:focusable="true"
+            android:src="@android:drawable/ic_lock_silent_mode_off"
+            android:tint="@android:color/white" />
+
+        <ImageButton
+            android:id="@+id/kino_subtitle_track_btn"
+            android:layout_width="56dp"
+            android:layout_height="56dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/kino_player_subtitle_track_content_description"
+            android:focusable="true"
+            android:src="@android:drawable/ic_menu_more"
+            android:tint="@android:color/white" />
+    </LinearLayout>
+
+    <!-- Bottom band: play/pause + seek bar -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:padding="16dp"
+        android:background="#80000000">
+
+        <ImageButton
+            android:id="@id/exo_play_pause"
+            android:layout_width="64dp"
+            android:layout_height="64dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/kino_player_play_content_description"
+            android:focusable="true" />
+
+        <TextView
+            android:id="@id/exo_position"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:paddingStart="16dp"
+            android:paddingEnd="8dp"
+            android:textColor="@android:color/white"
+            tools:text="00:01:23" />
+
+        <androidx.media3.ui.DefaultTimeBar
+            android:id="@id/exo_progress"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:focusable="true"
+            android:contentDescription="@string/kino_player_seek_bar_content_description" />
+
+        <TextView
+            android:id="@id/exo_duration"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:paddingStart="8dp"
+            android:paddingEnd="16dp"
+            android:textColor="@android:color/white"
+            tools:text="01:36:00" />
+    </LinearLayout>
+
+    <!-- Info panel overlay (toggled by kino_info_btn). -->
+    <ScrollView
+        android:id="@+id/kino_info_panel"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:padding="32dp"
+        android:background="#CC000000"
+        android:visibility="gone"
+        tools:visibility="visible">
+
+        <TextView
+            android:id="@+id/kino_info_text"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textColor="@android:color/white"
+            android:textSize="14sp"
+            android:fontFamily="monospace"
+            tools:text="Resolution: 3840x2160\nVideo: HEVC (Main10)\nHDR: Dolby Vision Profile 5\nAudio: TrueHD 7.1 (passthrough)\nDecoder: c2.qti.hevc.decoder" />
+    </ScrollView>
+
+</FrameLayout>
