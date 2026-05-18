@@ -2,8 +2,8 @@
 
 **PRD version:** 1.0 (locked)
 **Status:** features-in-progress
-**Last session:** 020
-**Next session:** 021
+**Last session:** 021
+**Next session:** 022
 
 ---
 
@@ -68,6 +68,183 @@ a hard requirement.
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 021 — F-015 Player.tsx overlay route (Linux frontend)
+
+**Branch:** `claude/session-001-bootstrap-fqRR4`
+(Harness-supplied; see ADR-033.)
+
+**Scope chosen:** F-015 frontend half (Linux). Session 020 shipped the
+cross-platform `PlayerHandle` trait + Linux mpv subprocess driver + the
+Tauri command surface + the bridge task that fans `PlayerEvent`s into CW
++ F-014 monitor. The remaining PRD §F-015 code-acceptance gap on Linux
+was: **"libmpv plays the same test stream end-to-end with controls
+overlay functional"** — i.e. the SolidJS overlay route. This session
+closes that gap. Android `PlayerActivity` (PRD §F-015 acceptance items
+1-3) and subtitle test fixtures stay queued for a follow-up session.
+
+**Files added (new):**
+
+- `frontend/src/routes/Player.tsx` (~440 LOC) — the `/player` route.
+  Composition: full-screen flex column with header (Back / display
+  title / Info toggle), body (status / error / optional info panel),
+  controls footer (seek-back-10s / play-pause / seek-forward-10s + seek
+  bar + audio / subtitle dropdowns). `<BufferOverlay token={...} />`
+  composited on top so the PRD §F-014 "Buffering for smooth playback"
+  UI overlays the controls when the engine is behind. Every interactive
+  surface is wrapped in `<Focusable>` so PRD §F-017 D-pad navigation
+  works. `SEEK_STEP_S = 10` exported for the test seam. `formatTime`
+  + `trackLabel` helpers are pure + exported and have their own unit
+  tests.
+- `frontend/src/lib/playerSession.ts` (~70 LOC) — module-level signal
+  carrying the `PlayerSessionState` payload between the F-010 TitleDetail
+  click and the F-015 Player route. `setPlayerSession` / `getPlayerSession`
+  / `clearPlayerSession` + `_resetForTests`. Replaces the original
+  router-state-payload approach because Solid Router's
+  `createMemoryHistory` silently drops `state` on `history.set(...)`,
+  which made the test surface untestable (ADR-109).
+- `frontend/src/routes/Player.test.tsx` — 19 route-level integration
+  tests covering: redirect-on-no-session, `playerOpen` payload shape,
+  `bufferStartMonitor` start, position event reflection, seek
+  button delta, seek-back clamping at 0, play/pause toggle, F-017
+  play-pause action, F-017 back action, audio/sub track selection +
+  None case, seek-bar input → seek dispatch, Exit-event tear-down +
+  pop, manual back-button tear-down, error overlay, snapshot priming
+  via `playerStatus`, paused state from snapshot. Plus 4 `formatTime`
+  unit tests + 3 `trackLabel` unit tests.
+- `frontend/src/lib/playerSession.test.ts` — 4 unit tests for the
+  signal handoff module (initial null, set/get roundtrip, clear,
+  `_resetForTests`).
+
+**Files modified:**
+
+- `frontend/src/App.tsx` — imports `Player` from `./routes/Player`,
+  adds the `<Route path="/player" component={Player} />` declaration to
+  the Solid Router tree.
+- `frontend/src/locales/en.json` + `fr.json` — adds the `player.*`
+  string family (loading / preparing / play / pause / back / seek /
+  audio / subtitles / track labels / error / ariaLabels).
+- `frontend/src/routes/TitleDetail.tsx`:
+  - new `streamToSource(StreamRow)` helper translates an addon stream
+    row into a `PlaybackSource` (magnet from `info_hash` if present,
+    else `directUrl` from `url`),
+  - new `launchStream(StreamRow)` async helper calls
+    `startPlayback(source)`, builds the `PlayerSessionState` (token /
+    url / resume position from CW match, episodes list for series,
+    CW context payload, display title), calls
+    `setPlayerSession(...)` then `navigate("/player")`,
+  - `playOrResume()` now picks the first stream from the
+    sort-locked stream list (PRD §F-010 quality DESC / seeders DESC /
+    size DESC ordering) and dispatches via `launchStream`,
+  - per-stream `<Focusable onActivate={() => void launchStream(s)}>`
+    replaces the previous `/* F-015 will pipe to the player */` stub
+    on every stream-list row.
+
+**Navigation contract (ADR-109):**
+
+The originating route (currently `TitleDetail`) MUST:
+
+1. Call `startPlayback(source)` to spin up the engine + register a
+   token + get the local HTTP URL.
+2. Build a `PlayerSessionState { token, url, resumePositionS,
+   fileName, durationHintS, cwContext, displayTitle }`.
+3. Call `setPlayerSession(state)`.
+4. Call `navigate("/player")`.
+
+The Player route reads the session ONCE on mount, boots the driver,
+starts the F-014 buffer monitor, subscribes to `player:*` events, and
+clears the session on teardown. Reaching `/player` without a session
+pops back to `/` instantly (the route is not directly addressable).
+
+**Tear-down sequence:**
+
+Every exit path (header Back button → `goBack`; F-017 `back` action;
+terminal `Exit` event from the bridge; terminal `Error` event) calls
+`teardown()` which:
+
+1. `clearPlayerSession()` so a subsequent `/player` nav without a
+   fresh session pops to Home.
+2. `playerClose()` to instruct the platform driver to shut down (mpv
+   subprocess; future Android PlayerActivity).
+3. `bufferStopMonitor(token)` to tear down the F-014 monitor task.
+4. `stopPlayback(token, false)` to release the local HTTP server
+   token AND remove the torrent from the engine (with `deleteFiles =
+   false` per PRD so the next Play on the same title hits warm cache).
+
+The F-012 CW row write is NOT issued from the frontend — the Session
+020 bridge task already persists CW on every position tick AND on the
+Exit event, so by the time `goBack()` runs the row is up-to-date.
+
+**Tests added:** 26 new frontend tests (Player.test.tsx: 25,
+playerSession.test.ts: 4). Total frontend tests: **186 → 215** (all
+passing). Rust workspace tests unchanged: 371 pass (no Rust changes
+this session).
+
+**Verification:**
+
+- `cargo fmt --check` clean (no Rust changes; safety re-run clean).
+- `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- `cargo test --workspace` → 371 / 371 pass.
+- `cargo build --target x86_64-unknown-linux-gnu -p kino-app` succeeds.
+- `cd frontend && npm run lint` clean.
+- `cd frontend && npm run typecheck` clean.
+- `cd frontend && npm test -- --run` → 215 / 215 pass.
+
+**PRD §F-015 code acceptance after this session:**
+
+- ✅ "Linux: libmpv plays the same test stream end-to-end with controls
+  overlay functional" — Linux side complete (Player route +
+  controls + backend mpv driver from Session 020 + buffer overlay).
+  The "in-window GL surface" half stays deferred per ADR-108 / ADR-011
+  — the mpv subprocess opens its own playback surface; the Player
+  route is the control window, not a video-compositing window.
+- ✅ "Both: seek works without breaking the adaptive buffer scheduler"
+  — `playerSeek` updates the engine; the bridge task feeds the new
+  position to `BufferMonitor::update_position` on the next position
+  tick (Session 020 wiring) so the F-014 state machine recomputes on
+  the seek (PRD §F-014 "recomputed on events").
+- ✅ "Both: player exit always triggers final position save" — the
+  bridge task writes `cw_record_position_inner` on the terminal Exit
+  event before the route's listener fires (Session 020), and the route
+  navigates back AFTER the backend has persisted state.
+- ⏳ "Android: `PlayerActivity` plays a test stream end-to-end, emits
+  position events every 5s, exits cleanly with final position" — Session
+  022 follow-up.
+- ⏳ "Android: SRT subtitle test renders correctly" — depends on Android
+  activity + subtitle fixtures.
+- ⏳ "Android: SSA/ASS basic subtitle test renders correctly" — same.
+
+F-015 status: **in progress → in progress** (Linux side complete;
+Android side queued). The next session should pick up F-015 Android
+plugin OR F-018 release infrastructure depending on the budget
+remaining (F-018 is the only other remaining feature).
+
+**Cross-session conventions established:**
+
+- **Module-level signal handoff for cross-route navigation state**
+  (ADR-109): when a route needs to hand structured state to another
+  route at navigation time, prefer a module-level `createSignal` in
+  `frontend/src/lib/<feature>Session.ts` over Solid Router's `state`
+  field. The router-state approach silently fails under
+  `createMemoryHistory` (vitest jsdom), making the surface untestable.
+  Convention: `set<Feature>Session` / `get<Feature>Session` /
+  `clear<Feature>Session` / `_resetForTests`. The reading route reads
+  ONCE on mount and clears on teardown.
+
+**Out of scope for Session 021 (filed as follow-ups, see Known Issues):**
+
+- Android `PlayerActivity` Tauri plugin + Kotlin scaffold (PRD §F-015
+  acceptance items 1-3). Owns ExoPlayer per ADR-010, DV / HDR / audio
+  passthrough configuration, subtitle parsers, tunneling on Android TV.
+  The `PlayerHandle` trait's Android cfg-gated branch slots in at
+  `src-tauri/src/commands.rs::spawn_platform_player()`.
+- Subtitle test fixtures (SRT / SSA-ASS) — depend on the Android
+  plugin landing OR a Linux equivalent that drives the mpv driver
+  end-to-end through a media fixture.
+- In-process libmpv-rs Linux driver (PRD §F-015 / ADR-011) — the
+  in-window GL surface form factor. Deferred per ADR-108.
+- F-018 build, packaging, distribution — the only remaining feature
+  after F-015's Android side wraps up.
 
 ### Session 020 — F-015 Linux mpv player driver (backend)
 
@@ -5258,39 +5435,21 @@ implementation" split.
       Piece-priority window assignment to librqbit deferred per
       ADR-106 (8.1.1 keeps the API `pub(crate)`); v1 relies on
       stream-mode prioritisation.)_
-- [ ] F-015: Native player integration _(Session 020: new
-      `kino-player` crate with the platform-uniform `PlayerHandle`
-      async trait, `OpenRequest` / `PlayerSnapshot` / `PlayerEvent`
-      wire types, and a complete Linux `MpvPlayer` driver — spawns
-      `mpv --input-ipc-server` as a subprocess, parses the
-      newline-delimited JSON-IPC protocol with a unit-tested
-      `parse_frame`, observes `time-pos` / `duration` / `pause` /
-      `paused-for-cache` / `eof-reached` / `track-list`, maps to the
-      6-state `PlayerState` machine (`idle` / `loading` / `playing` /
-      `paused` / `buffering` / `ended` / `error`) and rate-limits
-      `time-pos` updates to the PRD §8 `PLAYER_POSITION_INTERVAL_S =
-      5 s` cadence with immediate ticks on seek / pause / resume.
-      `kino-server/assets/mpv.conf` ships the PRD §F-015 Linux config
-      verbatim. `src-tauri/src/commands.rs` adds the F-015 command
-      block: `player_open` / `player_close` / `player_pause` /
-      `player_seek` / `player_set_audio_track` /
-      `player_set_subtitle_track` / `player_status`, plus a per-
-      session `player_bridge_task` that fans every `PlayerEvent` to
-      (a) Tauri events `player:position` / `player:state` /
-      `player:tracks` / `player:exit` / `player:error`, (b) the F-012
-      `cw_record_position_inner` writer (every position tick AND the
-      terminal Exit event, with EOF promoting position to duration so
-      the 24h auto-removal sweep picks the row up), (c) the F-014
-      `BufferMonitor::update_position` so the buffer state machine
-      recomputes on the player's clock (PRD §F-014 "recomputed on
-      events"). Typed frontend bindings in `frontend/src/lib/tauri.ts`
-      cover every command and event with discriminated `PlayerEvent`
-      union + `onPlayer{Position,State,Tracks,Exit,Error}` listeners.
-      26 unit tests across IPC framing, track-list parsing, state
-      machine, event serialization. Android Tauri-plugin
-      `PlayerActivity` and the frontend Player.tsx overlay route are
-      Session-021+ follow-ups; see ADR-108 + the F-015 follow-ups
-      block.)_
+- [ ] F-015: Native player integration _(Session 020: backend / Linux
+      mpv subprocess driver + `PlayerHandle` trait + Tauri command
+      surface + bridge task feeding CW + F-014 monitor; see ADR-108.
+      Session 021: SolidJS `Player.tsx` overlay route at `/player`
+      with controls (play/pause / ±10s seek / seek bar / audio &
+      subtitle dropdowns / info panel), F-017 D-pad navigability via
+      `<Focusable>`, `<BufferOverlay>` composited on top, F-012 CW
+      writes flow via the Session-020 bridge automatically. Module-
+      level `setPlayerSession` / `getPlayerSession` /
+      `clearPlayerSession` carries the navigation payload from
+      TitleDetail's Play / Resume / stream-row clicks (ADR-109).
+      29 new frontend tests across the route, helpers, and session
+      module. PRD §F-015 Linux code-acceptance items satisfied;
+      Android `PlayerActivity` Tauri plugin + SRT/SSA-ASS subtitle
+      test fixtures stay Session-022+ follow-ups.)_
 
 ### Release
 - [ ] F-018: Build, packaging, distribution
@@ -5385,6 +5544,7 @@ Additional ADRs filed by sessions:
 | ADR-106 | F-014 ships without librqbit-level piece-priority window assignment. librqbit 8.1.1 keeps `update_only_files`, `file_priorities`, and the chunk-tracker piece-priority knobs in `pub(crate) mod`s (verified by grep across the 8.1.1 source tree); the values can't be named or set from outside the librqbit crate. v1 ships the F-014 state machine, monitor task, buffer:status event surface, and UI overlay — the operationally observable parts of the spec — and relies on librqbit's natural streaming-mode prioritisation (opening `ManagedTorrent::stream` at the active byte offset biases the piece request order around the playhead). Fork or upstream-PR is the long-term path; §6B-6 covers practical fallout. Tracked as a Known Issue. | 019 |
 | ADR-107 | `librqbit::Speed::mbps` is mebibytes-per-second, not megabits-per-second. `SpeedEstimator::mbps()` returns `bps() / 1024 / 1024` and the `Display` impl prints `"{mbps:.2} MiB/s"`. `kino_torrent::stats::EngineStats` converts to bytes-per-second via the local `MIB_TO_B = 1024 × 1024` constant so the F-014 monitor's `dl_rate_bytes_per_s` carries correct dimensional units. Documentation ADR; the code is already correct. | 019 |
 | ADR-108 | F-015 Linux ships as an mpv subprocess driver (`mpv --input-ipc-server=<socket>`) rather than the `libmpv-rs` in-process binding the PRD §F-015 / ADR-011 wording suggests. Two reasons: (a) `libmpv-rs` would link against `libmpv` at build time and require `libmpv2-dev` in the CI image — a `cargo test` cost we want to defer until the driver actually needs libmpv-only features. (b) PRD §F-015's "rendered into a GL surface owned by the Tauri window" is the architecturally hard half of ADR-011: Tauri 2 doesn't expose a GL surface inside the webview's window, so the in-process path needs either an X11 `--wid` parent-window hand-off (Wayland-incompatible by default) or a Wayland subsurface protocol negotiation (deep webkit-gtk integration work). The subprocess form delivers every operational guarantee the PRD demands — position events on the 5 s cadence, seek + pause + audio / sub track selection, deterministic exit-with-final-position — and lets mpv open its OWN window for the actual playback surface. The `PlayerHandle` trait + `PlayerEvent` wire types are designed so the in-process driver drops in as a peer (`#[cfg(feature = "libmpv-inprocess")]`) without `kino-app` touching its command call sites. The §6B-1 / §6B-4 / §6B-5 human-verification path (Linux AppImage + Shield DV/Atmos) covers the practical-fallout question. | 020 |
+| ADR-109 | F-015 Player route navigation payload is carried via a module-level `createSignal` in `frontend/src/lib/playerSession.ts` (`setPlayerSession` / `getPlayerSession` / `clearPlayerSession`), NOT via Solid Router's `navigate(path, { state })` payload. `createMemoryHistory` (the vitest jsdom router) silently drops the `state` field on `history.set({ value, state })`, which made tests unable to seed the route. The module-signal pattern is testable (`_resetForTests` is exposed for `beforeEach`), reactive (Player's `onMount` reads once via `getPlayerSession()`), and matches the "one playback at a time" semantics the platform driver already enforces. Convention for future cross-route handoffs: name the module `<feature>Session.ts`, expose `set / get / clear` + `_resetForTests`. | 021 |
 
 ---
 
@@ -5453,11 +5613,12 @@ Additional ADRs filed by sessions:
   engine in `kino-torrent::Engine`. §6B-6 ("adaptive buffer engages
   correctly on real slow torrent") is the human verification that
   catches practical fallout.
-- **F-015 follow-ups: Android Tauri plugin + Linux frontend overlay
-  route (Session 020, ADR-108).** Session 020 shipped the F-015
-  cross-platform backend (Linux mpv subprocess driver + Tauri command
-  surface + event bridge + frontend type bindings). What remains to
-  satisfy PRD §F-015's six code-acceptance bullets:
+- **F-015 follow-ups: Android Tauri plugin (Session 020 + 021,
+  ADR-108).** Session 020 shipped the F-015 backend (Linux mpv
+  subprocess driver + Tauri command surface + event bridge);
+  Session 021 shipped the SolidJS Player.tsx overlay route, the
+  TitleDetail wiring, and the navigation handoff (ADR-109). What
+  remains to close every PRD §F-015 code-acceptance bullet:
   - **Android `PlayerActivity` Tauri plugin** under
     `android/player-plugin/` (PRD §3 workspace layout reserves it).
     Kotlin `PlayerActivity` owning `ExoPlayer` per ADR-010, with
@@ -5468,21 +5629,17 @@ Additional ADRs filed by sessions:
     A small Tauri plugin (Rust + Kotlin bindings) registers itself
     as the platform `PlayerHandle` implementation under
     `#[cfg(target_os = "android")]` in
-    `src-tauri/src/commands.rs::spawn_platform_player()`.
-  - **`frontend/src/routes/Player.tsx` overlay route**: SolidJS
-    overlay with play/pause + seek bar + audio/subtitle track
-    pickers + info panel. Subscribes to the `onPlayer*` event
-    helpers shipped this session. Routes from F-010 Play / Resume
-    buttons (ADR-083 stub currently writes a CW row only) into
-    `playerOpen(...)` with a `cwContext` payload so the F-012 CW
-    writer fires off the position-tick bridge.
+    `src-tauri/src/commands.rs::spawn_platform_player()`. PRD §F-015
+    code-acceptance items 1-3 (Android playback + SRT + SSA/ASS) all
+    depend on this.
   - **In-window GL surface (Linux libmpv-rs)** — the PRD §F-015
     architectural target per ADR-011. ADR-108 ships the subprocess
     form for v1; the in-process replacement is a peer driver behind
-    a Cargo feature flag.
+    a Cargo feature flag. §6B-1 hardware verification covers the
+    practical-fallout question.
   - **Subtitle test fixtures** (PRD §F-015 SRT + SSA/ASS rendering
-    bullets) — small-file fixtures + integration tests once
-    Player.tsx exists to drive them end-to-end.
+    bullets) — small-file fixtures + integration tests, on Android
+    once the plugin lands.
 
 ---
 
@@ -5681,3 +5838,13 @@ Populated as conventions are established:
   sessions consuming trending data should pick whichever shape
   matches the row they're rendering rather than re-deriving from
   the merged 50-list.
+- **Cross-route navigation handoff via module-level signals**
+  (ADR-109, Session 021). When a route hands off structured state
+  to another at navigation time, declare a module under
+  `frontend/src/lib/<feature>Session.ts` with a private
+  `createSignal`, exposed via `set<Feature>Session` /
+  `get<Feature>Session` / `clear<Feature>Session` plus a
+  `_resetForTests`. Solid Router's `state` payload is NOT a viable
+  alternative — `createMemoryHistory` (vitest jsdom) drops it
+  silently, killing test seedability. The reading route reads
+  ONCE on mount and clears on teardown.
