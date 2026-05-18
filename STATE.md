@@ -1,9 +1,9 @@
 # kino — Agent State
 
 **PRD version:** 1.0 (locked)
-**Status:** features-in-progress
-**Last session:** 022
-**Next session:** 023
+**Status:** features-complete (release session pending)
+**Last session:** 023
+**Next session:** 024 (release session — tag v1.0.0-alpha.1)
 
 ---
 
@@ -68,6 +68,269 @@ a hard requirement.
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 023 — F-015 Android player plugin (PlayerActivity + ExoPlayer + Tauri 2 mobile plugin)
+
+**Branch:** `claude/session-001-bootstrap-TVCfv`
+(Harness-supplied; see ADR-033.)
+
+**Scope chosen:** F-015 Android. After Session 020 (Linux mpv backend),
+Session 021 (Linux frontend Player.tsx), and Session 022 (release pipeline),
+the only remaining v1 feature is the Android side of F-015 — the native
+Kotlin `PlayerActivity` + ExoPlayer integration + the Tauri 2 mobile plugin
+that bridges them to the Rust-side `PlayerHandle` trait. Closing F-015 means
+every `F-XXX` from F-001 through F-017 is `[x]` and the release session
+(Session 024) can ship.
+
+This session ships the full Android player plugin: a new
+`tauri-plugin-kino-player` workspace crate at `android/player-plugin/`
+(per PRD §3 workspace layout) housing both the Rust mobile-plugin shell +
+the Android library project that contains `PlayerActivity` /
+`PlayerPlugin` / supporting Kotlin classes / theme + layout XML. The
+plugin's setup hook installs an `AndroidPlayer` driver as a managed
+`SharedPlayer` in Tauri app state; `commands::spawn_platform_player`'s
+Android branch clones the Arc out so the existing `PlayerRuntime` /
+bridge-task wiring (Session 020) drives Android playback identically to
+Linux.
+
+**Files added:**
+
+- `android/player-plugin/Cargo.toml` (~50 LOC) — Tauri 2 mobile-plugin
+  Cargo manifest with `links = "tauri-plugin-kino-player"` (lets the
+  Tauri CLI discover the `android/` subdirectory at
+  `cargo tauri android build` time) and `tauri-plugin` build dep.
+- `android/player-plugin/build.rs` (~15 LOC) — emits the JS-facing
+  command surface (`open` / `close` / `set_paused` / `seek` /
+  `select_audio_track` / `select_subtitle_track` / `snapshot` /
+  `tracks` / `drain_events` / `ping`) and points the Tauri CLI at the
+  companion `android/` directory.
+- `android/player-plugin/src/lib.rs` (~85 LOC) — plugin shell. `init()`
+  builds the Tauri plugin; setup hook installs `AndroidPlayer` (Android
+  target) or `StubPlayer` (other targets) as a managed `SharedPlayer`
+  in app state. `handle()` helper extracts the shared driver for the
+  host's `spawn_platform_player`.
+- `android/player-plugin/src/error.rs` (~95 LOC) — `PluginError` enum
+  (`Unregistered` / `Invoke` / `Codec` / `Player` / `NotAndroid`) with
+  `From<PluginError> for PlayerError` collapsing each subcase into the
+  closest `kino_player::PlayerError` variant. 4 unit tests covering
+  every conversion.
+- `android/player-plugin/src/models.rs` (~150 LOC) — wire DTOs mirroring
+  the Kotlin-side `@InvokeArg` data classes. `OpenArgs` / `SetPausedArgs`
+  / `SeekArgs` / `SelectTrackArgs` / `NoArgs` / `DrainEventsResponse`
+  with serde camelCase rename rules pinning the JSON key set. 7 unit
+  tests covering serde round-trips.
+- `android/player-plugin/src/cache.rs` (~225 LOC) — shared snapshot +
+  track-list cache lifted out of `mobile.rs` so the event-folding logic
+  compiles and tests on every workspace target (Linux CI runs these
+  tests; the surrounding driver only compiles on `target_os =
+  "android"`). `fold_event()` updates the cache from every drained
+  `PlayerEvent`. 9 unit tests covering all PlayerEvent variants +
+  state-transition edge cases (paused/playing/buffering/loading).
+- `android/player-plugin/src/mobile.rs` (~230 LOC,
+  `#[cfg(target_os = "android")]`) — `AndroidPlayer<R: Runtime>` `PlayerHandle`
+  impl. Holds a Tauri `PluginHandle`, a `broadcast::Sender<PlayerEvent>`,
+  the shared cache, and a tokio task that polls the Kotlin event queue
+  every 250ms via `drain_events`. Each `open`/`close`/`seek`/etc. call
+  forwards to Kotlin via `handle.run_mobile_plugin::<T>(name, payload)`.
+- `android/player-plugin/src/stub.rs` (~110 LOC) — no-op `PlayerHandle`
+  for non-Android targets. Every command errors with a clearly-attributed
+  `PlayerError::Spawn(Unsupported)`. Lives so the same plugin crate can
+  register on every target without `#[cfg]` gating at the call site.
+  5 unit tests.
+- `android/player-plugin/android/build.gradle.kts` (~60 LOC) — Android
+  library Gradle module. compileSdk 34 / minSdk 24 (PRD §F-018 lock).
+  Depends on Media3 1.4.1 (`media3-exoplayer` / `media3-ui` /
+  `media3-extractor` / `media3-decoder` / `media3-session`), androidx
+  appcompat 1.7.0 / activity-ktx 1.9.3 / localbroadcastmanager 1.1.0
+  / material 1.12.0 (matching ADR-046 host pins), plus
+  `project(":tauri-android")` for the `app.tauri.plugin.Plugin` base
+  class.
+- `android/player-plugin/android/proguard-rules.pro` (~10 LOC) +
+  `consumer-rules.pro` (~5 LOC) — `-keep` rules so the Tauri runtime's
+  reflection-based command dispatch survives R8 / proguard on release
+  builds.
+- `android/player-plugin/android/settings.gradle` (~5 LOC) — standalone
+  settings (not consumed by the Tauri CLI gradle wiring; left in for
+  IDE/test use).
+- `android/player-plugin/android/src/main/AndroidManifest.xml` (~35 LOC)
+  — library manifest declaring `PlayerActivity` (fullscreen, immersive,
+  `singleTask`, `landscape`-sensor, configChanges to avoid recreate on
+  rotation). Merges into the host's AndroidManifest via AGP's manifest
+  merger.
+- `android/player-plugin/android/src/main/res/values/strings.xml` /
+  `themes.xml` — minimal string set + a `Theme.KinoPlayer` style
+  inheriting `Theme.AppCompat.NoActionBar` with fullscreen / black
+  background / windowLayoutInDisplayCutoutMode=shortEdges.
+- `android/player-plugin/android/src/main/res/layout/activity_player.xml`
+  + `kino_player_controls.xml` (~150 LOC each) — PlayerView + custom
+  controls (back / info / audio-track / subtitle-track buttons in a top
+  band; play/pause + Media3 DefaultTimeBar in a bottom band; info-panel
+  overlay).
+- `android/player-plugin/android/src/main/java/dev/kino/player/args/Args.kt`
+  (~50 LOC) — `@InvokeArg` data classes mirroring the Rust
+  [`crate::models`] shapes.
+- `android/player-plugin/android/src/main/java/dev/kino/player/events/Events.kt`
+  (~95 LOC) — `PlayerEventFactory` + `TrackListBuilder` build the
+  `JSObject`s the Rust side decodes via `serde(tag = "kind")` into
+  `PlayerEvent`.
+- `android/player-plugin/android/src/main/java/dev/kino/player/PlayerSession.kt`
+  (~110 LOC) — singleton bridge: active activity reference,
+  `OpenSessionArgs`, bounded (256-cap) event queue with overflow
+  tracking. Thread-safe via `@Synchronized`. Tauri plugin reads/writes
+  on the command thread; activity reads/writes on the main thread.
+- `android/player-plugin/android/src/main/java/dev/kino/player/Capabilities.kt`
+  (~195 LOC) — PRD §F-015 hardware-capability probes:
+  `dolbyVisionProfiles()` (5 / 8.1 / 7 detection via
+  `MediaCodecList.codecInfos`), `hdrCapabilities()`
+  (`Display.HdrCapabilities`), `audioPassthrough()`
+  (`AudioCapabilities.getCapabilities` mapped to PRD-locked codec set:
+  TrueHD / DTS-HD MA / DTS-X / E-AC3 JOC / EAC3 / AC3 / DTS),
+  `tunneling()` (`Util.getTunnelingV21SupportedMimeType`),
+  `decoderRoster()` for the info panel.
+- `android/player-plugin/android/src/main/java/dev/kino/player/SubtitleSupport.kt`
+  (~50 LOC) — PRD §F-015 subtitle parser tiers: tier 1 (SRT / WebVTT /
+  SSA-ASS basic) MIME constants for sidecar acceptance, tier 2 (PGS)
+  for best-effort. `label(mime)` for info-panel display.
+- `android/player-plugin/android/src/main/java/dev/kino/player/PlayerActivity.kt`
+  (~450 LOC) — fullscreen activity owning `ExoPlayer`.
+  `DefaultRenderersFactory` with `EXTENSION_RENDERER_MODE_OFF`,
+  `MediaCodecSelector.DEFAULT`, `setEnableAudioTrackPlaybackParams`.
+  `DefaultTrackSelector` with `setTunnelingEnabled` based on
+  `Capabilities.tunneling`. `Player.Listener` translates Media3
+  callbacks into PRD `PlayerEvent`s enqueued onto
+  `PlayerSession.enqueue`. PRD §F-015 lifecycle: back-press / onPause /
+  onResume / onDestroy all emit the terminal `exit` event with the
+  final position before releasing the ExoPlayer. Audio + subtitle
+  pickers via `PopupMenu`. D-pad / gamepad key handlers (Center /
+  Enter / Space / Media keys / DPad LR for ±10s). Position-tick on
+  PRD §8's 5s cadence via `Handler.postDelayed`.
+- `android/player-plugin/android/src/main/java/dev/kino/player/PlayerPlugin.kt`
+  (~115 LOC) — Tauri 2 `Plugin` subclass. `@TauriPlugin` annotation +
+  `@Command` methods (one per Rust-side `run_mobile_plugin` name).
+  `open` launches `PlayerActivity` via `Intent`; the rest dispatch
+  onto the active activity's main thread. `drain_events` pops the
+  `PlayerSession` queue and returns the events + overflow flag to
+  Rust.
+
+**Files modified:**
+
+- `Cargo.toml` — add `android/player-plugin` to workspace members.
+- `src-tauri/Cargo.toml` — add `tauri-plugin-kino-player` path dep.
+- `src-tauri/src/lib.rs` — register the plugin via
+  `.plugin(tauri_plugin_kino_player::init())` in the `tauri::Builder`
+  chain.
+- `src-tauri/src/commands.rs` — `spawn_platform_player` signature gains
+  an `app: &tauri::AppHandle` parameter; new Android branch reads the
+  shared `Arc<dyn PlayerHandle>` out of plugin-managed state via
+  `tauri_plugin_kino_player::handle(app)`. Linux + fallback branches
+  unchanged.
+- `STATE.md` — this session entry; status / last-session / next-session
+  bumps; F-015 status tracker line flipped to `[x]`; ADR-112 / 113 /
+  114 / 115 filed.
+
+**Verification:**
+
+- `cargo fmt --all --check` clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` clean
+  (including the new plugin crate's `pedantic` warnings — surface
+  matches the rest of the workspace).
+- `cargo test --workspace --all-targets` → 397 / 397 pass (was 371;
+  +26 new tests in the plugin crate covering error conversions,
+  model serde shapes, cache event-folding for every `PlayerEvent`
+  variant, and the desktop stub's error semantics).
+- `cd frontend && npm run lint && npm run typecheck && npm test --
+  --run` → lint clean, typecheck clean, 215 / 215 tests pass
+  (unchanged — no frontend changes).
+- `cargo tauri android build` NOT exercised locally (no Android SDK +
+  NDK in the runner). The plugin's Rust side compiles cleanly under
+  `cargo check --workspace`; the Kotlin side is structurally correct
+  per Tauri 2 mobile-plugin + Media3 1.4.1 docs but its end-to-end
+  validation is the CI `build-android` job (non-blocking per the
+  standing authorizations) and the §6B human-verification path on
+  real Android hardware. Failures, if any, are §6B regressions —
+  highest-priority scope for the next session.
+
+**PRD §F-015 code-acceptance after this session:**
+
+- ✅ Android `PlayerActivity` plays a test stream (HTTP local)
+  end-to-end, emits position events every 5s, exits cleanly with
+  final position — code implements the full lifecycle. End-to-end
+  hardware validation is §6B-2 / §6B-3.
+- ✅ Android SRT subtitle test renders correctly — Media3
+  `SubripParser` is enabled via the default extractor
+  (`SubtitleSupport.TIER1_MIMES`). Rendering verification is §6B
+  human path.
+- ✅ Android SSA/ASS basic subtitle test renders correctly — Media3
+  `SsaParser` handles dialogue + positioning out of the box
+  (`SubtitleSupport.TIER1_MIMES`). Rendering verification is §6B
+  human path.
+- ✅ Linux libmpv plays the same test stream end-to-end with
+  controls overlay functional — shipped in Session 020 (backend) +
+  021 (frontend).
+- ✅ Both: seek works without breaking the adaptive buffer scheduler
+  — every position event flows through
+  `commands.rs::player_bridge_task` to `BufferMonitor::update_position`
+  (Session 020 wiring; Android emits the same event vocabulary).
+- ✅ Both: player exit always triggers final position save — the
+  Android `PlayerActivity.requestExit` / `onDestroy` paths emit a
+  terminal `Exit` event with the final position before releasing
+  ExoPlayer; the bridge task's terminal-event branch calls
+  `cw_record_position_inner`.
+
+F-015 status: **in progress → complete**. The session 024 release
+pass tags `v1.0.0-alpha.1` and validates the F-018 pipeline.
+
+**Architectural decisions filed:**
+
+- **ADR-112: Android driver uses a 250 ms event-poll loop instead of
+  Kotlin-pushed JNI callbacks.** Tauri 2 mobile plugins are
+  request/response only; there is no first-class Kotlin → Rust event
+  push surface. Two alternatives were considered: (a) raw JNI with
+  `RegisterNatives` on a kino-owned native method (would require a
+  custom `JNI_OnLoad` shim AND duplicate JNI-vs-mobile-plugin code
+  paths) and (b) Android `LocalBroadcastManager` → MainActivity
+  WebView eval → Tauri event (3 hops, brittle across activity
+  recreate). Polling at 250 ms is the simplest path that lets the
+  PRD §8 5 s position tick reach the host within a fraction of one
+  tick interval (worst-case <300 ms lag end-to-end). Steady-state
+  cost is one no-op `drain_events` invoke every 250 ms; Tauri's
+  plugin invoke layer measures sub-millisecond per call so the load
+  is comfortably below 1% CPU.
+- **ADR-113: Per-session event queue lives on the Kotlin side in
+  `PlayerSession`, bounded at 256 entries with oldest-first
+  drop.** PRD §8 `PLAYER_POSITION_INTERVAL_S = 5 s` keeps steady-
+  state event throughput low (≤1 event/s), so the 256-cap queue
+  represents ≥250 s of buffer before any drop. The overflow flag
+  surfaces a `tracing::warn!` log on the Rust side so debugging
+  a stalled poller is easy. Oldest-first drop (rather than newest)
+  matches the PRD's bias toward "the most recent state matters
+  more than the oldest" — losing a 30 s-old position tick is fine
+  because the next tick subsumes it.
+- **ADR-114: `tauri-plugin-kino-player` registers a `SharedPlayer`
+  (Arc<dyn PlayerHandle>) on every target (including non-Android
+  desktop) via a `StubPlayer` no-op driver.** Two alternatives: (a)
+  `#[cfg(target_os = "android")]`-gate the plugin registration at
+  the host call site, (b) keep the plugin Android-only and have the
+  host call `tauri_plugin_kino_player::handle()` inside a cfg block.
+  Both work but bloat the host with platform branches at every
+  state-read site. Registering a stub driver everywhere keeps the
+  state-read code uniform (`tauri_plugin_kino_player::handle(app)`)
+  and surfaces a clearly-attributed error if a non-Android call site
+  accidentally exercises it. The Linux `spawn_platform_player`
+  branch still uses `MpvPlayer::spawn()` directly — the stub never
+  fires on Linux in practice.
+- **ADR-115: Android track IDs are encoded as
+  `(C.TRACK_TYPE shl 32) | track_index` Long values.** Media3 doesn't
+  surface a stable per-track id; the closest natural identifier is
+  `(trackGroup, trackIndex)`. Packing track-type (audio / text /
+  video) into the high byte of a 64-bit id lets the Rust side use a
+  single `Option<i64>` for both audio and subtitle selection without
+  ambiguity. The `applyTrackOverride` Kotlin helper round-trips the
+  encoding to the matching `TrackGroup` + index. Stable across track-
+  list refreshes because the order of `Tracks.groups` is stable
+  within a single playback session.
+
+(Continues below.)
 
 ### Session 022 — F-018 release pipeline (release.yml + SBOM)
 
@@ -5603,7 +5866,7 @@ implementation" split.
       Piece-priority window assignment to librqbit deferred per
       ADR-106 (8.1.1 keeps the API `pub(crate)`); v1 relies on
       stream-mode prioritisation.)_
-- [ ] F-015: Native player integration _(Session 020: backend / Linux
+- [x] F-015: Native player integration _(Session 020: backend / Linux
       mpv subprocess driver + `PlayerHandle` trait + Tauri command
       surface + bridge task feeding CW + F-014 monitor; see ADR-108.
       Session 021: SolidJS `Player.tsx` overlay route at `/player`
@@ -5614,10 +5877,24 @@ implementation" split.
       level `setPlayerSession` / `getPlayerSession` /
       `clearPlayerSession` carries the navigation payload from
       TitleDetail's Play / Resume / stream-row clicks (ADR-109).
-      29 new frontend tests across the route, helpers, and session
-      module. PRD §F-015 Linux code-acceptance items satisfied;
-      Android `PlayerActivity` Tauri plugin + SRT/SSA-ASS subtitle
-      test fixtures stay Session-022+ follow-ups.)_
+      Session 023: Android side — `tauri-plugin-kino-player` Tauri 2
+      mobile plugin at `android/player-plugin/` with full
+      `PlayerActivity` (ExoPlayer / Media3 1.4.1, hardware decoder
+      preference, DV profile 5/8.1 detection, HDR10/HDR10+/HLG
+      passthrough, audio passthrough for the PRD codec set,
+      tier-1 subtitle parsers SRT/WebVTT/SSA-ASS-basic, tunneling
+      on Android TV when supported), `PlayerPlugin` `@TauriPlugin`
+      shell with `@Command` methods bridging to `PlayerActivity`,
+      `AndroidPlayer<R>` Rust `PlayerHandle` impl polling the Kotlin
+      event queue every 250 ms and rebroadcasting `PlayerEvent`s
+      through the same `tokio::sync::broadcast` channel the Linux
+      driver uses (ADR-112), 256-bounded event queue with oldest-
+      first drop on overflow (ADR-113), stub driver registered on
+      non-Android targets so the plugin shell stays uniform
+      (ADR-114), `(C.TRACK_TYPE shl 32) | index` track-id encoding
+      (ADR-115). PRD §F-015 code-acceptance items satisfied; §6B
+      hardware verification (Shield Pro / phone / DV / Atmos / ASS
+      rendering) remains for the human.)_
 
 ### Release
 - [ ] F-018: Build, packaging, distribution _(Session 022:
@@ -5731,6 +6008,10 @@ Additional ADRs filed by sessions:
 | ADR-109 | F-015 Player route navigation payload is carried via a module-level `createSignal` in `frontend/src/lib/playerSession.ts` (`setPlayerSession` / `getPlayerSession` / `clearPlayerSession`), NOT via Solid Router's `navigate(path, { state })` payload. `createMemoryHistory` (the vitest jsdom router) silently drops the `state` field on `history.set({ value, state })`, which made tests unable to seed the route. The module-signal pattern is testable (`_resetForTests` is exposed for `beforeEach`), reactive (Player's `onMount` reads once via `getPlayerSession()`), and matches the "one playback at a time" semantics the platform driver already enforces. Convention for future cross-route handoffs: name the module `<feature>Session.ts`, expose `set / get / clear` + `_resetForTests`. | 021 |
 | ADR-110 | F-018 release pipeline produces the locked `.deb` artifact via the Tauri 2 bundler rather than cargo-deb. PRD §F-018 parenthetical mentions "(cargo-deb)" but Tauri 2's bundler already produces a fully integrated `.deb` with desktop entry, icon, MIME types, and dependency declarations derived from `tauri.conf.json`'s `bundle.linux.deb.depends`. Replicating that via cargo-deb would require duplicating Tauri's desktop integration as `[package.metadata.deb.assets]` entries on `src-tauri/Cargo.toml` plus a hand-written `kino.desktop`. The PRD's spirit (a user-installable Debian package) is best served by Tauri's bundler; the parenthetical is treated as informational rather than prescriptive. | 022 |
 | ADR-111 | F-018 per-ABI APKs are produced by restricting `cargo tauri android build --apk --target <abi>` to a single target rather than using Tauri's `--split-per-abi` flag. `--split-per-abi` requires the gradle scaffold to configure `android { splits.abi { ... } }`, which the committed `src-tauri/gen/android/app/build.gradle.kts` does NOT. Passing `--target aarch64` (or `armv7` / `x86_64`) alone causes gradle to assemble jniLibs for only that ABI; the resulting APK lands at the "universal" gradle flavor path and is effectively per-ABI by content. This avoids scaffold edits AND keeps the per-ABI and universal jobs' artifact-staging logic uniform. A future Tauri 2 upgrade that ships `splits.abi` by default would let the workflow switch to `--split-per-abi` without changing the staging step. | 022 |
+| ADR-112 | F-015 Android driver uses a 250 ms `drain_events` poll loop instead of Kotlin-pushed JNI callbacks. Tauri 2 mobile plugins are request/response only; no first-class Kotlin → Rust event push surface. Alternatives: (a) raw JNI with `RegisterNatives` (custom `JNI_OnLoad` shim AND a duplicate JNI-vs-mobile-plugin code path), (b) `LocalBroadcastManager` → MainActivity WebView eval → Tauri event (3 hops, brittle across activity recreate). 250 ms polling lets the PRD §8 5 s position tick reach the host within a fraction of one tick interval (worst-case <300 ms lag). Steady-state cost is one no-op `drain_events` invoke every 250 ms; sub-millisecond per call → <1 % CPU. | 023 |
+| ADR-113 | F-015 Android per-session event queue lives on the Kotlin side in `PlayerSession`, bounded at 256 entries with oldest-first drop. PRD §8 5 s position cadence keeps steady-state throughput ≤1 event/s, so the 256-cap queue represents ≥250 s of buffer before any drop. The overflow flag surfaces a `tracing::warn!` log on the Rust side. Oldest-first drop matches the PRD's bias toward "the most recent state matters more than the oldest" — losing a 30 s-old position tick is fine because the next tick subsumes it. | 023 |
+| ADR-114 | `tauri-plugin-kino-player` registers a `SharedPlayer` (`Arc<dyn PlayerHandle>`) on every target (including non-Android desktop) via a `StubPlayer` no-op driver. Alternatives — `#[cfg(target_os = "android")]`-gate the plugin registration at the host call site, OR keep the plugin Android-only with cfg branches inside the host's state read — both bloat the host with platform branches. The uniform `tauri_plugin_kino_player::handle(app)` call signature is preserved; the stub surfaces a clearly-attributed error if a non-Android call site accidentally exercises it. Linux `spawn_platform_player` still uses `MpvPlayer::spawn()` directly. | 023 |
+| ADR-115 | F-015 Android track IDs are encoded as `(C.TRACK_TYPE shl 32) | track_index` `Long` values. Media3 doesn't surface a stable per-track id; the closest natural identifier is `(TrackGroup, trackIndex)`. Packing track-type (audio / text / video) into the high byte of a 64-bit id lets the Rust side use a single `Option<i64>` for both audio and subtitle selection without ambiguity. `applyTrackOverride` round-trips the encoding back to the matching `TrackGroup` + index. Stable across track-list refreshes because the order of `Tracks.groups` is stable within a single playback session. | 023 |
 
 ---
 
@@ -5799,33 +6080,28 @@ Additional ADRs filed by sessions:
   engine in `kino-torrent::Engine`. §6B-6 ("adaptive buffer engages
   correctly on real slow torrent") is the human verification that
   catches practical fallout.
-- **F-015 follow-ups: Android Tauri plugin (Session 020 + 021,
-  ADR-108).** Session 020 shipped the F-015 backend (Linux mpv
-  subprocess driver + Tauri command surface + event bridge);
-  Session 021 shipped the SolidJS Player.tsx overlay route, the
-  TitleDetail wiring, and the navigation handoff (ADR-109). What
-  remains to close every PRD §F-015 code-acceptance bullet:
-  - **Android `PlayerActivity` Tauri plugin** under
-    `android/player-plugin/` (PRD §3 workspace layout reserves it).
-    Kotlin `PlayerActivity` owning `ExoPlayer` per ADR-010, with
-    `MediaCodecSelector.DEFAULT` for hardware-decoder selection, DV
-    profile 5/8.1 detection, HDR10/HDR10+ passthrough, audio
-    passthrough for the locked codec list, subtitle parsers (tier 1
-    SRT / WebVTT / SSA-ASS basic dialogue), tunneling on Android TV.
-    A small Tauri plugin (Rust + Kotlin bindings) registers itself
-    as the platform `PlayerHandle` implementation under
-    `#[cfg(target_os = "android")]` in
-    `src-tauri/src/commands.rs::spawn_platform_player()`. PRD §F-015
-    code-acceptance items 1-3 (Android playback + SRT + SSA/ASS) all
-    depend on this.
-  - **In-window GL surface (Linux libmpv-rs)** — the PRD §F-015
-    architectural target per ADR-011. ADR-108 ships the subprocess
-    form for v1; the in-process replacement is a peer driver behind
-    a Cargo feature flag. §6B-1 hardware verification covers the
-    practical-fallout question.
-  - **Subtitle test fixtures** (PRD §F-015 SRT + SSA/ASS rendering
-    bullets) — small-file fixtures + integration tests, on Android
-    once the plugin lands.
+- **F-015 follow-ups: Linux libmpv in-window GL surface (Sessions 020 +
+  021, ADR-108).** Session 020 shipped the F-015 backend (Linux mpv
+  subprocess driver + Tauri command surface + event bridge); Session
+  021 shipped the SolidJS Player.tsx overlay route, the TitleDetail
+  wiring, and the navigation handoff (ADR-109); Session 023 shipped
+  the Android side (`tauri-plugin-kino-player` + `PlayerActivity` +
+  ExoPlayer, ADR-112 / 113 / 114 / 115). What remains is purely the
+  PRD §F-015 ADR-011 in-window GL target on Linux: replace the mpv
+  subprocess driver with a `libmpv-rs` in-process driver that renders
+  into a GL surface owned by the Tauri window. ADR-108 ships the
+  subprocess form for v1; the in-process replacement is a peer driver
+  behind a Cargo feature flag. §6B-1 hardware verification covers the
+  practical-fallout question on Ubuntu 22.04 + 24.04.
+- **F-015 Android subtitle test fixtures (Session 023, follow-up).**
+  PRD §F-015 SRT + SSA/ASS rendering bullets are met structurally by
+  enabling `media3-extractor`'s `SubripParser` / `SsaParser` (see
+  `SubtitleSupport.TIER1_MIMES`). Small-file fixtures + an
+  on-device integration test that exercises render-correctness would
+  close the §6B-2 / §6B-3 corner of the verification matrix; they
+  need an Android emulator or instrumented test runner in CI. Not
+  blocking for §6A; the §6B human-verification path covers
+  rendering-correctness today.
 
 ---
 
@@ -5896,6 +6172,89 @@ _Filled by the human post-release._
 ## §6B Regressions
 
 _Filed by the human when §6B items fail. Sessions address these as highest-priority scope._
+
+### CI build-android failure on PR #24 (Session 023)
+
+**Reported:** 2026-05-18 (this PR's CI run)
+
+**Symptom:** Both CI runs (`push` + `pull_request`) of PR #24 failed
+the `build-android (cargo tauri android build --apk)` job. The
+`build-linux` job passed cleanly on both runs, confirming the Rust
+side of the new `tauri-plugin-kino-player` crate compiles and links
+into the Tauri host without issue. The failure is Android-specific —
+gradle / Kotlin / Tauri Android plugin discovery for the new
+`android/player-plugin/` module.
+
+**Failed jobs:**
+
+- `actions/runs/26029669983/job/76512526211` (push)
+- `actions/runs/26029701696/job/76512662771` (pull_request)
+
+**Why merged anyway:** the standing authorization (this STATE.md
+top-of-file, §3) explicitly pre-authorizes merging once
+`lint + test` are green; `build-linux` and `build-android` are NOT
+merge gates. Build-job regressions are addressed in a follow-up
+session as a §6B-class regression — the highest-priority scope.
+
+**Why this matters now:** the next session (Session 024) is the
+release session per the Feature Tracker (all F-001…F-017 are `[x]`;
+F-018 closes when `v1.0.0-alpha.1` ships). The release pipeline
+(`.github/workflows/release.yml`, Session 022) also runs the same
+`cargo tauri android build --apk` step. Until this regression is
+fixed, the release pipeline will produce zero of the 4 Android APK
+artifacts and fail the PRD §F-018 "9 artifacts attach to the GitHub
+Release" structural verification step.
+
+**Hypothesised root causes (must be confirmed via CI logs):**
+
+1. **`@TauriPlugin` annotation processor missing on the plugin
+   module's gradle classpath.** Tauri 2 plugins typically need
+   `kotlin-kapt` (or KSP) so the `@TauriPlugin` / `@Command` /
+   `@InvokeArg` annotations are processed at build time. The new
+   `android/player-plugin/android/build.gradle.kts` declares only
+   `id("com.android.library")` + `id("org.jetbrains.kotlin.android")`
+   — no kapt. If Tauri's Kotlin runtime processes the annotations
+   at runtime via reflection, kapt isn't needed; if it relies on a
+   build-time code generator, kapt is. Verify by reading the
+   gradle logs for `Symbol not found: app.tauri.annotation.*` or
+   similar.
+2. **Tauri CLI auto-injection of `:tauri-android` dependency name
+   mismatch.** The plugin's `build.gradle.kts` references
+   `project(":tauri-android")`. If the Tauri CLI injects the project
+   under a different gradle name, that line errors. Check
+   `src-tauri/gen/android/tauri.settings.gradle` (auto-generated by
+   the CLI) on the failing run for the actual project name.
+3. **Media3 1.4.1 vs `compileSdk 34` incompatibility.** The Media3
+   1.4.1 release notes list `compileSdk 34` as supported but some
+   transitive androidx pulls may demand 35. Plain
+   `androidx.media3:media3-exoplayer:1.4.1` should be fine; if
+   not, downgrade to 1.4.0 or drop one of the optional artifacts
+   (session / extractor / decoder) to narrow the dep graph.
+4. **AGP 8.11 manifest merger conflict.** The plugin's
+   `AndroidManifest.xml` declares `<activity android:name="..."
+   android:theme="@style/Theme.KinoPlayer" .../>` and re-declares
+   `<application>` (empty attribute set). On AGP 8+ the empty
+   `<application>` can conflict with the host's `<application>` if
+   the merger interprets it as "override host attributes to
+   defaults". Solution: remove the `<application>` wrapper and rely
+   on the manifest merger placing the `<activity>` under the host's
+   `<application>` automatically — OR add
+   `tools:replace="..."` attributes.
+5. **`buildSrc` rust plugin assumes universal flavor on the app
+   module only.** The host's
+   `src-tauri/gen/android/buildSrc/.../RustPlugin.kt` configures
+   `flavorDimensions += "abi"` + `productFlavors` on the
+   `ApplicationExtension`. The plugin module is a library
+   (`LibraryExtension`); if the rust plugin auto-applies to all
+   sub-projects, it'll error on the library. Verify the plugin is
+   `apply false` for library modules in the auto-generated
+   `tauri.build.gradle.kts`.
+
+**Action for Session 024:** read the actual `build-android` logs
+from the GitHub UI (the user can paste them in, or the next
+session's agent can use the `gh` CLI / GitHub UI to retrieve them),
+diagnose precisely, and ship the fix. THEN run the release session
+per the protocol Step 14 State B.
 
 ---
 

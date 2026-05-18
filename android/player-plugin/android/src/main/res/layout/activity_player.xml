@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  PRD §F-015 Android: PlayerActivity layout.
+
+  - `PlayerView` (Media3) hosts the ExoPlayer surface and the built-in
+    controller (play/pause + seek bar). We use the Media3 controller for
+    the core transport because re-implementing seek/scrub from scratch in
+    a single session is not worth the audit surface; we layer the
+    PRD-required audio/subtitle track selectors + info panel above it.
+  - The audio/subtitle controls live in `controls_overlay` which we
+    show alongside Media3's controller. The F-017 D-pad navigation is
+    handled by `focusable="true"` + Media3's native track selection UI.
+  - The info panel (toggled by the `info` button) shows file name,
+    bitrate / resolution / HDR / DV flag, decoder, audio passthrough
+    state. Populated from the [`Capabilities`] probe.
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:id="@+id/kino_player_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@android:color/black"
+    android:keepScreenOn="true"
+    tools:context="dev.kino.player.PlayerActivity">
+
+    <androidx.media3.ui.PlayerView
+        android:id="@+id/kino_player_view"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        app:resize_mode="fit"
+        app:show_buffering="when_playing"
+        app:use_controller="true"
+        app:controller_layout_id="@layout/kino_player_controls"
+        app:auto_show="true"
+        app:hide_on_touch="true" />
+
+    <ProgressBar
+        android:id="@+id/kino_player_loading"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:indeterminate="true"
+        android:visibility="gone"
+        tools:visibility="visible" />
+
+    <TextView
+        android:id="@+id/kino_player_error_text"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:padding="24dp"
+        android:textColor="@android:color/white"
+        android:textSize="18sp"
+        android:visibility="gone"
+        android:background="#80000000"
+        tools:text="@string/kino_player_error_generic"
+        tools:visibility="visible" />
+
+</FrameLayout>

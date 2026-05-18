@@ -3829,7 +3829,7 @@ pub async fn player_open(
     // before booting the new driver.
     close_active_player(&player).await;
 
-    let handle: Arc<dyn PlayerHandle> = spawn_platform_player()
+    let handle: Arc<dyn PlayerHandle> = spawn_platform_player(&app)
         .await
         .map_err(|e| format!("player driver: {e}"))?;
     handle
@@ -3955,16 +3955,32 @@ async fn close_active_player(player: &State<'_, Arc<PlayerRuntime>>) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-async fn spawn_platform_player() -> Result<Arc<dyn PlayerHandle>, PlayerError> {
+async fn spawn_platform_player(
+    _app: &tauri::AppHandle,
+) -> Result<Arc<dyn PlayerHandle>, PlayerError> {
     let player = MpvPlayer::spawn().await?;
     Ok(Arc::new(player))
 }
 
-#[cfg(not(target_os = "linux"))]
-async fn spawn_platform_player() -> Result<Arc<dyn PlayerHandle>, PlayerError> {
-    // PRD §F-015 Android path lives in `android/player-plugin/` and
-    // wires its own `PlayerHandle` impl through a Tauri plugin once it
-    // lands. Until then, surface a clear error.
+/// On Android the platform `PlayerHandle` is the singleton
+/// `AndroidPlayer` registered by `tauri-plugin-kino-player`'s setup
+/// hook (PRD §F-015, ADR-010). The plugin's driver is stored as a
+/// managed `Arc<dyn PlayerHandle>` in app state; this function clones
+/// the Arc so the per-session `PlayerRuntime` can hold its own
+/// reference. The underlying driver outlives any single playback
+/// session — the Kotlin `PlayerActivity` is launched fresh on each
+/// `open()` and finished on each `close()`.
+#[cfg(target_os = "android")]
+async fn spawn_platform_player(
+    app: &tauri::AppHandle,
+) -> Result<Arc<dyn PlayerHandle>, PlayerError> {
+    tauri_plugin_kino_player::handle(app).map_err(kino_player::PlayerError::from)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+async fn spawn_platform_player(
+    _app: &tauri::AppHandle,
+) -> Result<Arc<dyn PlayerHandle>, PlayerError> {
     Err(PlayerError::Spawn(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "native player driver not implemented for this platform",

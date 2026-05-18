@@ -1,0 +1,8 @@
+// Placeholder settings.gradle so this module is consumable as a
+// standalone library project for IDE/test purposes. The Tauri CLI
+// includes this module into the host app's gradle build via its own
+// `include(":tauri-plugin-kino-player")` line — see
+// `src-tauri/gen/android/tauri.settings.gradle` (auto-generated on
+// every `cargo tauri android build`).
+
+rootProject.name = "tauri-plugin-kino-player"

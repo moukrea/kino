@@ -48,6 +48,15 @@ pub fn run() {
     // tracing-log shim drops events; this is acceptable because we haven't
     // resolved the config dir yet and the AppHandle is the canonical source.
     tauri::Builder::default()
+        // PRD §F-015 Android: register the `kino-player` Tauri 2 mobile
+        // plugin so `commands::spawn_platform_player` can resolve the
+        // Android `PlayerHandle` impl out of app state. On Linux the
+        // plugin installs a `StubPlayer` that errors on every call — the
+        // mpv subprocess driver wired below is what actually drives
+        // Linux playback. The stub keeps the registration path uniform
+        // so a future libmpv-in-process driver can land behind the same
+        // plugin-as-feature-flag interface.
+        .plugin(tauri_plugin_kino_player::init())
         .setup(|app| {
             let handle = app.handle().clone();
             let db_path = paths::db_path(&handle).map_err(|e| {

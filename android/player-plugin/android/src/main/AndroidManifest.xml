@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  PRD §F-015 Android plugin manifest.
+
+  Declares `PlayerActivity` as a fullscreen, immersive activity that the
+  Tauri host's `MainActivity` launches via `Intent(context,
+  PlayerActivity::class.java)`. `configChanges` covers the orientation /
+  density / locale transitions the activity handles internally without a
+  recreate (ExoPlayer's surface re-attach is more expensive than the
+  activity reconfig).
+
+  Required permissions:
+   - `INTERNET`: already declared by the host app; not re-declared here
+     because library manifests merge into the app manifest and we don't
+     need to assert it twice.
+   - `WAKE_LOCK`: optional, used by ExoPlayer when audio-only.
+   - `FOREGROUND_SERVICE_MEDIA_PLAYBACK`: required on Android 14+
+     (API 34) if we ever promote the player to a foreground service.
+     v1 uses a regular activity so this is reserved for a future
+     polish pass.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <application>
+        <activity
+            android:name="dev.kino.player.PlayerActivity"
+            android:exported="false"
+            android:label="@string/kino_player_activity_label"
+            android:theme="@style/Theme.KinoPlayer"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode|density"
+            android:launchMode="singleTask"
+            android:resizeableActivity="false"
+            android:supportsPictureInPicture="false" />
+    </application>
+
+</manifest>
