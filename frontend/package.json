@@ -1,7 +1,7 @@
 {
   "name": "kino-frontend",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0-alpha.1",
   "type": "module",
   "description": "kino SolidJS frontend bundle (shared across Linux, Android, Android TV).",
   "scripts": {

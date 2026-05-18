@@ -2319,7 +2319,7 @@ dependencies = [
 
 [[package]]
 name = "kino-addons"
-version = "0.0.0"
+version = "1.0.0-alpha.1"
 dependencies = [
  "kino-core",
  "regex",
@@ -2334,7 +2334,7 @@ dependencies = [
 
 [[package]]
 name = "kino-app"
-version = "0.0.0"
+version = "1.0.0-alpha.1"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -2366,7 +2366,7 @@ dependencies = [
 
 [[package]]
 name = "kino-core"
-version = "0.0.0"
+version = "1.0.0-alpha.1"
 dependencies = [
  "chrono",
  "reqwest 0.12.28",
@@ -2382,7 +2382,7 @@ dependencies = [
 
 [[package]]
 name = "kino-metadata"
-version = "0.0.0"
+version = "1.0.0-alpha.1"
 dependencies = [
  "chrono",
  "kino-core",
@@ -2400,7 +2400,7 @@ dependencies = [
 
 [[package]]
 name = "kino-player"
-version = "0.0.0"
+version = "1.0.0-alpha.1"
 dependencies = [
  "async-trait",
  "serde",
@@ -2414,7 +2414,7 @@ dependencies = [
 
 [[package]]
 name = "kino-server"
-version = "0.0.0"
+version = "1.0.0-alpha.1"
 dependencies = [
  "axum",
  "bytes",
@@ -2438,7 +2438,7 @@ dependencies = [
 
 [[package]]
 name = "kino-torrent"
-version = "0.0.0"
+version = "1.0.0-alpha.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -5057,7 +5057,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-plugin-kino-player"
-version = "0.0.0"
+version = "1.0.0-alpha.1"
 dependencies = [
  "async-trait",
  "kino-player",

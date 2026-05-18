@@ -13,7 +13,7 @@ members = [
 
 [workspace.package]
 # Single workspace version per ADR-026. Bumped by the release session only.
-version = "0.0.0"
+version = "1.0.0-alpha.1"
 edition = "2021"
 rust-version = "1.94"
 license = "MIT"
