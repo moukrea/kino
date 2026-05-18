@@ -57,6 +57,14 @@ android/.gradle/
 android/local.properties
 android/captures/
 android/.idea/
+# Tauri 2 mobile plugin scaffolds under `android/*-plugin/android/`. The
+# Tauri CLI drops `.tauri/tauri-api/` (Kotlin sources for the
+# `:tauri-android` gradle project) on every Android cross-compile, and
+# gradle writes its outputs to `build/`. Both are regenerated; never
+# commit them.
+android/*-plugin/android/.tauri/
+android/*-plugin/android/build/
+android/*-plugin/android/.gradle/
 *.iml
 *.apk
 *.aab

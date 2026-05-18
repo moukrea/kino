@@ -205,9 +205,6 @@ object Capabilities {
         return context.packageManager.hasSystemFeature("android.software.leanback")
     }
 
-    /** Convenience: PRD §F-015 ADR-010 hardware-decoder preference. */
-    fun preferHardwareDecoder(): Boolean = !Util.isAutomotive
-
     /** Build a human-readable info-panel summary from [Snapshot] + a media format. */
     fun describe(snapshot: Snapshot): String {
         val sb = StringBuilder()

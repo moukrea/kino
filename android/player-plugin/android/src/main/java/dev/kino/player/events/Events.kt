@@ -76,10 +76,13 @@ object TrackListBuilder {
         isSelected: Boolean
     ): JSObject = JSObject().apply {
         put("id", id)
-        title?.let { put("title", it) } ?: put("title", JSObject.NULL)
-        language?.let { put("language", it) } ?: put("language", JSObject.NULL)
-        codec?.let { put("codec", it) } ?: put("codec", JSObject.NULL)
-        channels?.let { put("channels", it) } ?: put("channels", JSObject.NULL)
+        // The Rust side uses `Option<T>` for these fields, so omitting a
+        // key deserializes to `None`. Avoids `JSObject.NULL` which is
+        // not accessible through the Kotlin subclass reference.
+        title?.let { put("title", it) }
+        language?.let { put("language", it) }
+        codec?.let { put("codec", it) }
+        channels?.let { put("channels", it) }
         put("isDefault", isDefault)
         put("isSelected", isSelected)
     }
@@ -94,9 +97,9 @@ object TrackListBuilder {
         isSelected: Boolean
     ): JSObject = JSObject().apply {
         put("id", id)
-        title?.let { put("title", it) } ?: put("title", JSObject.NULL)
-        language?.let { put("language", it) } ?: put("language", JSObject.NULL)
-        codec?.let { put("codec", it) } ?: put("codec", JSObject.NULL)
+        title?.let { put("title", it) }
+        language?.let { put("language", it) }
+        codec?.let { put("codec", it) }
         put("isDefault", isDefault)
         put("isForced", isForced)
         put("isSelected", isSelected)
