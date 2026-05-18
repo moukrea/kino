@@ -11,6 +11,15 @@ export default defineConfig({
     port: 1420,
     strictPort: true,
     host: "127.0.0.1",
+    // F-016 §8: `Settings.tsx` inlines the repo-root LICENSE file via
+    // `?raw`. The default `fs.allow` is the project root (`frontend/`),
+    // which would refuse the cross-boundary read; widening to the
+    // workspace root keeps the dev server (and vitest, which reuses
+    // this config) happy without loosening serving rules to anything
+    // outside the kino checkout.
+    fs: {
+      allow: [".."],
+    },
   },
   envPrefix: ["VITE_", "TAURI_"],
   build: {

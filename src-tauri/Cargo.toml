@@ -49,6 +49,13 @@ kino-server = { path = "../crates/kino-server" }
 # mobile plugin (`tauri-plugin-kino-player`) registered in `lib.rs`.
 kino-player = { path = "../crates/kino-player" }
 tauri-plugin-kino-player = { path = "../android/player-plugin" }
+# F-016 §4: native directory picker. Tauri 2 first-party plugin; uses
+# zenity/kdialog/portal on Linux, SAF on Android. ADR-095's deferral
+# (text-input only) is re-classified as a §6A regression by ADR-118;
+# this plugin closes it. No new Android manifest permissions are
+# required — SAF runs through the system file-picker activity and
+# returns a content:// URI without persisted access by default.
+tauri-plugin-dialog = "2"
 bytes = { workspace = true }
 uuid = { workspace = true }
 base64 = "0.22"

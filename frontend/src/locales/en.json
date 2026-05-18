@@ -130,6 +130,8 @@
     "cache": {
       "path": "Cache path",
       "pathHint": "Where torrents and resolved artwork are stored on disk.",
+      "browse": "Browse…",
+      "browseError": "Could not open file picker: {{reason}}",
       "size": "Size limit",
       "sizeLabel": "{{n}} GiB",
       "usage": "Current usage",
@@ -179,6 +181,9 @@
       "repo": "Source",
       "openRepo": "Open repository",
       "license": "License",
+      "viewLicense": "View license",
+      "licenseTitle": "License (MIT)",
+      "licenseClose": "Close",
       "exportLogs": "Export logs",
       "exportLogsHint": "Bundles the rolling log files into a single .zip you can share.",
       "exportLogsPathPlaceholder": "kino-logs.zip",

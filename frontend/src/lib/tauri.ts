@@ -10,6 +10,7 @@
 // land in their own feature sessions.
 
 import { invoke } from "@tauri-apps/api/core";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 export type TitleKind = "movie" | "series";
 
@@ -461,6 +462,24 @@ export async function cacheClear(): Promise<void> {
 
 export async function exportLogs(destZip: string): Promise<number> {
   return invoke<number>("export_logs", { destZip });
+}
+
+/**
+ * PRD §F-016 §4 Cache → Path: native directory picker. Wraps
+ * `@tauri-apps/plugin-dialog`'s `open({ directory: true })` so callers
+ * only see a `Promise<string | null>` (null when the user cancels or
+ * when the Tauri runtime isn't reachable in plain-vite/jsdom).
+ */
+export async function pickDirectory(
+  initialPath?: string,
+): Promise<string | null> {
+  if (!hasTauri()) return null;
+  const result = await openDialog({
+    directory: true,
+    multiple: false,
+    defaultPath: initialPath && initialPath.length > 0 ? initialPath : undefined,
+  });
+  return typeof result === "string" ? result : null;
 }
 
 export async function getAppInfo(): Promise<AppInfo> {

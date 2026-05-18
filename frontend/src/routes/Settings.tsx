@@ -52,6 +52,7 @@ import {
   getRecommendedAddons,
   hasTauri,
   installAddon,
+  pickDirectory,
   setAddonOrder,
   settingsGetAll,
   settingsResetDefaults,
@@ -67,6 +68,13 @@ import {
   type RecommendedAddon,
   type SettingsView,
 } from "../lib/tauri";
+
+// PRD §F-016 §8 "License: MIT, full text accessible". The repository
+// LICENSE file is inlined at build time via Vite's `?raw` query so the
+// About → "View license" modal can render the full body without any
+// runtime filesystem access. `vite.config.ts` widens `server.fs.allow`
+// to the workspace root so the import resolves under vitest as well.
+import licenseText from "../../../LICENSE?raw";
 
 /** Stable id for the first interactive control on the Settings route. */
 export const SETTINGS_INITIAL_FOCUS_ID = "settings-section-apiKeys-tmdb-input";
@@ -294,7 +302,12 @@ export const SettingsContent: Component<SettingsProps> = (props) => {
             requestConfirm={requestConfirm}
           />
           <LanguageSection view={view} persist={persist} />
-          <CacheSection view={view} persist={persist} requestConfirm={requestConfirm} />
+          <CacheSection
+            view={view}
+            persist={persist}
+            announce={announce}
+            requestConfirm={requestConfirm}
+          />
           <BufferSection view={view} persist={persist} />
           <Show when={isAndroid()}>
             <PlayerSection view={view} persist={persist} />
@@ -984,6 +997,7 @@ const LanguageSection: Component<SectionProps> = (props) => {
 
 const CacheSection: Component<
   SectionProps & {
+    announce: AnnounceFn;
     requestConfirm: (message: string, fn: () => Promise<void>) => void;
   }
 > = (props) => {
@@ -1005,6 +1019,27 @@ const CacheSection: Component<
     await refetchUsage();
   }
 
+  // PRD §F-016 §4 "Path (with directory picker)". Closure for ADR-118's
+  // §6A regression on top of ADR-095: opens the native directory picker
+  // via `tauri-plugin-dialog` and routes the selection through the same
+  // `settingsSet` channel the manual TextField uses, so persistence,
+  // validation, and the live cache-root re-bind in `lib.rs` all work
+  // identically whether the user typed the path or picked it.
+  async function browseCachePath(): Promise<void> {
+    try {
+      const picked = await pickDirectory(props.view().cache.path);
+      if (picked) {
+        await props.persist(SETTING_KEYS.cachePath, picked);
+      }
+    } catch (err) {
+      const reason = String((err as { message?: string }).message ?? err);
+      props.announce({
+        kind: "error",
+        message: t("settings.cache.browseError", { reason }),
+      });
+    }
+  }
+
   return (
     <SectionShell id="cache" titleKey="settings.sections.cache">
       <FieldShell
@@ -1012,12 +1047,33 @@ const CacheSection: Component<
         labelKey="settings.cache.path"
         hintKey="settings.cache.pathHint"
       >
-        <TextField
-          id="settings-section-cache-path-input"
-          value={() => props.view().cache.path}
-          onSave={(v) => props.persist(SETTING_KEYS.cachePath, v)}
-          placeholder={props.view().cache.path}
-        />
+        <div class="flex items-center gap-2">
+          <TextField
+            id="settings-section-cache-path-input"
+            value={() => props.view().cache.path}
+            onSave={(v) => props.persist(SETTING_KEYS.cachePath, v)}
+            placeholder={props.view().cache.path}
+          />
+          <Focusable
+            id="settings-section-cache-path-browse"
+            onActivate={() => {
+              void browseCachePath();
+            }}
+          >
+            {({ showRing, ref, onClick }) => (
+              <button
+                ref={ref as (el: HTMLButtonElement) => void}
+                onClick={onClick}
+                data-testid="settings-section-cache-path-browse"
+                class={`rounded-md bg-neutral-700 px-3 py-2 text-sm text-neutral-100 hover:bg-neutral-600 ${
+                  showRing() ? "outline outline-2 outline-sky-400" : ""
+                }`}
+              >
+                {t("settings.cache.browse")}
+              </button>
+            )}
+          </Focusable>
+        </div>
       </FieldShell>
       <FieldShell
         id="settings-section-cache-size"
@@ -1298,6 +1354,12 @@ const AboutSection: Component<{
   announce: AnnounceFn;
 }> = (props) => {
   const [dest, setDest] = createSignal("");
+  // PRD §F-016 §8 "License: MIT, full text accessible". Closure for
+  // ADR-118's §6A regression on the About section: rather than render
+  // the literal string "MIT", expose a Focusable button that opens an
+  // in-app scrollable modal with the inlined LICENSE body. The trigger
+  // sits next to the license value so D-pad traversal stays intuitive.
+  const [showLicense, setShowLicense] = createSignal(false);
 
   async function doExport(): Promise<void> {
     const path = dest().trim();
@@ -1340,7 +1402,28 @@ const AboutSection: Component<{
         <dt class="text-neutral-400">{t("settings.about.platform")}</dt>
         <dd class="font-mono text-neutral-100">{props.appInfo().platform}</dd>
         <dt class="text-neutral-400">{t("settings.about.license")}</dt>
-        <dd class="font-mono text-neutral-100">{props.appInfo().license}</dd>
+        <dd class="flex items-center gap-3 font-mono text-neutral-100">
+          <span data-testid="settings-about-license-value">
+            {props.appInfo().license}
+          </span>
+          <Focusable
+            id="settings-about-license-view"
+            onActivate={() => setShowLicense(true)}
+          >
+            {({ showRing, ref, onClick }) => (
+              <button
+                ref={ref as (el: HTMLButtonElement) => void}
+                onClick={onClick}
+                data-testid="settings-about-license-view"
+                class={`rounded-md bg-neutral-700 px-2 py-0.5 font-sans text-xs text-neutral-100 hover:bg-neutral-600 ${
+                  showRing() ? "outline outline-2 outline-sky-400" : ""
+                }`}
+              >
+                {t("settings.about.viewLicense")}
+              </button>
+            )}
+          </Focusable>
+        </dd>
       </dl>
       <Show when={props.appInfo().repository}>
         <Focusable id="settings-about-repo">
@@ -1399,7 +1482,55 @@ const AboutSection: Component<{
           </Focusable>
         </div>
       </div>
+      <Show when={showLicense()}>
+        <LicenseModal onClose={() => setShowLicense(false)} />
+      </Show>
     </SectionShell>
+  );
+};
+
+const LicenseModal: Component<{ onClose: () => void }> = (props) => {
+  onMount(() => {
+    setInitialFocus("settings-about-license-close");
+  });
+  return (
+    <div
+      class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-8"
+      data-testid="settings-about-license-modal"
+      role="dialog"
+      aria-modal="true"
+    >
+      <div class="flex max-h-[80vh] w-full max-w-2xl flex-col gap-4 rounded-lg border border-neutral-700 bg-neutral-900 p-6 shadow-2xl">
+        <h2 class="text-lg font-semibold text-neutral-50">
+          {t("settings.about.licenseTitle")}
+        </h2>
+        <pre
+          class="flex-1 overflow-auto whitespace-pre-wrap rounded-md border border-neutral-800 bg-neutral-950 p-4 font-mono text-xs text-neutral-200"
+          data-testid="settings-about-license-body"
+        >
+          {licenseText}
+        </pre>
+        <div class="flex justify-end">
+          <Focusable
+            id="settings-about-license-close"
+            onActivate={props.onClose}
+          >
+            {({ showRing, ref, onClick }) => (
+              <button
+                ref={ref as (el: HTMLButtonElement) => void}
+                onClick={onClick}
+                data-testid="settings-about-license-close"
+                class={`rounded-md bg-sky-600 px-3 py-2 text-sm font-semibold text-neutral-50 hover:bg-sky-500 ${
+                  showRing() ? "outline outline-2 outline-sky-400" : ""
+                }`}
+              >
+                {t("settings.about.licenseClose")}
+              </button>
+            )}
+          </Focusable>
+        </div>
+      </div>
+    </div>
   );
 };
 
