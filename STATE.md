@@ -1,8 +1,8 @@
 # kino — Agent State
 
 **PRD version:** 1.0 (locked)
-**Status:** v1.0.0-alpha.1 staged on main; release pipeline now fireable via Actions UI (workflow_dispatch). Tag push from agent still BLOCKED by harness git proxy, but tag is created by `gh release create --target` on dispatch.
-**Last session:** 025 (`workflow_dispatch:` trigger on `release.yml` — unblocks human-side release without a tag push)
+**Status:** v1.0.0-alpha.1 staged on main; release pipeline now fireable via Actions UI (workflow_dispatch). Tag push from agent still BLOCKED by harness git proxy, but tag is created by `gh release create --target` on dispatch. **Session 026 fixed the build-android Kotlin compile regression**: the release pipeline will now produce all 4 Android APK artifacts (universal + arm64-v8a + armeabi-v7a + x86_64) when the human fires the dispatch.
+**Last session:** 026 (§6B regression fix: build-android Kotlin compile errors — `Util.isAutomotive` property-vs-function in `Capabilities.kt` + `JSObject.NULL` inherited-static access in `Events.kt`)
 **Next session:** none required from the agent — human runs `Actions → release → Run workflow` with `version = 1.0.0-alpha.1` (preferred) OR pushes the tag from a directly-authenticated machine OR cuts the release via the GitHub UI. See PRD Issues entry "§F-018 release tag push blocked by harness Git proxy" for the three workarounds, now in priority order with workflow_dispatch as the recommended path.
 
 ---
@@ -68,6 +68,147 @@ a hard requirement.
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 026 — §6B regression fix: build-android Kotlin compile errors
+
+**Branch:** `agent/session-026-fix-android-kotlin-build`
+
+**Scope chosen:** §6B Regression (highest-priority scope per the
+session protocol). Session 023's "CI build-android failure on PR #24"
+entry was filed but never addressed: Session 024 was the release
+session, Session 025 added the `workflow_dispatch:` trigger so the
+human can fire the release pipeline by hand. Neither fixed the
+underlying Kotlin compile error in
+`android/player-plugin/android/src/main/java/dev/kino/player/`, so
+when the release workflow fires (via tag-push or dispatch), the 4
+Android APK build jobs would fail and the GitHub Release structural-
+verification step would refuse to publish, blocking PRD §6A
+condition 4. This session reproduces the failure locally, diagnoses
+it precisely, ships the minimal fix, and proves the fix end-to-end
+by producing the universal APK locally.
+
+**Root causes (reproduced locally with the same toolchain as CI):**
+
+A full `cargo tauri android build --apk` run against the same
+Android SDK / NDK pin used by CI (`platforms;android-34
+build-tools;34.0.0 ndk;27.0.12077973 platform-tools`, AGP 8.11.0,
+Kotlin 1.9.25) failed in the `:tauri-plugin-kino-player:compileReleaseKotlin`
+task with two distinct Kotlin errors — both pure language-level
+issues, not gradle / AGP / Tauri-injection issues. (Hypotheses 1–5
+filed in the §6B Regressions entry are all rejected by the actual
+log; the truth is much simpler.)
+
+1. **`Capabilities.kt:209` — `'Util.isAutomotive(...)' expected` /
+   `No value passed for parameter 'p0'`.** The `preferHardwareDecoder()`
+   helper called `!Util.isAutomotive` as if `isAutomotive` were a
+   property; in Media3 1.4.x `androidx.media3.common.util.Util.isAutomotive(Context)`
+   is a *function* that takes a `Context` argument. `preferHardwareDecoder()`
+   was also dead code — declared but never called anywhere in the
+   plugin or host. Fix: deleted the helper entirely (per project
+   guideline "Don't add features beyond what the task requires").
+
+2. **`Events.kt:79..82, 97..99` — `Unresolved reference: NULL`.** The
+   `TrackListBuilder.audioTrack` / `subtitleTrack` factories used
+   `JSObject.NULL` to put an explicit JSON-null on missing optional
+   fields. `app.tauri.plugin.JSObject` extends `org.json.JSONObject`
+   which has a `public static final Object NULL` field — Java would
+   inherit the static, but Kotlin does NOT expose inherited Java
+   static fields through subclass references (ADR-117). Fix: simply
+   omit the key on `null` values. The Rust side
+   (`kino_player::tracks::{AudioTrack, SubtitleTrack}`) uses
+   `Option<T>` for `title` / `language` / `codec` / `channels`, and
+   serde defaults `Option<T>` to `None` on missing fields (verified
+   with a local cargo-run repro), so an omitted key deserializes
+   exactly the same as an explicit JSON null.
+
+**Files changed:**
+
+- `android/player-plugin/android/src/main/java/dev/kino/player/Capabilities.kt`:
+  removed the 1-line `preferHardwareDecoder()` helper. No call sites
+  to update. `Util` import retained — still referenced in the KDoc
+  for `tunneling()` and `audioPassthrough()` documentation.
+- `android/player-plugin/android/src/main/java/dev/kino/player/events/Events.kt`:
+  in `TrackListBuilder.audioTrack` and `TrackListBuilder.subtitleTrack`,
+  replaced `value?.let { put("k", it) } ?: put("k", JSObject.NULL)`
+  with `value?.let { put("k", it) }` for all four optional fields per
+  track type. Added a comment explaining why omission is safe (Rust
+  `Option<T>` + serde missing-field default).
+- `STATE.md` — this Session 026 entry; header status flipped to
+  reflect the fix; the §6B Regressions entry "CI build-android
+  failure on PR #24" annotated with **RESOLVED in Session 026** and
+  the actual root cause + fix recorded inline so the entry is a
+  closed loop. ADR-117 filed.
+
+**Features advanced:**
+
+- F-015: `[x]` (unchanged — already complete since Session 023). The
+  Kotlin code that ships in that feature now actually *compiles* on
+  the CI matrix; the runtime behavior was never in question because
+  the broken helper was dead code and the broken `JSObject.NULL`
+  emission would have produced equivalent JSON to the fix anyway.
+- F-018: `[x]` (unchanged — already complete since Session 024). The
+  release pipeline's `build-android-universal` / `build-android-per-abi`
+  jobs will now produce APK artifacts when fired. No release.yml
+  change was needed.
+
+**ADRs filed:**
+
+- **ADR-117: Kotlin does not expose inherited Java static fields
+  through subclass references; use the declaring class.** Kotlin's
+  resolver treats Java statics declared on a parent class as part of
+  that parent — `JSObject.NULL` does NOT resolve to `JSONObject.NULL`
+  even though Java inheritance would surface it. Two fixes are
+  acceptable: (a) `import org.json.JSONObject; ... JSONObject.NULL`,
+  or (b) omit the key entirely when the value is null and rely on
+  the Rust side's serde `Option<T>` missing-field handling. This
+  codebase picks (b) because the Rust contract uses `Option<T>`
+  anyway and an omitted key is bit-for-bit equivalent to a JSON
+  null for that contract. Future Kotlin code in the plugin module
+  should not reach for `JSObject.NULL` — either import JSONObject
+  explicitly or omit.
+
+**Verification:**
+
+- `cargo fmt --all --check` clean (no Rust changes; safety re-run
+  clean).
+- `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- `cargo test --workspace --all-targets` clean — 26 plugin crate
+  tests pass + full workspace test count unchanged from Session 023
+  baseline.
+- `cd frontend && npm run lint` clean.
+- `cd frontend && npm run typecheck` clean.
+- `cd frontend && npm test -- --run` → 215 / 215 pass (unchanged).
+- **`cargo tauri android build --apk` succeeds locally** with the
+  same SDK / NDK / AGP / Kotlin pins CI uses. Output:
+  `app-universal-release.apk` (61 MB) at
+  `src-tauri/gen/android/app/build/outputs/apk/universal/release/`.
+  This is the critical proof — the §6B regression is gone, not just
+  side-stepped.
+- `cargo tauri build --target x86_64-unknown-linux-gnu` NOT exercised
+  locally per Standing Authorization #3 (Kotlin-only diff cannot
+  affect the Linux bundle; `cargo clippy --workspace` already proved
+  the workspace compiles).
+
+**Post-merge action:**
+
+After PR merges to `main`:
+
+1. The CI `build-android` job will go green on the next push to
+   `main` and on every subsequent PR.
+2. The human can fire the release pipeline via `Actions → release →
+   Run workflow` with `version = 1.0.0-alpha.1` — the previously-
+   blocked Android APK jobs will now succeed, and the release job
+   will publish a GitHub Release with all 9 PRD-locked artifacts.
+3. Once that release exists, PRD §6A conditions 1–5 are all
+   satisfied; the next agent run will print `PRD COMPLETE` (Step 15
+   of the agent protocol).
+
+**Carryover / next session:**
+
+If the human fires the release workflow and it succeeds: no further
+agent session required (§6B remains the human's checklist). If a
+new build issue surfaces under the release matrix: the next session
+addresses it as a §6B-class regression.
 
 ### Session 025 — `workflow_dispatch:` trigger on `release.yml` (unblocks human-side release without a tag push)
 
@@ -6302,6 +6443,7 @@ Additional ADRs filed by sessions:
 | ADR-114 | `tauri-plugin-kino-player` registers a `SharedPlayer` (`Arc<dyn PlayerHandle>`) on every target (including non-Android desktop) via a `StubPlayer` no-op driver. Alternatives — `#[cfg(target_os = "android")]`-gate the plugin registration at the host call site, OR keep the plugin Android-only with cfg branches inside the host's state read — both bloat the host with platform branches. The uniform `tauri_plugin_kino_player::handle(app)` call signature is preserved; the stub surfaces a clearly-attributed error if a non-Android call site accidentally exercises it. Linux `spawn_platform_player` still uses `MpvPlayer::spawn()` directly. | 023 |
 | ADR-115 | F-015 Android track IDs are encoded as `(C.TRACK_TYPE shl 32) | track_index` `Long` values. Media3 doesn't surface a stable per-track id; the closest natural identifier is `(TrackGroup, trackIndex)`. Packing track-type (audio / text / video) into the high byte of a 64-bit id lets the Rust side use a single `Option<i64>` for both audio and subtitle selection without ambiguity. `applyTrackOverride` round-trips the encoding back to the matching `TrackGroup` + index. Stable across track-list refreshes because the order of `Tracks.groups` is stable within a single playback session. | 023 |
 | ADR-116 | `release.yml` accepts a `workflow_dispatch:` trigger alongside the PRD §F-018 `on: push: tags: v*` trigger. The agent cannot push tag refs through the harness Git proxy (Session 024 PRD Issues entry — HTTP 403 `ERR Unable to parse branch information from push data`); rather than chase the harness fix (out of scope) or wait on a human-side tag push, the workflow gains a `version` string input and creates the tag at the run's commit via `gh release create --target ${{ github.sha }}` whenever `github.event_name == workflow_dispatch`. Both triggers feed the same `version` → `build-*` → `release` DAG; the only per-trigger code is the `extract` step's event-name branch and the `gh release create` `--target` flag. PRD §F-018 wording ("Triggered on tag matching v*") is preserved — the new trigger is additive, not a replacement. Rejected alternatives: keep the workflow tag-only and add a "create tag via PR" mechanism (commit a tagged ref to a `.tags/` directory + a workflow that consumes it — more moving parts, leaks tag state into the file tree); rewrite the harness proxy to accept tag refs (out of this repo's scope). | 025 |
+| ADR-117 | Kotlin does not expose inherited Java static fields through subclass references. `JSObject.NULL` does NOT resolve to `JSONObject.NULL` even though `JSObject extends JSONObject` and Java would inherit the static. Two acceptable fixes: (a) `import org.json.JSONObject` and reference `JSONObject.NULL` directly, or (b) omit the key entirely on null values and rely on the Rust contract's missing-field default. This codebase picks (b) for the player plugin because the Rust `tracks` types use `Option<T>` with serde's missing-field-defaults-to-None behaviour; an omitted JSON key is bit-for-bit equivalent to a JSON null for the wire contract. Future Kotlin code in the plugin module should not reach for `JSObject.NULL` — either import `JSONObject` explicitly or omit. Documents the cause of the §6B regression filed in Session 023 and fixed in Session 026. | 026 |
 
 ---
 
@@ -6533,88 +6675,65 @@ _Filled by the human post-release._
 
 _Filed by the human when §6B items fail. Sessions address these as highest-priority scope._
 
-### CI build-android failure on PR #24 (Session 023)
+### ~~CI build-android failure on PR #24 (Session 023)~~ — RESOLVED in Session 026
 
-**Reported:** 2026-05-18 (this PR's CI run)
+**Reported:** 2026-05-18 (PR #24's CI run, Session 023)
+
+**Resolved:** 2026-05-18 (Session 026)
 
 **Symptom:** Both CI runs (`push` + `pull_request`) of PR #24 failed
 the `build-android (cargo tauri android build --apk)` job. The
-`build-linux` job passed cleanly on both runs, confirming the Rust
-side of the new `tauri-plugin-kino-player` crate compiles and links
-into the Tauri host without issue. The failure is Android-specific —
-gradle / Kotlin / Tauri Android plugin discovery for the new
-`android/player-plugin/` module.
+`build-linux` job passed cleanly on both runs.
 
-**Failed jobs:**
+**Failed jobs (pre-fix, historical):**
 
 - `actions/runs/26029669983/job/76512526211` (push)
 - `actions/runs/26029701696/job/76512662771` (pull_request)
 
-**Why merged anyway:** the standing authorization (this STATE.md
-top-of-file, §3) explicitly pre-authorizes merging once
-`lint + test` are green; `build-linux` and `build-android` are NOT
-merge gates. Build-job regressions are addressed in a follow-up
-session as a §6B-class regression — the highest-priority scope.
+**Actual root cause (reproduced locally in Session 026):** Two
+Kotlin compile errors in `:tauri-plugin-kino-player:compileReleaseKotlin`,
+both pure language-level issues — none of the five originally-
+hypothesised gradle / AGP / Tauri-injection causes were correct.
 
-**Why this matters now:** the next session (Session 024) is the
-release session per the Feature Tracker (all F-001…F-017 are `[x]`;
-F-018 closes when `v1.0.0-alpha.1` ships). The release pipeline
-(`.github/workflows/release.yml`, Session 022) also runs the same
-`cargo tauri android build --apk` step. Until this regression is
-fixed, the release pipeline will produce zero of the 4 Android APK
-artifacts and fail the PRD §F-018 "9 artifacts attach to the GitHub
-Release" structural verification step.
+1. **`Capabilities.kt:209` — `'isAutomotive(...)' expected` / `No value
+   passed for parameter 'p0'`.** `preferHardwareDecoder() = !Util.isAutomotive`
+   referenced `Util.isAutomotive` as a property; in Media3 1.4.x
+   it's a function taking a `Context`. `preferHardwareDecoder()` was
+   also dead code (no call sites). Fix: deleted the helper.
+2. **`Events.kt:79..82, 97..99` — `Unresolved reference: NULL`.** The
+   `TrackListBuilder` factories used `JSObject.NULL` to emit
+   explicit JSON null for missing optional fields. Kotlin does NOT
+   expose inherited Java statics through subclass references
+   (ADR-117) — `JSObject.NULL` does not resolve to `JSONObject.NULL`.
+   Fix: omit the key entirely on `null`; the Rust side uses
+   `Option<T>` with serde's missing-field default, so an omitted
+   key is bit-for-bit equivalent to a JSON null for the wire
+   contract.
 
-**Hypothesised root causes (must be confirmed via CI logs):**
+**Fix verification (Session 026):** Full `cargo tauri android build
+--apk` succeeded locally against the exact SDK / NDK / AGP / Kotlin
+pins CI uses, producing the universal APK at
+`src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk`
+(61 MB).
 
-1. **`@TauriPlugin` annotation processor missing on the plugin
-   module's gradle classpath.** Tauri 2 plugins typically need
-   `kotlin-kapt` (or KSP) so the `@TauriPlugin` / `@Command` /
-   `@InvokeArg` annotations are processed at build time. The new
-   `android/player-plugin/android/build.gradle.kts` declares only
-   `id("com.android.library")` + `id("org.jetbrains.kotlin.android")`
-   — no kapt. If Tauri's Kotlin runtime processes the annotations
-   at runtime via reflection, kapt isn't needed; if it relies on a
-   build-time code generator, kapt is. Verify by reading the
-   gradle logs for `Symbol not found: app.tauri.annotation.*` or
-   similar.
-2. **Tauri CLI auto-injection of `:tauri-android` dependency name
-   mismatch.** The plugin's `build.gradle.kts` references
-   `project(":tauri-android")`. If the Tauri CLI injects the project
-   under a different gradle name, that line errors. Check
-   `src-tauri/gen/android/tauri.settings.gradle` (auto-generated by
-   the CLI) on the failing run for the actual project name.
-3. **Media3 1.4.1 vs `compileSdk 34` incompatibility.** The Media3
-   1.4.1 release notes list `compileSdk 34` as supported but some
-   transitive androidx pulls may demand 35. Plain
-   `androidx.media3:media3-exoplayer:1.4.1` should be fine; if
-   not, downgrade to 1.4.0 or drop one of the optional artifacts
-   (session / extractor / decoder) to narrow the dep graph.
-4. **AGP 8.11 manifest merger conflict.** The plugin's
-   `AndroidManifest.xml` declares `<activity android:name="..."
-   android:theme="@style/Theme.KinoPlayer" .../>` and re-declares
-   `<application>` (empty attribute set). On AGP 8+ the empty
-   `<application>` can conflict with the host's `<application>` if
-   the merger interprets it as "override host attributes to
-   defaults". Solution: remove the `<application>` wrapper and rely
-   on the manifest merger placing the `<activity>` under the host's
-   `<application>` automatically — OR add
-   `tools:replace="..."` attributes.
-5. **`buildSrc` rust plugin assumes universal flavor on the app
-   module only.** The host's
-   `src-tauri/gen/android/buildSrc/.../RustPlugin.kt` configures
-   `flavorDimensions += "abi"` + `productFlavors` on the
-   `ApplicationExtension`. The plugin module is a library
-   (`LibraryExtension`); if the rust plugin auto-applies to all
-   sub-projects, it'll error on the library. Verify the plugin is
-   `apply false` for library modules in the auto-generated
-   `tauri.build.gradle.kts`.
+**Originally-hypothesised root causes (all rejected by the actual
+log; kept here as a record of how to NOT triage Android Kotlin
+compile failures next time):**
 
-**Action for Session 024:** read the actual `build-android` logs
-from the GitHub UI (the user can paste them in, or the next
-session's agent can use the `gh` CLI / GitHub UI to retrieve them),
-diagnose precisely, and ship the fix. THEN run the release session
-per the protocol Step 14 State B.
+1. ~~`@TauriPlugin` annotation processor missing.~~ The annotations
+   are runtime-retained; no kapt / KSP is needed.
+2. ~~Tauri CLI auto-injection of `:tauri-android` dependency name
+   mismatch.~~ The CLI injects under that exact name; the
+   `project(":tauri-android")` reference resolves cleanly.
+3. ~~Media3 1.4.1 vs `compileSdk 34` incompatibility.~~ Media3 1.4.1
+   compiles fine against `compileSdk 34`.
+4. ~~AGP 8.11 manifest merger conflict on the library's
+   `<application>` wrapper.~~ AGP merges cleanly; no `tools:replace`
+   is needed.
+5. ~~`buildSrc` rust plugin auto-applies to library modules.~~ The
+   `id("rust")` plugin is only applied to the app module via
+   `src-tauri/gen/android/app/build.gradle.kts`; library modules
+   are unaffected.
 
 ---
 
