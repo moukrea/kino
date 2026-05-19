@@ -4,32 +4,35 @@
 **Target upstream:** `ikatson/rqbit` (Apache-2.0).
 **librqbit version surveyed:** `8.1.1` (Cargo.lock pin; latest on crates.io
 as of 2026-05-19).
-**Filed by:** kino agent Session 039 (Path B option (i) per the Session 038
-plan).
+**Filed by:** kino agent Session 039 (PR A + PR B framing); Sub-PR B1
+expanded to ready-to-submit in Session 040; Sub-PR B2 expanded to
+ready-to-submit in Session 041.
 
-This document drafts two upstream changes that, if accepted by the rqbit
+This document drafts three upstream changes that, if accepted by the rqbit
 maintainer, would close the two §6A code-acceptance regressions kino's
 PRD Issues entry tracks for F-013 ("max connections per torrent: 200")
 and F-014 ("piece priorities mapped to librqbit ..."). The drafts are
 written so that the human can copy each PR description verbatim into a
 GitHub PR; the diffs are anchored to real lines in librqbit 8.1.1's
 on-disk source tree as cross-checked from
-`~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/librqbit-8.1.1/`.
+`~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/librqbit-8.1.1/`
+(or, in fresh containers where the registry cache is empty, against the
+tarball at
+`https://static.crates.io/crates/librqbit/librqbit-8.1.1.crate`).
 
 Until upstream lands, kino's §6A entries stay OPEN. Once upstream
 publishes a release containing **PR A** (the smaller change), the
 follow-up kino session bumps `librqbit` in `Cargo.toml`, wires the
 new field through `kino_torrent::engine`, and flips the F-013 §6A
 entry to RESOLVED. **PR B** is split into two independently-mergeable
-sub-PRs: **PR B1** (per-stream lookahead, drafted fully in this doc)
-and **PR B2** (per-piece priority enum + tiered scheduler walk,
-drafted as a design proposal). Wiring B1 honors PRD §F-014's HIGHEST
-window approximately (lookahead sized to 60s of file bitrate); B2
-adds the HIGH window and last-piece-HIGH special-case. If upstream
-rejects or stalls either of B1/B2, the PRD Issues entry's
-**option (d)** (PRD revision relaxing the language to "best-effort,
-subject to engine API capabilities") remains the §6A clearance
-lever.
+sub-PRs: **PR B1** (per-stream lookahead, drafted fully) and **PR B2**
+(per-piece priority enum + tiered scheduler walk, also drafted fully
+as of Session 041). Wiring B1 honors PRD §F-014's HIGHEST window
+approximately (lookahead sized to 60s of file bitrate); B2 adds the
+explicit HIGH window and the last-piece-HIGH special case. If upstream
+rejects or stalls any of A/B1/B2, the PRD Issues entry's **option (d)**
+(PRD revision relaxing the language to "best-effort, subject to engine
+API capabilities") remains the §6A clearance lever.
 
 ---
 
@@ -413,10 +416,13 @@ mechanisms in librqbit:
 
 3. **HIGH window `[pos+60s, pos+300s]`** — there is no existing
    mechanism for tiered "after-lookahead" pre-fetching. Adding one
-   requires either a new piece-priority enum (HIGHEST / HIGH /
-   NORMAL / DONT_DOWNLOAD) with per-piece priority storage and a
-   tiered scheduler walk, OR a second lookahead window with a
-   weaker scheduling preference. Both are bigger changes than PR A.
+   requires a new piece-priority enum (HIGHEST / HIGH / NORMAL /
+   DONT_DOWNLOAD) with per-piece priority storage and a tiered
+   scheduler walk. This is structurally larger than B1 because it
+   touches both the schedule-walk in `chunk_tracker` and the
+   in-flight reservation in `torrent_state/live`, and it adds two new
+   public surface elements (the enum + the setter method on
+   `ManagedTorrent`).
 
 PR B is therefore drafted as **two independently-mergeable sub-PRs**:
 
@@ -794,55 +800,888 @@ priority enum + tiered scheduler walk sketch.
 
 ### Sub-PR B2: piece-priority enum + tiered scheduler walk
 
-The substantive change. Requires:
+**Title:** `feat(streaming): per-piece priority API for tiered scheduler walk`
 
-1. New `pub enum PiecePriority { Highest, High, Normal, DontDownload }`
-   in `librqbit/src/lib.rs` (or a sibling module).
-2. Per-piece priority storage. Either: (a) a parallel
-   `BitVec`-of-2-bits (~8MB for a 1 TiB torrent at 256 KiB pieces —
-   fine), or (b) a `HashMap<ValidPieceIndex, PiecePriority>` keyed on
-   non-Normal entries only (sparse). Option (b) is recommended for
-   memory pressure.
-3. Public API on `ManagedTorrent`:
-   ```rust
-   pub fn set_piece_priorities(
-       &self,
-       file_id: usize,
-       ranges: impl IntoIterator<Item = (Range<usize>, PiecePriority)>,
-   ) -> anyhow::Result<()>;
-   ```
-   The `Range<usize>` is over piece indices within the file (which
-   `librqbit::file_info::FileInfo::piece_range` already exposes as a
-   `pub` field).
-4. Scheduler integration in `chunk_tracker::iter_queued_pieces`
-   (lines 216-229): walk HIGHEST → HIGH → NORMAL, intersected with
-   the existing `file_priorities` order. The existing
-   `iter_next_pieces` (streaming) should be invoked BEFORE the
-   tiered walk so streams' HIGHEST windows are honored first.
-5. The last-piece-HIGH convenience could be a method on
-   `FileStream` that calls `set_piece_priorities` with the file's
-   final piece index marked HIGH (or a constructor flag on
-   `stream_with_lookahead` for the common case).
+**Summary:** Adds a public `PiecePriority` enum
+(`Highest` / `High` / `Normal` / `DontDownload`) and a setter method
+`ManagedTorrent::set_piece_priorities(file_id, ranges)` so external
+callers can override the scheduler's piece selection on a per-piece
+basis. The reservation loop in `TorrentStateLive::reserve_next_needed_piece`
+gains two new walk tiers (HIGHEST then HIGH) inserted between the
+existing per-stream lookahead (`TorrentStreams::iter_next_pieces`) and
+the natural file-priority walk (`ChunkTracker::iter_queued_pieces`).
+`DontDownload`-marked pieces are filtered out of all three walks so
+they're never reserved, even if an active stream's lookahead happens to
+cover them. The new state lives in a sibling `Arc<TorrentPiecePriorities>`
+field on `TorrentStateLive` and `TorrentStatePaused`, parallel to the
+existing `Arc<TorrentStreams>` — created once per torrent in
+`TorrentStateInitializing::check()` and preserved across pause/resume
+cycles via the same Arc-clone mechanism `streams` already uses.
 
-**Why this is structurally bigger than PR A:** the scheduler walk
-in `chunk_tracker::iter_queued_pieces` interacts with the existing
-endgame mode, the bitfield queueing logic
-(`mark_piece_broken_if_not_have`), and the streams' wake-on-completed
-flow (`TorrentStreams::wake_streams_on_piece_completed`). A correctness
-review would want test coverage proving:
+**Why:** PRD §F-014 (the kino streaming client's locked design)
+specifies a four-tier piece-priority model that maps onto librqbit's
+existing scheduler thus:
 
-- A piece marked DontDownload is never queued, even if streams
-  request it.
-- Switching a piece from Normal → Highest mid-download wakes the
-  scheduler (no missed piece-event).
-- The endgame mode (when ≤ N pieces remain) still uses redundant
-  fetching across peers regardless of priority.
-- Priorities survive pause/resume cycles
-  (`TorrentStateLive::pause` / restart from `TorrentStatePaused`).
+| PRD tier | librqbit mechanism |
+|---|---|
+| HIGHEST (`[pos, pos+60s]`) | Existing stream lookahead (`PER_STREAM_BUF_DEFAULT`, configurable after PR B1) |
+| **HIGH (`[pos+60s, pos+300s]`)** | **No existing mechanism — PR B2 adds it** |
+| **HIGH (last piece of active file)** | **No existing mechanism — PR B2 adds it** |
+| NORMAL (everything else) | Existing file-priority walk (`iter_queued_pieces`) |
 
-Sub-PR B2 is therefore drafted here as a **design proposal**, not a
-full diff. A separate agent session (or the human directly) can
-land the full implementation once the design is accepted upstream.
+The HIGHEST tier is already handled by the per-stream lookahead window
+(B1 makes it configurable per file). The HIGH tier — pieces just
+beyond the lookahead window, which the player will want next but
+isn't actively reading — needs an explicit priority annotation
+because the scheduler's "natural order" walks file-by-file then
+piece-by-piece, with no notion of "second-tier priority".
+
+The same enum's `DontDownload` variant is independently useful for
+"skip this episode" / "don't download disc 2" UI affordances —
+downstream callers can mark whole files as DontDownload without
+having to use `update_only_files` (which atomically rewrites the
+selected set and is heavier than a per-piece annotation).
+
+`Last-piece-HIGH` (the `.mp4` `moov`-atom case) is left to the
+caller: they call `set_piece_priorities(file_id, [(file_pieces - 1
+..file_pieces, High)])` once at stream open. No new convenience
+method is added in this PR; if usage shows the call site duplicating
+the same boilerplate, a follow-up PR can add a thin wrapper.
+
+**Surface area:**
+- One new public enum (`PiecePriority`) in a new module
+  `librqbit/src/torrent_state/piece_priorities.rs`, re-exported from
+  `librqbit/src/lib.rs`.
+- One new crate-internal struct (`TorrentPiecePriorities`) in the same
+  module, with `Default` + four `pub(crate)` methods.
+- One new field on each of `TorrentStateLive` and `TorrentStatePaused`
+  (sibling to the existing `streams: Arc<TorrentStreams>` field).
+- One new public method on `ManagedTorrent` (`set_piece_priorities`)
+  and one read-back accessor (`piece_priorities`).
+- One updated method body on `TorrentStateLive::reserve_next_needed_piece`
+  (lines 1227-1276) — two new tier walks chained into the existing
+  for-loop's `priority_streamed_pieces.chain(natural_order_pieces)`.
+- Zero behavior change for callers that never call `set_piece_priorities`:
+  the default `TorrentPiecePriorities` is empty, all tier walks yield
+  nothing, the DontDownload filter degrades to a constant `true`.
+
+### Files changed
+
+#### 1. `librqbit/src/torrent_state/piece_priorities.rs` (NEW)
+
+New module hosting the `PiecePriority` enum and the
+`TorrentPiecePriorities` storage. The module is created here because
+the storage shape (per-piece map, keyed by `ValidPieceIndex`, only
+touched in the scheduler and the public setter) doesn't naturally fit
+in any existing file: it's not stream state (lives in `streaming.rs`),
+not chunk-level state (lives in `chunk_tracker.rs`), not session-wide
+config (lives in `session.rs`). The module is ~120 LOC; placing it as
+a sibling to `streaming.rs` keeps the `torrent_state/` directory's
+"one concern per file" layout intact.
+
+```rust
+//! Per-piece priority storage for the scheduler tiered walk.
+//!
+//! This module backs [`ManagedTorrent::set_piece_priorities`] and is
+//! consulted by [`crate::torrent_state::live::TorrentStateLive::reserve_next_needed_piece`]
+//! between the per-stream lookahead walk and the natural file-priority
+//! walk. The storage is sparse: only non-`Normal` entries are kept, so a
+//! torrent that never calls `set_piece_priorities` pays zero memory cost.
+//!
+//! The struct is preserved across pause/resume cycles via the same
+//! `Arc`-clone path as [`crate::torrent_state::streaming::TorrentStreams`]:
+//! it is created once per torrent during initialization and lives on
+//! both [`crate::torrent_state::live::TorrentStateLive`] and
+//! [`crate::torrent_state::paused::TorrentStatePaused`].
+
+use std::collections::HashMap;
+
+use librqbit_core::lengths::ValidPieceIndex;
+use parking_lot::RwLock;
+
+/// Per-piece scheduling priority override.
+///
+/// Set via [`crate::ManagedTorrent::set_piece_priorities`]. Pieces
+/// without an explicit annotation are treated as [`PiecePriority::Normal`]
+/// (the default).
+///
+/// # Tier ordering
+///
+/// The scheduler walks tiers in this order on every peer's next-piece
+/// request: per-stream lookahead → `Highest` → `High` → `Normal`. A
+/// piece marked `DontDownload` is filtered out of all four walks and is
+/// never reserved, even if an active stream's lookahead window happens
+/// to cover it.
+///
+/// # When to use each tier
+///
+/// - `Highest`: when the caller knows the piece is needed immediately
+///   AND is NOT covered by an active stream (use the stream's lookahead
+///   for that — it has identical priority effect and is cheaper).
+/// - `High`: when the piece is needed soon but not immediately
+///   (e.g. PRD §F-014's `[pos+60s, pos+300s]` HIGH window for kino's
+///   adaptive buffer, or the last piece of an `.mp4` file whose `moov`
+///   atom lives at the end).
+/// - `Normal`: the implicit default — no annotation needed, but the
+///   variant exists so callers can explicitly UN-set a previous
+///   `Highest`/`High`/`DontDownload` annotation.
+/// - `DontDownload`: when the caller wants the scheduler to skip the
+///   piece entirely. Useful for "skip episode" / "skip bonus disc" UI
+///   without going through `update_only_files`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PiecePriority {
+    /// Walk before `High` and `Normal`. See type-level docs.
+    Highest,
+    /// Walk before `Normal`. See type-level docs.
+    High,
+    /// The implicit default. See type-level docs.
+    #[default]
+    Normal,
+    /// Skip entirely. See type-level docs.
+    DontDownload,
+}
+
+/// Sparse per-piece priority store used by the scheduler.
+///
+/// Pieces not present in the inner map are treated as
+/// [`PiecePriority::Normal`]; the empty map (the default state) thus
+/// represents "no priorities set" without any allocation.
+#[derive(Default)]
+pub(crate) struct TorrentPiecePriorities {
+    /// Sparse map: only non-`Normal` entries stored. Pieces tagged
+    /// `Normal` are removed from the map by [`Self::set_many`].
+    inner: RwLock<HashMap<ValidPieceIndex, PiecePriority>>,
+}
+
+impl TorrentPiecePriorities {
+    /// Read the current priority for a single piece. Returns
+    /// [`PiecePriority::Normal`] if the piece has no explicit
+    /// annotation.
+    pub(crate) fn get(&self, idx: ValidPieceIndex) -> PiecePriority {
+        self.inner.read().get(&idx).copied().unwrap_or_default()
+    }
+
+    /// Apply a batch of (piece, priority) updates. Setting a piece to
+    /// `Normal` removes it from the sparse map. The batch is applied
+    /// under a single write lock so concurrent readers see a consistent
+    /// view.
+    pub(crate) fn set_many(
+        &self,
+        updates: impl IntoIterator<Item = (ValidPieceIndex, PiecePriority)>,
+    ) {
+        let mut g = self.inner.write();
+        for (idx, prio) in updates {
+            match prio {
+                PiecePriority::Normal => {
+                    g.remove(&idx);
+                }
+                _ => {
+                    g.insert(idx, prio);
+                }
+            }
+        }
+    }
+
+    /// Return the set of pieces currently marked at the given tier.
+    /// Returns a `Vec` rather than a borrowed iterator so the caller
+    /// can drop the read lock before iterating (the scheduler holds
+    /// other locks while iterating, and re-acquiring this lock per item
+    /// would be wasteful).
+    pub(crate) fn iter_tier(&self, tier: PiecePriority) -> Vec<ValidPieceIndex> {
+        let g = self.inner.read();
+        g.iter()
+            .filter(|(_, p)| **p == tier)
+            .map(|(idx, _)| *idx)
+            .collect()
+    }
+
+    /// Snapshot of the current sparse map. Used by
+    /// [`crate::ManagedTorrent::piece_priorities`] for external
+    /// introspection (debug tools, future `Api` JSON shape).
+    pub(crate) fn snapshot(&self) -> HashMap<ValidPieceIndex, PiecePriority> {
+        self.inner.read().clone()
+    }
+}
+```
+
+#### 2. `librqbit/src/torrent_state/mod.rs` (lines 1-30 — module list)
+
+Declare the new module alongside the existing siblings.
+
+```diff
+ mod initializing;
+ pub mod live;
+ mod paused;
+ pub(crate) mod stats;
+ pub(crate) mod streaming;
++pub(crate) mod piece_priorities;
+ pub(crate) mod utils;
+```
+
+(Adjust to match the exact line numbers in the file; the module-list
+block is at the top of `torrent_state/mod.rs` and the existing module
+declarations follow this style.)
+
+#### 3. `librqbit/src/lib.rs` (lines 87-91 — re-exports)
+
+Re-export `PiecePriority` from the crate root so external callers can
+write `librqbit::PiecePriority` without reaching into the
+`torrent_state::piece_priorities` internal path.
+
+```diff
+ pub use torrent_state::{
+     ManagedTorrent, ManagedTorrentShared, ManagedTorrentState, TorrentMetadata, TorrentStats,
+     TorrentStatsState,
++    piece_priorities::PiecePriority,
+ };
+ pub use type_aliases::FileInfos;
+```
+
+`TorrentPiecePriorities` itself is NOT re-exported — it's a
+`pub(crate)` storage detail, accessed externally only via
+`ManagedTorrent::set_piece_priorities` and
+`ManagedTorrent::piece_priorities`.
+
+#### 4. `librqbit/src/torrent_state/live/mod.rs` (lines 176-212 — `TorrentStateLive` struct)
+
+Add the `piece_priorities` field as a sibling to the existing
+`streams: Arc<TorrentStreams>` field. Same Arc shape so pause/resume
+clones the inner state through naturally.
+
+```diff
+ pub struct TorrentStateLive {
+     peers: PeerStates,
+     shared: Arc<ManagedTorrentShared>,
+     metadata: Arc<TorrentMetadata>,
+     locked: RwLock<TorrentStateLocked>,
+     // … existing fields elided …
+
+     pub(crate) streams: Arc<TorrentStreams>,
++    /// Per-piece priority overrides. Consulted by
++    /// [`Self::reserve_next_needed_piece`] between the per-stream
++    /// lookahead walk and the natural file-priority walk. Preserved
++    /// across pause/resume via the same Arc-clone path as `streams`.
++    pub(crate) piece_priorities: Arc<TorrentPiecePriorities>,
+     have_broadcast_tx: tokio::sync::broadcast::Sender<ValidPieceIndex>,
+     // … remaining existing fields elided …
+ }
+```
+
+And in `TorrentStateLive::new()` (lines 214-300), thread the
+`piece_priorities` field through the `Arc::new(TorrentStateLive { ... })`
+literal, taking the Arc from the paused side:
+
+```diff
+ let state = Arc::new(TorrentStateLive {
+     shared: paused.shared.clone(),
+     metadata: paused.metadata.clone(),
+     // … existing peers / locked literals elided …
++    piece_priorities: paused.piece_priorities.clone(),
+     streams: paused.streams.clone(),
+     // … remaining existing fields elided …
+ });
+```
+
+And update `TorrentStateLive::pause()` (lines 701-725) so the
+priorities Arc rides along into the paused state:
+
+```diff
+ Ok(TorrentStatePaused {
+     shared: self.shared.clone(),
+     metadata: self.metadata.clone(),
+     files: self.files.take()?,
+     chunk_tracker,
+     streams: self.streams.clone(),
++    piece_priorities: self.piece_priorities.clone(),
+ })
+```
+
+(Imports: add `use crate::torrent_state::piece_priorities::TorrentPiecePriorities;`
+to the top of `live/mod.rs`; the `Arc` import is already present.)
+
+#### 5. `librqbit/src/torrent_state/paused.rs` (lines 8-20 — `TorrentStatePaused` struct)
+
+Mirror the same field on the paused side.
+
+```diff
+ use super::{streaming::TorrentStreams, ManagedTorrentShared, TorrentMetadata};
++use super::piece_priorities::TorrentPiecePriorities;
+
+ pub(crate) struct TorrentStatePaused {
+     pub(crate) shared: Arc<ManagedTorrentShared>,
+     pub(crate) metadata: Arc<TorrentMetadata>,
+     pub(crate) files: Box<dyn TorrentStorage>,
+     pub(crate) chunk_tracker: ChunkTracker,
+     pub(crate) streams: Arc<TorrentStreams>,
++    /// Per-piece priority overrides. See [`TorrentPiecePriorities`].
++    /// Created once per torrent in
++    /// [`crate::torrent_state::initializing::TorrentStateInitializing::check`]
++    /// and shared with `TorrentStateLive` via Arc-clone on resume.
++    pub(crate) piece_priorities: Arc<TorrentPiecePriorities>,
+ }
+```
+
+(Adjust import paths to match the file's existing style — the
+`use super::...` line is at the top of the file; the Arc import
+already exists since the struct already holds `Arc<TorrentStreams>`.)
+
+#### 6. `librqbit/src/torrent_state/initializing.rs` (lines 272-280 — `TorrentStatePaused` construction)
+
+Initialize the new Arc once per torrent here, mirroring the
+`streams: Arc::new(Default::default())` pattern already in place.
+
+```diff
+ let paused = TorrentStatePaused {
+     shared: self.shared.clone(),
+     metadata: self.metadata.clone(),
+     files: self.files.take()?,
+     chunk_tracker,
+     streams: Arc::new(Default::default()),
++    piece_priorities: Arc::new(Default::default()),
+ };
+```
+
+(Import: add `use super::piece_priorities::TorrentPiecePriorities;` if
+the type's Default impl is the only thing referenced — the Arc and
+`Default::default()` calls don't need a direct type reference, so the
+import is only needed if rustc's type inference flags ambiguity. In
+practice the existing `Arc::new(Default::default())` for `streams`
+works without an explicit `TorrentStreams` import in this file because
+the field's type is fixed on `TorrentStatePaused`; the same applies
+here.)
+
+#### 7. `librqbit/src/torrent_state/live/mod.rs` (lines 1227-1276 — `reserve_next_needed_piece`)
+
+The substantive scheduler change. Two new tier walks (HIGHEST and HIGH)
+chained between the existing per-stream lookahead walk and the natural
+file-priority walk. DontDownload filter applied to all three pre-existing
+walk surfaces.
+
+```diff
+ fn reserve_next_needed_piece(&self) -> anyhow::Result<Option<ValidPieceIndex>> {
+     // TODO: locking one inside the other in different order results in deadlocks.
+     self.state
+         .peers
+         .with_live_mut(self.addr, "reserve_next_needed_piece", |live| {
+             if self.locked.read().i_am_choked {
+                 debug!("we are choked, can't reserve next piece");
+                 return Ok(None);
+             }
+             let mut g = self.state.lock_write("reserve_next_needed_piece");
+
+             let n = {
+                 let mut n_opt = None;
+                 let bf = &live.bitfield;
+                 let chunk_tracker = g.get_chunks()?;
++                let prio = &self.state.piece_priorities;
+                 let priority_streamed_pieces = self
+                     .state
+                     .streams
+                     .iter_next_pieces(&self.state.lengths)
+                     .filter(|pid| {
+                         !chunk_tracker.is_piece_have(*pid)
+                             && !g.inflight_pieces.contains_key(pid)
++                            && prio.get(*pid) != PiecePriority::DontDownload
+                     });
++                // NEW: explicit HIGHEST tier from `set_piece_priorities`. Walked
++                // after the per-stream lookahead because streams already imply
++                // HIGHEST for their active windows; callers that need HIGHEST
++                // outside a stream context (e.g. a "download this file fast"
++                // tool) reach the same effect through this tier.
++                let highest_tier = prio
++                    .iter_tier(PiecePriority::Highest)
++                    .into_iter()
++                    .filter(|pid| {
++                        !chunk_tracker.is_piece_have(*pid)
++                            && !g.inflight_pieces.contains_key(pid)
++                    });
++                // NEW: explicit HIGH tier — PRD §F-014's `[pos+60s, pos+300s]`
++                // and last-piece-HIGH map onto this tier. Walked before the
++                // natural file-priority order so these pieces are picked up
++                // earlier than they otherwise would be.
++                let high_tier = prio
++                    .iter_tier(PiecePriority::High)
++                    .into_iter()
++                    .filter(|pid| {
++                        !chunk_tracker.is_piece_have(*pid)
++                            && !g.inflight_pieces.contains_key(pid)
++                    });
+                 let natural_order_pieces = chunk_tracker
+-                    .iter_queued_pieces(&g.file_priorities, &self.state.metadata.file_infos);
++                    .iter_queued_pieces(&g.file_priorities, &self.state.metadata.file_infos)
++                    .filter(|pid| {
++                        // DontDownload is a hard skip; Highest/High pieces have
++                        // already been yielded in the dedicated tier walks above
++                        // (the inner loop breaks on first match, but filtering
++                        // here keeps the walk cheap when no HIGHEST/HIGH match
++                        // exists on this peer).
++                        let p = prio.get(*pid);
++                        p != PiecePriority::DontDownload
++                            && p != PiecePriority::Highest
++                            && p != PiecePriority::High
++                    });
+-                for n in priority_streamed_pieces.chain(natural_order_pieces) {
++                for n in priority_streamed_pieces
++                    .chain(highest_tier)
++                    .chain(high_tier)
++                    .chain(natural_order_pieces)
++                {
+                     if bf.get(n.get() as usize).map(|v| *v) == Some(true) {
+                         n_opt = Some(n);
+                         break;
+                     }
+                 }
+
+                 match n_opt {
+                     Some(n_opt) => n_opt,
+                     None => return Ok(None),
+                 }
+             };
+             // … remainder of the function unchanged (inflight insert +
+             // reserve_needed_piece call + Ok(Some(n))) …
+         })
+         .transpose()
+         .map(|r| r.flatten())
+ }
+```
+
+(Imports: add `use crate::torrent_state::piece_priorities::PiecePriority;`
+to the top of `live/mod.rs`; the function lives in the same file so a
+single use-statement suffices for both the field reference in
+`TorrentStateLive` and the enum reference in the walk.)
+
+**Endgame interaction:** the endgame mode kicks in when very few
+pieces remain (the existing `try_steal_old_slow_piece` flow at lines
+1278-1320). Endgame relies on `inflight_pieces` membership to identify
+candidates to steal; the tier walks above only INSERT into
+`inflight_pieces` (via `reserve_needed_piece`), they never read it for
+endgame purposes. So endgame is structurally unaffected: a piece
+that's marked HIGHEST and reserved by peer A can still be stolen by
+peer B if A is too slow, regardless of priority annotation.
+
+**Wake-on-mutation flow:** see file 9 below.
+
+#### 8. `librqbit/src/torrent_state/mod.rs` (lines 203-300 — `ManagedTorrent` impl, public API surface)
+
+Add the two new public methods to `ManagedTorrent`. Both reach into
+the current `state` to find the live-or-paused `piece_priorities` Arc
+and either mutate it (setter) or snapshot it (getter).
+
+```diff
+ impl ManagedTorrent {
+     pub fn id(&self) -> TorrentId {
+         self.shared.id
+     }
+     // … other existing methods elided …
+
++    /// Set per-piece scheduling priorities for the given file.
++    ///
++    /// The `ranges` argument carries `(file_piece_range, priority)`
++    /// pairs where `file_piece_range` is over piece indices relative
++    /// to the file's start (NOT torrent-absolute piece indices). The
++    /// method translates these to absolute [`ValidPieceIndex`] values
++    /// via the file's `piece_range` from [`crate::file_info::FileInfo`]
++    /// before applying them to the sparse storage.
++    ///
++    /// The scheduler picks pieces in this tier order: per-stream
++    /// lookahead → `Highest` → `High` → `Normal`. `DontDownload`-marked
++    /// pieces are never reserved, even if an active stream's lookahead
++    /// window covers them.
++    ///
++    /// Setting a piece to [`PiecePriority::Normal`] removes any
++    /// previous explicit annotation (the storage is sparse — `Normal`
++    /// is the implicit default).
++    ///
++    /// # Errors
++    ///
++    /// Returns an error if the torrent's metadata is not yet resolved
++    /// (magnet links pre-info-fetch), if `file_id` is out of range, or
++    /// if any of the supplied ranges falls outside the file's piece
++    /// range.
++    pub fn set_piece_priorities(
++        &self,
++        file_id: usize,
++        ranges: impl IntoIterator<Item = (std::ops::Range<usize>, crate::PiecePriority)>,
++    ) -> anyhow::Result<()> {
++        let metadata = self
++            .metadata
++            .load_full()
++            .context("torrent metadata is not resolved")?;
++        let file_info = metadata
++            .file_infos
++            .get(file_id)
++            .with_context(|| format!("file_id {file_id} out of range"))?;
++        let file_piece_range = file_info.piece_range_usize();
++
++        let priorities_arc = self.with_state(|s| match s {
++            ManagedTorrentState::Live(l) => Ok(l.piece_priorities.clone()),
++            ManagedTorrentState::Paused(p) => Ok(p.piece_priorities.clone()),
++            ManagedTorrentState::Initializing(_) => {
++                bail!("torrent is still initializing; piece priorities cannot be set yet")
++            }
++            ManagedTorrentState::Error(_) => {
++                bail!("torrent is in error state")
++            }
++            ManagedTorrentState::None => bail!("bug: torrent is in empty state"),
++        })?;
++
++        let translated: Vec<(ValidPieceIndex, crate::PiecePriority)> = ranges
++            .into_iter()
++            .flat_map(|(r, prio)| {
++                r.map(move |file_local_piece_id| {
++                    let absolute = file_piece_range.start + file_local_piece_id;
++                    (absolute, prio)
++                })
++            })
++            .filter_map(|(absolute, prio)| {
++                metadata
++                    .lengths
++                    .validate_piece_index(absolute as u32)
++                    .map(|valid| (valid, prio))
++            })
++            .collect();
++
++        priorities_arc.set_many(translated);
++
++        // Wake parked peers so they re-check the queue immediately. The
++        // notify is a no-op if no peers are currently parked.
++        if let Some(live) = self.live() {
++            live.new_pieces_notify.notify_waiters();
++        }
++
++        Ok(())
++    }
++
++    /// Snapshot the current per-piece priority map. Returns an empty
++    /// map if the torrent is not yet initialized or no priorities have
++    /// been set. Useful for debug tools and the `Api` JSON surface.
++    pub fn piece_priorities(
++        &self,
++    ) -> std::collections::HashMap<
++        librqbit_core::lengths::ValidPieceIndex,
++        crate::PiecePriority,
++    > {
++        self.with_state(|s| match s {
++            ManagedTorrentState::Live(l) => l.piece_priorities.snapshot(),
++            ManagedTorrentState::Paused(p) => p.piece_priorities.snapshot(),
++            _ => Default::default(),
++        })
++    }
+ }
+```
+
+(Imports: add `use librqbit_core::lengths::ValidPieceIndex;` and
+`use anyhow::{bail, Context};` to the existing import block in
+`torrent_state/mod.rs` if not already present. `anyhow::Context` is
+already in use in this file via `with_metadata`; `bail!` is the
+macro form.)
+
+#### 9. Wake-on-mutation: `notify_waiters()` semantics
+
+The existing field `new_pieces_notify: tokio::sync::Notify` on
+`TorrentStateLive` (line 196) is the wake channel parked peers wait on
+when they have no piece to download (see the existing call sites at
+lines 1139 and 1791). Calling `notify_waiters()` after a
+priority update wakes ALL parked peers; each one re-runs
+`reserve_next_needed_piece`, which now sees the new tier annotations.
+
+This is the same notify mechanism used by:
+- `mark_piece_downloaded` (line 1139 — when a piece completes, parked
+  peers should re-check in case the next piece is now available)
+- `update_only_files`'s downstream effects (line 1791 — when the
+  selected file set changes, parked peers should re-check)
+
+Adding `set_piece_priorities` as a third notify caller is consistent
+with the existing pattern. No new field, no new channel, no new lock.
+
+### Tests
+
+Three `#[tokio::test(flavor = "multi_thread")]` test stubs added to
+`librqbit/src/tests/e2e_stream.rs`, following the existing
+`e2e_stream()` helper's fixture pattern (dual-session
+seeder→leecher + temp-dir random-content torrent + `wait_until_completed`
+timeout). Each stub asserts a distinct property of the priority API:
+
+```rust
+// Append to librqbit/src/tests/e2e_stream.rs after the existing
+// `test_e2e_stream()` function.
+
+use crate::PiecePriority;
+use std::time::Duration;
+
+/// Helper: spin up a seeder→leecher pair just like `e2e_stream()` but
+/// expose the client's `Arc<ManagedTorrent>` to the caller so they can
+/// poke `set_piece_priorities` mid-download.
+///
+/// Returns once the leecher torrent has finished initializing (chunk
+/// tracker built, piece bitfield empty). The caller is responsible for
+/// waiting for completion via the returned handle.
+async fn e2e_with_priorities<F>(
+    file_count: usize,
+    file_size: usize,
+    inspect: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(
+            std::sync::Arc<crate::ManagedTorrent>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>,
+        > + Send,
+{
+    // TODO: factor out the dual-session fixture currently inlined in
+    // `e2e_stream()` (lines 16-105). The helper should yield the
+    // `client_handle: Arc<ManagedTorrent>` after `wait_until_initialized`
+    // so the caller's `inspect` closure runs against a live torrent
+    // with no pieces downloaded yet. Once factored, this body becomes
+    // ~15 lines of setup + `inspect(client_handle).await?` +
+    // `client_handle.wait_until_completed().await?`.
+    todo!("extract fixture from existing e2e_stream() body");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_piece_priorities_highest_pieces_selected_first() -> anyhow::Result<()> {
+    use tokio::time::timeout;
+    // 4 files × 32 KiB each; the torrent has ~128 pieces at the
+    // 1024-byte piece_length the existing fixture uses.
+    timeout(Duration::from_secs(15), e2e_with_priorities(4, 32 * 1024, |handle| {
+        Box::pin(async move {
+            // Mark the LAST piece of file 0 as HIGHEST. The natural
+            // file-priority walk would fetch it after every preceding
+            // file 0 piece; the HIGHEST tier should pull it forward.
+            let metadata = handle.metadata.load_full().unwrap();
+            let file_0_piece_count = metadata.file_infos[0].piece_range.len();
+            handle.set_piece_priorities(
+                0,
+                std::iter::once((file_0_piece_count - 1..file_0_piece_count, PiecePriority::Highest)),
+            )?;
+
+            // Wait until the leecher has at least 1 piece. Then check
+            // that the last piece of file 0 is among the have-set.
+            //
+            // TODO: poll `handle.stats().progress.have_bytes` until it
+            // exceeds the first-piece size (1024 B); then snapshot
+            // `with_chunk_tracker(|ct| ct.get_have_pieces().clone())`
+            // and assert the last-piece bit is set.
+            todo!("wait + assert have-bit on last piece of file 0");
+        })
+    })).await??;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_piece_priorities_dont_download_excluded() -> anyhow::Result<()> {
+    use tokio::time::timeout;
+    // 2 files × 4 KiB each; file 1 marked entirely DontDownload.
+    // After completion, file 1's piece-have bits should remain 0.
+    timeout(Duration::from_secs(15), e2e_with_priorities(2, 4 * 1024, |handle| {
+        Box::pin(async move {
+            let metadata = handle.metadata.load_full().unwrap();
+            let file_1_piece_count = metadata.file_infos[1].piece_range.len();
+            handle.set_piece_priorities(
+                1,
+                std::iter::once((0..file_1_piece_count, PiecePriority::DontDownload)),
+            )?;
+
+            // TODO: wait until file 0 fully downloaded
+            // (`stats().progress.have_bytes >= file_infos[0].len`),
+            // then assert file 1's piece-bits are all 0. Note that
+            // `wait_until_completed()` will hang because the leecher
+            // never reaches `is_finished()` if file 1 is excluded —
+            // use a manual completion poll on file 0's byte count
+            // instead.
+            todo!("poll file 0 completion + assert file 1 have-bits unset");
+        })
+    })).await??;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_piece_priorities_survive_pause_resume() -> anyhow::Result<()> {
+    use tokio::time::timeout;
+    // 2 files × 4 KiB each; set HIGH priorities, pause, resume,
+    // verify the priorities are still in effect by snapshotting via
+    // `piece_priorities()` accessor.
+    timeout(Duration::from_secs(20), e2e_with_priorities(2, 4 * 1024, |handle| {
+        Box::pin(async move {
+            let metadata = handle.metadata.load_full().unwrap();
+            let file_0_piece_count = metadata.file_infos[0].piece_range.len();
+            handle.set_piece_priorities(
+                0,
+                std::iter::once((0..file_0_piece_count, PiecePriority::High)),
+            )?;
+
+            let before_pause = handle.piece_priorities();
+            assert_eq!(
+                before_pause.len(),
+                file_0_piece_count,
+                "all file-0 pieces marked HIGH should be in the snapshot",
+            );
+
+            // TODO: pause via `handle.pause()`, then resume via
+            // `handle.start(None, false)`. Re-snapshot
+            // `handle.piece_priorities()` and assert equality with
+            // `before_pause` — the Arc-clone path through
+            // `TorrentStatePaused.piece_priorities` should preserve
+            // the map verbatim.
+            todo!("pause + resume + assert priorities preserved");
+        })
+    })).await??;
+    Ok(())
+}
+```
+
+The `todo!()` markers are deliberate — extracting the dual-session
+fixture from `e2e_stream()` is a refactor the test author needs to do
+once and reuse across all three new tests. The assertions themselves
+are concrete (specific piece-count comparisons, specific have-bit
+checks) and don't need further design work.
+
+A `pub(crate)` accessor on `TorrentStateLive::piece_priorities` may
+need to be exposed for the snapshot assertion in
+`test_piece_priorities_survive_pause_resume` — the existing
+`Arc<TorrentPiecePriorities>` field is already `pub(crate)` per the
+file 4 diff above, and the in-crate test can read it directly. If the
+test moves to a separate `tests/` integration directory in a follow-up,
+add a `#[cfg(test)] pub fn piece_priorities_arc(&self) -> Arc<TorrentPiecePriorities>`
+accessor.
+
+### PR description (paste verbatim into the upstream PR for B2)
+
+## Summary
+
+Adds a public `PiecePriority` enum and a setter method
+`ManagedTorrent::set_piece_priorities(file_id, ranges)` so downstream
+applications can override the scheduler's per-piece selection.
+
+The reservation loop in `TorrentStateLive::reserve_next_needed_piece`
+gains two new walk tiers (`Highest` then `High`) inserted between the
+existing per-stream lookahead and the natural file-priority walk.
+`DontDownload`-marked pieces are filtered out of all walks and never
+reserved.
+
+The new state lives in a sparse `HashMap<ValidPieceIndex, PiecePriority>`
+inside a sibling `Arc<TorrentPiecePriorities>` field on
+`TorrentStateLive` and `TorrentStatePaused`, parallel to the existing
+`Arc<TorrentStreams>`. Created once per torrent in
+`TorrentStateInitializing::check()`; preserved across pause/resume via
+the same Arc-clone mechanism `streams` already uses.
+
+## Motivation
+
+Three downstream use cases:
+
+1. **Adaptive-buffer streaming clients** that want to express
+   "fetch the next 60s of file bitrate at HIGHEST, the next 240s at
+   HIGH, the last piece of the active file at HIGH". The existing
+   per-stream lookahead handles HIGHEST (as of PR B1); the new tiers
+   handle the rest.
+
+2. **"Skip episode" / "skip bonus disc" UI affordances** that want
+   to remove specific files from the download set without going
+   through `update_only_files` (which atomically rewrites the whole
+   selected set and is heavier than a per-piece annotation).
+
+3. **".mp4 with trailing `moov` atom"** — set the last piece of the
+   active file to HIGH at stream open so the player has the
+   moov-atom-bearing piece before it tries to seek.
+
+## Surface area
+
+- New `pub enum PiecePriority { Highest, High, Normal, DontDownload }`
+  in a new module `torrent_state/piece_priorities.rs`, re-exported
+  from `lib.rs`.
+- New `pub(crate) struct TorrentPiecePriorities` in the same module,
+  with sparse RwLock-backed `HashMap<ValidPieceIndex, PiecePriority>`
+  storage.
+- New `Arc<TorrentPiecePriorities>` field on each of
+  `TorrentStateLive` and `TorrentStatePaused`, initialized once per
+  torrent in `TorrentStateInitializing::check()`.
+- New `pub fn ManagedTorrent::set_piece_priorities(file_id, ranges)`
+  and `pub fn ManagedTorrent::piece_priorities()` accessor.
+- Updated `TorrentStateLive::reserve_next_needed_piece`: two new
+  tier walks chained into the existing
+  `priority_streamed_pieces.chain(natural_order_pieces)` pattern;
+  DontDownload filter added to all three walk surfaces.
+
+## Tests
+
+Three `#[tokio::test(flavor = "multi_thread")]` test stubs in
+`librqbit/src/tests/e2e_stream.rs`:
+
+- `test_piece_priorities_highest_pieces_selected_first` — verifies
+  a piece marked `Highest` is fetched ahead of the natural
+  file-priority order.
+- `test_piece_priorities_dont_download_excluded` — verifies pieces
+  marked `DontDownload` are never reserved, and the torrent
+  intentionally never reaches `is_finished()` for the excluded
+  pieces.
+- `test_piece_priorities_survive_pause_resume` — verifies the
+  priority map survives a pause/resume cycle via the same Arc-clone
+  path `streams` already uses.
+
+The three stubs share a new `e2e_with_priorities()` helper that
+extracts the existing `e2e_stream()` body's seeder→leecher fixture
+into a reusable form. The extraction is a one-time refactor
+(~80 lines of currently-inline scaffolding).
+
+## Backwards compatibility
+
+Zero behavior change for callers that never call
+`set_piece_priorities`: the default `TorrentPiecePriorities` is
+empty, all tier walks yield nothing, the DontDownload filter degrades
+to a constant `true`. The existing
+`chunk_tracker::iter_queued_pieces` signature is unchanged. The
+existing `TorrentStreams::iter_next_pieces` signature is unchanged.
+`Session::add_torrent`'s public surface is unchanged.
+
+The new `Arc<TorrentPiecePriorities>` field on `TorrentStateLive`
+and `TorrentStatePaused` is `pub(crate)` so external callers don't
+need to construct it; the empty default is built automatically
+during `TorrentStateInitializing::check()`.
+
+## Interaction with existing scheduler features
+
+- **Endgame mode** (`try_steal_old_slow_piece`, lines 1278-1320):
+  unaffected. Endgame steals based on `inflight_pieces` membership,
+  which the tier walks insert into via `reserve_needed_piece` after
+  selection. A HIGHEST piece reserved by a slow peer A can still be
+  stolen by faster peer B regardless of priority annotation.
+
+- **Streams' wake-on-piece-completed**
+  (`TorrentStreams::wake_streams_on_piece_completed`, lines 102-119):
+  unaffected. Per-stream wakers fire independently of the priority
+  storage; HIGH pieces don't have wakers (they're not tied to a
+  read position), only stream lookahead pieces do.
+
+- **`update_only_files`** (lines 558-587 in `torrent_state/mod.rs`):
+  unchanged signature. `DontDownload` per-piece annotations and
+  `update_only_files`-driven file deselection are independent
+  mechanisms; both filter the scheduler's walk, but neither one
+  overrides the other. A piece in a selected file marked
+  `DontDownload` is still skipped; a piece in an unselected file
+  marked `Highest` is still skipped (the file isn't in the
+  `iter_queued_pieces` walk).
+
+## Future work (not in this PR)
+
+- **`Last-piece-HIGH` convenience**: rather than have every caller
+  duplicate `set_piece_priorities(file_id, [(N-1..N, High)])` at
+  stream open, a `set_last_piece_high(file_id)` method on
+  `ManagedTorrent` could be added if usage shows the boilerplate
+  is repetitive. Deliberately left out of this PR to keep the
+  surface minimal.
+
+- **`PiecePriority` accessor on `FileStream`**: the existing
+  streaming `FileStream` could expose `set_piece_priorities` as
+  a method delegating to its owning `ManagedTorrent`. Reasonable
+  follow-up; left out of this PR because the `ManagedTorrent`
+  reference is already exposed via `FileStream.torrent` (line 132
+  of `torrent_state/streaming.rs`).
+
+- **`HTTP API` JSON shape**: the existing `Api` (re-exported from
+  `lib.rs:77`) could surface `piece_priorities()` and a
+  POST-shaped `set_piece_priorities` endpoint. Worth doing once
+  this PR lands and downstream usage materialises.
 
 ---
 
@@ -935,19 +1774,49 @@ land the full implementation once the design is accepted upstream.
 ### After PR B2 lands (librqbit `8.4.0` hypothetical)
 
 1. Bump `librqbit = "8.4"` in the workspace `Cargo.toml`.
-2. New module `crates/kino-torrent/src/piece_priority.rs` exposing a
-   per-stream `update_for_position(position_s, file_bitrate_bps)`
-   function that calls
-   `ManagedTorrent::set_piece_priorities(file_id, ranges)` with:
-   - HIGHEST ranges: pieces covering `[position_s, position_s + 60s]`
-     of file bitrate.
-   - HIGH ranges: pieces covering `[position_s + 60s, position_s + 300s]`.
-   - HIGH single piece: the file's final piece (`FileInfo::piece_range`'s
-     `.end - 1`).
+2. New module `crates/kino-torrent/src/piece_priority.rs` exposing
+   `update_for_position(handle: &ManagedTorrent, file_id: usize,
+   position_s: f64, file_bitrate_bps: f64)` which:
+   - Computes the HIGHEST piece range covering
+     `[position_s, position_s + PIECE_PRIORITY_HIGH_WINDOW_S]`
+     (60s per PRD §F-014) via `file_bitrate_bps` and the file's
+     piece length.
+   - Computes the HIGH piece range covering
+     `[position_s + PIECE_PRIORITY_HIGH_WINDOW_S,
+     position_s + PIECE_PRIORITY_MED_WINDOW_S]`
+     (60s..300s per PRD §F-014).
+   - Adds the file's final piece (`file_info.piece_range.end - 1`)
+     to the HIGH set.
+   - Diffs against the previous call's range so pieces that are no
+     longer in any tier are explicitly demoted to `Normal` (otherwise
+     stale `Highest`/`High` annotations would accumulate as the
+     playhead advances).
+   - Calls `handle.set_piece_priorities(file_id, ranges)` with the
+     three computed ranges (HIGHEST / HIGH / NORMAL-demotions).
+
+   Note: with PR B1 already wired, the HIGHEST tier is redundant
+   here for the active stream (the stream's lookahead already
+   covers it), but explicit annotation costs nothing and helps when
+   the user pauses playback for a long time (the stream's lookahead
+   drains, but the explicit HIGHEST keeps the scheduler honest).
+
 3. `crates/kino-torrent/src/monitor.rs::BufferMonitor` calls the new
-   function on every position-event recompute (sampled every 1s per
-   PRD §F-014).
-4. F-014 §6A entry in `STATE.md` flips to RESOLVED.
+   function from its existing 1-second sampler tick (PRD §F-014
+   `AHEAD_CHECK_INTERVAL_MS = 1000` for sampling; the 5-second
+   recompute `RECOMPUTE_INTERVAL_S` is too coarse for HIGH-tier
+   responsiveness on real-world torrents).
+
+4. New unit tests in `crates/kino-torrent/tests/buffer_monitor.rs`:
+   - HIGHEST/HIGH ranges computed correctly for representative
+     position/bitrate combinations (4K 80 Mbps, 1080p 8 Mbps,
+     audio-only 320 kbps).
+   - Stale-annotation demotion: advancing playhead by `>300s`
+     between calls produces a NORMAL demotion for the previously-
+     HIGH pieces that have fallen out of the window.
+   - Last-piece-HIGH is always included regardless of playhead
+     position.
+
+5. F-014 §6A entry in `STATE.md` flips to RESOLVED.
 
 ### Closure-path summary
 
@@ -991,4 +1860,20 @@ diff if the human ratifies.
   to satisfy `missing_docs` if upstream enforces it). PR A's new
   fields on the public `SessionOptions` and `AddTorrentOptions`
   structs especially need doc comments since those structs are part
-  of the crate's stable surface.
+  of the crate's stable surface. PR B2's new `PiecePriority` enum
+  and `set_piece_priorities` / `piece_priorities` methods similarly
+  need full `///` docs — they're the user-facing API for the whole
+  feature.
+- **PR B2 sequencing on the kino side.** The post-merge kino-side
+  wiring for B2 (the new
+  `crates/kino-torrent/src/piece_priority.rs` module +
+  `BufferMonitor` integration) DEPENDS on B1's wiring being in
+  place — both because B1 introduces the `LOOKAHEAD_MIN_BYTES` /
+  `LOOKAHEAD_MAX_BYTES` constants the B2 wiring also reads for the
+  stream-lookahead approximation, and because the B2 monitor loop
+  feeds `set_piece_priorities` calls that complement (don't
+  replace) B1's lookahead-driven HIGHEST coverage. A kino session
+  that wires B2 without B1's wiring already on `main` would leave
+  the HIGHEST tier permanently empty (no caller annotates it), so
+  the §6A entry would not flip to RESOLVED until B1 was also
+  wired.
