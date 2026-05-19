@@ -1,9 +1,9 @@
 # kino — Agent State
 
 **PRD version:** 1.0 (locked)
-**Status:** v1.0.0-alpha.1 release pipeline shipped. **Session 033 closes the F-015 / Android DV decoder-forcing §6A regression**: a new `DvAwareCodecSelector` object in the `tauri-plugin-kino-player` Android module overrides `MediaCodecSelector.DEFAULT` to, on `MimeTypes.VIDEO_DOLBY_VISION` tracks, filter the DEFAULT-returned `MediaCodecInfo` list to decoders whose `CodecCapabilities.profileLevels` declare one of the three HEVC-based DV profiles (`DolbyVisionProfileDvheStn` / `DolbyVisionProfileDvheSt` / `DolbyVisionProfileDvheDtb`) that PRD §F-015 + ADR-022 require. Non-DV mimetypes (HEVC / H.264 / VP9 / AV1 / audio / subtitle) delegate unchanged. `PlayerActivity.initPlayer` swaps `.setMediaCodecSelector(MediaCodecSelector.DEFAULT)` for `.setMediaCodecSelector(DvAwareCodecSelector)` at the one-line wiring point. Empty-filter-result guard returns the unfiltered list so emulator images and platforms that report no DV-capable decoders still attempt playback (the visible error surfaces via `onPlayerError` rather than a silent "no renderer" stall). 1 new Kotlin file (~70 LOC counting docstrings), 1 import + 1 wiring edit in `PlayerActivity.kt`, 0 Rust changes, 0 frontend changes. No Kotlin unit tests added: the player-plugin module ships no JVM test runner today (CI exercises Kotlin only via `cargo tauri android build --apk` which compiles but does not execute the unit-test source set); adding a `./gradlew test` CI job is a separate scope per ADR-131. The §6A "F-015 / Android DV decoder forcing" entry is flipped to **RESOLVED**. **Two §6A regressions remain**: F-013 / F-014 (librqbit-blocked: max-connections cap + piece-priority window assignment — need an upstream PR, a fork, an engine swap, or a PRD revision); F-015 (Linux libmpv in-window GL — multi-session ADR-108 deviation). F-015 stays `[ ]` in the Feature Tracker because the Linux libmpv §6A sub-regression remains. **§6A is still not claimable.** See ADR-131 in the Session 033 entry below.
-**Last session:** 033 (F-015 Android DV decoder selector — new `DvAwareCodecSelector : MediaCodecSelector` object at `android/player-plugin/android/src/main/java/dev/kino/player/DvAwareCodecSelector.kt`; on `MimeTypes.VIDEO_DOLBY_VISION` filters DEFAULT's decoder list to codecs with `CodecCapabilities.profileLevels` containing a DV profile constant (`DolbyVisionProfileDvheStn` profile 5, `DolbyVisionProfileDvheSt` profile 8.1, `DolbyVisionProfileDvheDtb` profile 7) — mirrors `Capabilities.dolbyVisionProfiles()`'s probe set; falls back to unfiltered list when no DV-capable decoder is found so emulators still attempt playback; non-DV mimetypes delegate to DEFAULT unchanged. `PlayerActivity.initPlayer` swaps `MediaCodecSelector.DEFAULT` for `DvAwareCodecSelector`; unused `MediaCodecSelector` import dropped; class-level kdoc updated to document the DV-aware selector. No Rust, no frontend, no test changes. The §6A "F-015 / Android DV decoder forcing" entry is flipped to RESOLVED; F-015 stays `[ ]` because Linux libmpv §6A remains.)
-**Next session:** 034 — remaining §6A regressions in priority order: (1) **F-013 max-connections cap** + **F-014 piece-priority window** (librqbit-blocked — Session 034 should pick (a) draft an upstream PR exposing the options, (b) file a PRD revision under "PRD Issues" relaxing the 200-cap invariant + the piece-priority mapping to "best-effort, subject to engine capabilities", or both; the agent can't merge an upstream PR alone so (b) is the fastest §6A clearance and the strongly-recommended first move), (2) **F-015 Linux libmpv in-window GL surface** (multi-session ADR-108 deviation — start with a "enumerate webview surface access on Linux" scout session that catalogs X11 `--wid` parent-window vs Wayland subsurface protocol routes through Tauri 2's WebKitGTK window, then a follow-up session implements the chosen route behind a feature flag).
+**Status:** v1.0.0-alpha.1 release pipeline shipped. **Session 034 files the F-013 / F-014 librqbit-blocked §6A closure path** — a formal PRD revision request under "PRD Issues" proposing surgical relaxations of two PRD §F-013 / §F-014 invariants to "best-effort, subject to torrent engine API capabilities". This is the Session-033-recommended option (d) of the F-013 / F-014 closure plan (file a PRD revision so the human can ratify) — the strongly-recommended first move because options (a)/(b)/(c) (upstream PR, fork librqbit, engine swap) all require coordination the agent can't drive solo within a single session, while option (d) is documentation-only work the agent CAN drive end-to-end and parks the §6A gate behind a single human ratification decision. The proposal documents (a) the exact librqbit 8.1.1 public API surface (`SessionOptions` exposes only timeouts, bandwidth ratelimits, `concurrent_init_limit`, DHT/peer toggles — no `max_connections_per_torrent`; `PeerConnectionOptions` exposes only `connect_timeout` / `read_write_timeout` / `keep_alive_interval`; `FilePriorities` and `chunk_tracker_*` are `pub(crate)`-only); (b) confirmation via crates.io that 8.1.1 IS the latest published librqbit (no newer version exposes the missing options); (c) a sketched upstream PR shape (what fields to expose on which structs) so the human can choose to pursue (a) in parallel; (d) the exact verbatim proposed PRD revision text for §F-013 "Max connections per torrent" and §F-014 "Piece priorities mapped to librqbit". **The §6A F-013 + F-014 entries are NOT flipped to RESOLVED this session** — the agent cannot self-ratify a PRD revision; that decision belongs to the human. The two entries are amended to point at the new PRD Issues block as the chosen closure path. F-013 and F-014 stay `[ ]` in the Feature Tracker. **One §6A regression now actionable by the agent solo remains**: F-015 Linux libmpv in-window GL surface (multi-session ADR-108 deviation — Session 035 should pick this up as a scout session enumerating X11 `--wid` vs Wayland subsurface vs deep webkit-gtk integration routes). **§6A is still not claimable.** See ADR-132 in the Session 034 entry below.
+**Last session:** 034 (F-013 + F-014 PRD revision proposal — added "§F-013 + §F-014 librqbit-blocked invariants" entry to "PRD Issues" in STATE.md quoting the locked PRD wording, citing the librqbit 8.1.1 public-API gap with file:line references to `peer_connection.rs:57` / `session.rs:382` / `limits.rs:10` / `chunk_tracker.rs:218` in the registry copy, listing the four closure paths (a)/(b)/(c)/(d) with concrete cost estimates, sketching the upstream-PR diff shape, and proposing exact verbatim PRD revision text for §F-013 line "Max connections per torrent: 200" → "Max connections per torrent: 200 (best-effort, subject to torrent engine API capabilities)" and §F-014 "Piece priorities mapped to librqbit:" block to a tiered "where the engine exposes a piece-priority API … where it does not" formulation. Updated §6A F-013 and §6A F-014 entries to reference the new PRD Issues block as the chosen closure path. ADR-132 documents the decision rationale. No code changes; no test changes — the librqbit consumer code in `crates/kino-torrent/src/engine.rs` and `monitor.rs` already comments the gap accurately (lines 18-22 of `engine.rs` and lines 23-28 of `monitor.rs` cited verbatim in the proposal). The §6A F-013 and F-014 entries stay OPEN; F-013 and F-014 stay `[ ]`.)
+**Next session:** 035 — sole agent-actionable §6A regression remaining is **F-015 Linux libmpv in-window GL surface** (multi-session ADR-108 deviation). Recommended Session-035 scope: a scout session that catalogs the available webview-surface access routes on Tauri 2 / WebKitGTK — X11 `--wid` parent-window hand-off (mature, Wayland-incompatible by default), Wayland subsurface protocol negotiation (deep webkit-gtk work), or a render-context-aware peer driver. Output: a new ADR documenting the chosen route + a follow-up session scope sketch. F-013 / F-014 §6A closure is parked on human PRD-revision ratification — if/when the human accepts the Session-034 proposal a follow-up session can flip those §6A entries to RESOLVED in one diff (no code changes needed beyond a STATE.md text edit). Parallel agent work on the F-015 Linux scout does not depend on the F-013 / F-014 ratification.
 
 ---
 
@@ -68,6 +68,250 @@ a hard requirement.
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 034 — F-013 + F-014 PRD revision proposal (librqbit-blocked §6A regressions)
+
+**Branch:** `claude/kino-prd-compliance-cIkcL` (harness-supplied; see
+ADR-033 — the harness reuses a single branch name for this checkout,
+the branch name does NOT track the session number).
+
+**Scope chosen:** F-013 + F-014 librqbit-blocked §6A closure path —
+the Session-033-recommended priority-1 remaining §6A scope. Picked
+because (a) F-013 and F-014 share a single root cause (librqbit 8.1.1
+does not expose `max_connections_per_torrent` or piece-priority APIs
+publicly), making them addressable in a single coherent unit of work;
+(b) the four closure paths (a)/(b)/(c)/(d) from the Session 027
+audit's F-013 / F-014 entries are well-enumerated and the recommended
+fastest gate-clearer (option (d), file a PRD revision request under
+"PRD Issues") is documentation-only work the agent can drive solo;
+(c) parking the §6A gate behind a single human ratification decision
+unblocks future sessions to either flip the entries (if accepted) or
+pursue (a) / (b) / (c) (if rejected); (d) options (a)/(b)/(c) all
+require coordination the agent can't drive solo within a single
+session — (a) upstream PR review by ikatson/rqbit, (b) maintaining a
+patched fork via `[patch.crates-io]`, (c) swapping the torrent engine
+(high blast radius, essentially redoing F-013). Bundle size: 0 LOC
+production code, 0 LOC test code, ~300 lines of STATE.md text (1 new
+PRD Issues entry, 2 §6A entry amendments, 1 new ADR, 1 new Sessions
+Log entry).
+
+**Pre-implementation verification (librqbit public-API survey):**
+
+The Session 027 audit asserted librqbit 8.1.1 does not expose the
+needed APIs publicly. Session 034 independently confirmed this by:
+
+1.  **Latest crates.io version check.** `cargo search librqbit
+    --limit 5` (2026-05-19) returns:
+    ```
+    librqbit = "8.1.1"
+    librqbit-buffers = "4.2.0"
+    librqbit-core = "5.0.0"
+    librqbit-dualstack-sockets = "0.7.0"
+    librqbit-utp = "0.7.0"
+    ```
+    8.1.1 IS the latest published librqbit; no newer version bumps the
+    feature set behind the audit's "librqbit 8.1.1-blocked" framing.
+
+2.  **`SessionOptions` field survey.** Reading
+    `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/librqbit-8.1.1/src/session.rs:382-432`,
+    the public fields are: `disable_dht`, `disable_dht_persistence`,
+    `dht_config`, `fastresume`, `persistence`, `peer_id`, `peer_opts`,
+    `listen_port_range`, `enable_upnp_port_forwarding`,
+    `defer_writes_up_to`, `default_storage_factory`, `socks_proxy_url`,
+    `cancellation_token`, `concurrent_init_limit`, `root_span`,
+    `ratelimits`, `blocklist_url`, `trackers`, `disable_upload`. NO
+    `max_connections_per_torrent` / `max_peers_per_torrent` /
+    equivalent field.
+
+3.  **`PeerConnectionOptions` field survey.** Reading
+    `peer_connection.rs:57-65`, the public fields are
+    `connect_timeout`, `read_write_timeout`, `keep_alive_interval`.
+    NO concurrent-connection cap; these are per-connection timeouts.
+
+4.  **`LimitsConfig` field survey.** Reading `limits.rs:10-12`,
+    the public fields are `upload_bps`, `download_bps`. Bandwidth
+    caps, NOT connection-count caps.
+
+5.  **Piece-priority API visibility check.** `grep -rn
+    "max_connections\|max_peers\|priorit"` in the librqbit 8.1.1
+    source shows `file_priorities: FilePriorities` and
+    `chunk_tracker.rs:218 (file_priorities: &'a FilePriorities)` are
+    `pub(crate)`-only. The internal type `FilePriorities` and the
+    chunk-tracker function consuming it are NOT in librqbit's public
+    surface; consumers cannot construct `FilePriorities` or call the
+    piece-priority paths from outside the crate.
+
+6.  **`concurrent_init_limit` is NOT a peer cap.** The single
+    "concurrent" field on `SessionOptions` controls the number of
+    torrents being initialized simultaneously (metadata-fetch
+    concurrency at session startup), not the per-torrent peer
+    connection count. Setting it does not approximate the PRD §F-013
+    "Max connections per torrent: 200" invariant.
+
+7.  **Stream-mode prioritisation is the librqbit-provided
+    substitute.** librqbit DOES bias piece selection around an active
+    read offset when its `Session::stream(file_idx)` API is used —
+    this is the existing call site at `engine.rs:243`
+    (`AddedTorrent::open_stream` →
+    `self.inner.clone().stream(file_index)`), unchanged since
+    Session 018. Stream-mode prioritisation IS the closest approximation
+    librqbit's public API provides to PRD §F-014's piece-priority
+    window mapping, and it IS what the F-014 §6A integration test
+    (`crates/kino-torrent/tests/buffer_monitor.rs`) relies on for the
+    fast-torrent → SAFE convergence path.
+
+**Implementation:**
+
+1.  **New entry under "PRD Issues" in STATE.md** —
+    "§F-013 max_connections + §F-014 piece-priority — librqbit 8.1.1
+    public API gap". The entry: (a) quotes the PRD §F-013 "Max
+    connections per torrent: 200" line and the §F-014 "Piece priorities
+    mapped to librqbit:" block verbatim; (b) quotes the actual code at
+    `engine.rs:310-319` (SessionOptions construction) and
+    `monitor.rs:23-28` (the explicit ADR-106 deferral comment); (c)
+    cites the librqbit 8.1.1 registry-copy line numbers for
+    `SessionOptions`, `PeerConnectionOptions`, `LimitsConfig`, and
+    `chunk_tracker.rs` `pub(crate)` boundaries; (d) lists the four
+    closure paths (a)/(b)/(c)/(d) from the Session 027 audit with
+    concrete cost estimates, the upstream-PR sketch for (a), and
+    the recommendation pointer to (d); (e) provides the proposed
+    verbatim PRD revision text for both invariants.
+
+2.  **Amend the §6A Code-Acceptance Regressions F-013 entry** —
+    "F-013 / Max connections per torrent" gets a new "Closure path
+    filed (Session 034)" subsection pointing at the PRD Issues
+    entry. The header keeps the strike-through-style RESOLVED tag
+    UNAPPLIED (the agent cannot self-ratify the proposal); the
+    entry stays OPEN until the human acts.
+
+3.  **Amend the §6A Code-Acceptance Regressions F-014 entry** —
+    "F-014 / Piece-priority window assignment" gets the same
+    "Closure path filed (Session 034)" subsection. Same OPEN status.
+
+4.  **No code changes.** The librqbit-consumer code in
+    `crates/kino-torrent/src/engine.rs` and
+    `crates/kino-torrent/src/monitor.rs` already documents the
+    gap accurately:
+    -   `engine.rs:14-22` documents the disabled-persistence + no
+        piece-scheduler stance.
+    -   `monitor.rs:23-28` documents the librqbit-8.1.1 piece-
+        priority API gap explicitly.
+    No additional comments needed — the existing comments are
+    already truthful and citation-worthy.
+
+5.  **No test changes.** The F-013 / F-014 integration tests at
+    `crates/kino-server/tests/stream_roundtrip.rs` and
+    `crates/kino-torrent/tests/buffer_monitor.rs` already pass
+    under the stream-mode prioritisation path (Session 018 / 019
+    + Session 026 CI runs are green); the proposal does not affect
+    them.
+
+6.  **ADR-132 filed** documenting the decision rationale: why
+    option (d) was chosen over (a)/(b)/(c) for the §6A clearance
+    path, and the convention that §6A regressions whose closure
+    requires PRD-locked-text revision are "human-gated" — the
+    agent files the proposal, the human ratifies, a follow-up
+    session flips the entry to RESOLVED.
+
+**Files changed (summary):**
+
+*   `STATE.md` — top-of-file Status + Last session + Next session
+    rewritten; new Session 034 Sessions Log entry (this one); new
+    PRD Issues entry; F-013 + F-014 §6A entry amendments; new
+    ADR-132.
+
+No Rust, Kotlin, TS, TSX, JSON, YAML, CSS, or build files
+touched. Pure STATE.md edit.
+
+**Verification:**
+
+*   `cargo fmt --check`: not executed — no Rust diff. The
+    workspace shipped green at Session 033 merge (CI run that
+    merged PR #36).
+*   `cargo clippy --workspace --all-targets -- -D warnings`: not
+    executed — same reasoning, no Rust diff.
+*   `cargo test --workspace`: not executed — same reasoning, no
+    Rust diff.
+*   `cd frontend && npm run lint && npm run typecheck && npm test`:
+    not executed — no TS/TSX diff. The frontend shipped green at
+    Session 030 merge (the last session that touched frontend
+    code); subsequent sessions did not touch it.
+*   `cargo tauri build --target x86_64-unknown-linux-gnu`: not
+    executed — no source-tree changes that affect compilation. CI
+    `build-linux` will run on push regardless; per the Standing
+    Authorizations the agent waits for `lint` + `test` only.
+*   `cargo tauri android build`: not executed — no Android-side
+    changes.
+
+The STATE.md diff is markdown text only; no CI step gates on
+markdown lint (the workspace ships no markdown linter). The PR
+self-review checks that the new sections render correctly in
+GitHub's markdown viewer.
+
+**Features advanced:**
+
+*   F-013 stays `[ ]` in the Feature Tracker — librqbit-blocked
+    §6A regression is filed under "PRD Issues" for human
+    ratification but NOT closed. The agent cannot self-ratify a
+    PRD-locked text revision.
+*   F-014 stays `[ ]` in the Feature Tracker — same reasoning as
+    F-013.
+*   No feature status transitions occurred this session.
+
+**New ADRs filed:** ADR-132 (see Architectural Decisions Log
+below — "§6A regressions whose closure requires PRD-locked text
+revision are human-gated; agent's role is to file a documented
+PRD revision proposal under 'PRD Issues' for the human to
+ratify").
+
+**Known issues introduced or resolved:**
+
+*   Resolved: none. The librqbit 8.1.1 public-API gap remains
+    a code-acceptance fact, but the closure path is now formally
+    documented for human ratification.
+*   Introduced: none. The PRD revision proposal is doc-only and
+    surfaces existing technical reality.
+
+**Next session needs to know:**
+
+*   §6A residual is ONE agent-actionable regression: **F-015
+    Linux libmpv in-window GL surface** (ADR-108 deviation,
+    multi-session). Recommended Session 035 scope: scout session
+    enumerating Tauri 2 / WebKitGTK webview-surface access routes
+    — X11 `--wid` parent-window hand-off (mature, Wayland-
+    incompatible by default), Wayland subsurface protocol
+    negotiation (deep webkit-gtk work), or a render-context-aware
+    peer driver. Output: ADR documenting chosen route + follow-up
+    session scope sketch. Sessions 036+ implement the chosen
+    route behind a `libmpv-inprocess` Cargo feature flag.
+*   F-013 / F-014 §6A closure is parked on the human's PRD-
+    revision ratification decision. If/when the human accepts the
+    Session-034 proposal, a follow-up session can flip both §6A
+    entries to RESOLVED in a single STATE.md edit (no code
+    changes needed — the existing code's stream-mode-prioritisation
+    behavior matches the proposed revision's "best-effort"
+    semantics). If the human rejects the proposal, the agent
+    must pursue (a) upstream PR drafting (would target
+    ikatson/rqbit's `SessionOptions` and `chunk_tracker_*`
+    surfaces), (b) a `[patch.crates-io]` fork (substantial fork-
+    maintenance overhead), or (c) a torrent engine swap (high
+    blast radius). The agent CAN start drafting (a) without
+    ratification — that work is independently useful regardless
+    of the human's PRD decision, since librqbit upstream
+    acceptance would close §6A unconditionally.
+*   The §6B-6 hardware-verification line ("Adaptive buffer
+    engages correctly on real slow torrent") remains the
+    user-facing acceptance gate for F-014's runtime correctness;
+    the integration test in `buffer_monitor.rs` covers the
+    state-machine math, but the §6B-6 check is what validates
+    that stream-mode prioritisation is sufficient on a real
+    slow torrent in practice.
+*   No new conventions filed this session. ADR-132 introduces the
+    "human-gated §6A regression" classification but does not
+    propose a new cross-session convention beyond what's already
+    in the Sessions Log handling of PRD Issues.
+
+---
 
 ### Session 033 — F-015 Android DV decoder selector
 
@@ -8015,6 +8259,7 @@ Additional ADRs filed by sessions:
 | ADR-129 | **404 from Trakt `/{movies\|shows}/{imdb}/ratings` is mapped to `Fresh { rating: TraktTitleRating { rating: None, .. }, etag: None }` — symmetric handling of "no rating" and "no title".** Trakt returns 404 for IMDb ids it doesn't recognize (different from a 200 with `rating: 0`, which it returns for ids it knows but has no votes for). The pre-Session-032 back-compat `title_rating` method already collapsed both into `Option<f64>::None`. The ETag-aware variant preserves that collapse INSIDE the `Fresh` arm so the negative result caches identically to a positive `None`: the cache row carries `payload = "{\"imdb_id\":..., \"rating\":null}"` and `etag = NULL`, and the next read deserializes back to `Option<f64>::None` without re-hitting the network until the `META_TTL_S` TTL elapses. Rejected alternative: return a separate `TraktTitleRatingFetch::NotFound` variant — clean type-theoretically but would require every caller in `get_title_detail_uncached` to branch on it (currently they all collapse to `None` anyway). The cost of the symmetric mapping is one cache row per unknown IMDb id for 24h, which is bounded by user navigation — acceptable. The same pattern is reused for TVDB extended (ADR-130). | 032 |
 | ADR-130 | **TVDB extended-artwork cache key OMITS language: `tvdb:title:{tvdb_id}:{kind}`.** The Session-031 STATE.md plan suggested `tvdb:title:{tvdb_id}:{kind}:{language}` but the actual HTTP target is `/v4/{movies\|series}/{id}/extended?meta=translations` — a single call that returns EVERY translation in one envelope. The cache row's identity is therefore `(tvdb_id, kind)`, not `(tvdb_id, kind, language)`; a `:language` suffix would fragment the cache by N copies of the same payload (one per UI language) for no behavioral benefit. The persisted payload is `Option<ProviderBundle>` so the 404 negative result (mapped per ADR-129's pattern: `Fresh { bundle: None, etag: None }`) round-trips through serde as the literal JSON token `null`, distinct from a populated bundle. `ProviderBundle` + `LocalizedAsset` derive Serialize/Deserialize (ADR-130 corollary); the `HashMap<String, String>` summaries field round-trips through serde's default map encoding. Because the underlying `/extended` call is also used by the F-005 artwork resolver at the OUTER `resolve_artwork` cache row (which has a 7-day TTL), the inner per-resource row's TTL is matched at `ARTWORK_TTL_S = 7d` so the two tiers expire on the same cadence (vs the META_TTL_S = 24h used by TMDB title_details / credits which feed the F-010 detail aggregate, which itself ships at META_TTL_S). | 032 |
 | ADR-131 | **Kotlin-side coverage for the Android player plugin ships under structural review until a `./gradlew test` CI job is added.** The `tauri-plugin-kino-player` android module's `build.gradle.kts` declares `testImplementation("junit:junit:4.13.2")` but the module has shipped without a `src/test/` source set since Session 023, and the CI workflow (`.github/workflows/ci.yml::build-android`) runs `cargo tauri android build --apk` exclusively — which compiles Kotlin but does NOT execute the unit-test source set. Adding a JVM-level test for a class that calls into Android framework code (`MediaCodecSelector.DEFAULT`, `MediaCodecInfo.CodecCapabilities`, `MediaCodecList`, etc.) requires either Robolectric (a ~15 MB dependency that emulates Android framework on the JVM) or extensive mocking via PowerMock / MockK — and a new `./gradlew :tauri-plugin-kino-player:test` CI job that runs neither today. Session 033 ships `DvAwareCodecSelector` without a Kotlin unit test because: (a) the §6A audit explicitly named the implementation pattern ("a custom `MediaCodecSelector` that filters `MediaCodecList` results to codecs whose `CodecCapabilities.profileLevels` declare a `DolbyVisionProfile` entry") so code review against the audit IS the structural verification; (b) the §6B-4 hardware-verification line ("DV Profile 5 movie plays on Shield with DV indicator") is the runtime acceptance gate; (c) wiring a `./gradlew test` CI job + a Robolectric / MockK harness is a separate scope (~150 LOC of test infra for ~30 LOC of new test logic) and Session 033 should not bundle the framework lift with the feature it would test. A future polish session ("Android-side test harness") can land the gradle test wiring and backfill tests for `DvAwareCodecSelector`, `Capabilities`, `PlayerSession`, `Events`, etc. all at once. This ADR is descriptive ("documents how a §6A regression is closed without a unit test") not prescriptive ("you must not add tests"); a session that adds JVM tests via Robolectric is welcome to do so. The convention is: when the §6A acceptance hinges on Android framework call-path structure rather than pure-logic state, structural review against the audit's quoted pattern is acceptable closure. | 033 |
+| ADR-132 | **§6A regressions whose closure requires PRD-locked text revision are "human-gated"; the agent's role is to file a documented PRD revision proposal under "PRD Issues" for the human to ratify, then keep the §6A entry OPEN until ratification.** F-013 (Max connections per torrent: 200) and F-014 (piece-priority window mapping) both hit librqbit 8.1.1's public API boundary — the closure paths enumerated by the Session 027 audit are (a) upstream PR to ikatson/rqbit exposing `max_connections_per_torrent` on `SessionOptions` and the `chunk_tracker_*` / `FilePriorities` surfaces, (b) fork librqbit via `[patch.crates-io]` and apply the patches locally, (c) swap the torrent engine, (d) file a PRD revision request relaxing the locked invariants. Sessions 028 / 029 / 030 / 031 / 032 / 033 each closed a different §6A regression by code change; F-013 + F-014 are the first §6A entries where NO code change available within librqbit 8.1.1's public API can satisfy the PRD-locked text. Option (a) requires ikatson/rqbit upstream review which the agent can prepare but not drive to completion in one session. Option (b) requires sustained fork maintenance against librqbit-core / -buffers / -utp transitive ABI changes (substantial multi-session overhead). Option (c) is a high-blast-radius F-013 redo. Option (d) is documentation-only work the agent CAN drive end-to-end and parks the gate behind a single human decision. Session 034 picks (d). The convention this ADR establishes: when a §6A regression cannot be closed by code against the locked PRD text AND the engine constraint is structural (not amenable to a workaround within the same crate ecosystem), the agent files the closure-path proposal under "PRD Issues" with (i) verbatim PRD quotes, (ii) verbatim source-of-truth code citations, (iii) a sketched upstream-PR diff shape for option (a), (iv) cost estimates for options (b) / (c), (v) exact verbatim proposed PRD revision text for option (d). The §6A entry stays OPEN with a "Closure path filed" subsection pointing at the PRD Issues block. The Feature Tracker checkbox stays `[ ]`. A follow-up session — invoked after the human ratifies the PRD revision — flips both the §6A entry to RESOLVED and the Feature Tracker checkbox to `[x]` in one diff. This avoids the agent self-ratifying a PRD-locked text revision (which would violate the harness rule "Never modify PRD.md") while still making maximum progress on §6A clearance per session. The classification also distinguishes "agent-actionable §6A regressions" (closeable by code in this session) from "human-gated §6A regressions" (require ratification first), which informs Session N+1's scope picking: prefer agent-actionable first, file human-gated when no agent-actionable §6A remains. | 034 |
 
 ---
 
@@ -8308,6 +8553,248 @@ Additional ADRs filed by sessions:
   stays `[x]` because the release pipeline itself is
   code-complete; only the human-side trigger is outstanding.
 
+- **§F-013 max_connections-per-torrent + §F-014 piece-priority
+  window mapping: librqbit 8.1.1 public API gap (Session 034
+  proposal).** Two §6A regressions filed by Session 027 trace to
+  the same root cause: librqbit 8.1.1's public surface does not
+  expose the APIs needed to honor the locked invariants. Session
+  034 files this entry as the formal closure path under audit
+  option (d) ("file a PRD revision request relaxing the cap to
+  'best-effort, subject to engine capabilities' so the human can
+  ratify"). See ADR-132 for the human-gated-§6A classification
+  rationale.
+
+  **Verbatim PRD quotes.**
+
+  PRD §F-013, line at `PRD.md:582`:
+  > Max connections per torrent: 200
+
+  PRD §F-014, lines at `PRD.md:647-652`:
+  > Piece priorities mapped to librqbit:
+  >
+  > - Window `[position, position + 60s]`: HIGHEST
+  > - Window `[position + 60s, position + 300s]`: HIGH
+  > - Last piece of the active file: HIGH
+  > - All others: NORMAL
+
+  **Verbatim librqbit 8.1.1 public-API survey** (from
+  `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/librqbit-8.1.1/`,
+  cross-checked 2026-05-19):
+
+  - `session.rs:382-432` — `pub struct SessionOptions` fields:
+    `disable_dht`, `disable_dht_persistence`, `dht_config`,
+    `fastresume`, `persistence`, `peer_id`, `peer_opts`,
+    `listen_port_range`, `enable_upnp_port_forwarding`,
+    `defer_writes_up_to`, `default_storage_factory`,
+    `socks_proxy_url`, `cancellation_token`,
+    `concurrent_init_limit`, `root_span`, `ratelimits`,
+    `blocklist_url`, `trackers`, `disable_upload`. NO
+    `max_connections_per_torrent` or equivalent.
+  - `peer_connection.rs:57-65` — `pub struct PeerConnectionOptions`
+    fields: `connect_timeout`, `read_write_timeout`,
+    `keep_alive_interval`. These are per-connection timeouts,
+    NOT a concurrent-connection cap.
+  - `limits.rs:10-12` — `pub struct LimitsConfig` fields:
+    `upload_bps`, `download_bps`. Bandwidth caps, NOT
+    connection-count caps.
+  - `chunk_tracker.rs:218` — `file_priorities: &'a FilePriorities`
+    is `pub(crate)` only. `FilePriorities` is not constructible
+    from outside the crate.
+  - `concurrent_init_limit` on `SessionOptions` controls torrent
+    metadata-fetch concurrency at session startup, NOT per-torrent
+    peer connection count. Cannot approximate the §F-013 cap.
+
+  **Verbatim kino consumer-code citations.**
+
+  `crates/kino-torrent/src/engine.rs:310-319` (SessionOptions
+  construction — Session 018, unchanged through Session 034):
+  ```rust
+  let opts = SessionOptions {
+      disable_dht: !config.enable_dht,
+      disable_dht_persistence: true,
+      trackers,
+      ..Default::default()
+  };
+  ```
+  `MAX_CONNECTIONS_PER_TORRENT = 200` at
+  `crates/kino-core/src/constants.rs:98` is unreferenced from
+  this construction site.
+
+  `crates/kino-torrent/src/monitor.rs:23-28` (explicit
+  ADR-106 deferral comment — Session 019, unchanged):
+  ```rust
+  //! - **No piece-priority side effects.** librqbit 8.1.1 does
+  //!   not expose its piece-priority API publicly; the scheduler
+  //!   relies on librqbit's stream-mode-driven natural
+  //!   prioritisation around the active read offset. ADR-106
+  //!   documents the gap. The state machine, sampler, and
+  //!   buffer:status events are what the PRD §F-014 §6A
+  //!   acceptance pins.
+  ```
+  `PIECE_PRIORITY_HIGH_WINDOW_S = 60.0` and
+  `PIECE_PRIORITY_MED_WINDOW_S = 300.0` at
+  `crates/kino-core/src/constants.rs:14,17` are unreferenced
+  from the scheduler's `compute_state` function.
+
+  **crates.io version check.** `cargo search librqbit --limit 5`
+  on 2026-05-19 returns `librqbit = "8.1.1"` as the latest.
+  No newer published version bumps the public-API surface.
+
+  **Four closure paths (Session 027 audit, restated with
+  Session-034 cost analysis):**
+
+  - **(a) Upstream PR to ikatson/rqbit** exposing
+    `max_connections_per_torrent` on `SessionOptions` (likely as
+    `Option<NonZeroU32>` matching `LimitsConfig`'s nullability
+    style) AND lifting `FilePriorities` + the `chunk_tracker_*`
+    file-priority API to `pub`. Sketch of the upstream diff:
+    ```diff
+    --- librqbit/src/session.rs
+    +++ librqbit/src/session.rs
+    @@ pub struct SessionOptions {
+         pub disable_upload: bool,
+    +    /// Optional cap on concurrent peer connections per torrent.
+    +    /// `None` means unlimited (the pre-existing behavior).
+    +    pub max_connections_per_torrent: Option<NonZeroU32>,
+     }
+
+    --- librqbit/src/chunk_tracker.rs
+    +++ librqbit/src/chunk_tracker.rs
+    @@
+    -pub(crate) struct FilePriorities { … }
+    +pub struct FilePriorities { … }
+
+    --- librqbit/src/torrent_state/live/mod.rs
+    +++ librqbit/src/torrent_state/live/mod.rs
+    @@ impl Live {
+    +    pub fn update_file_piece_priorities(
+    +        &self,
+    +        file_idx: usize,
+    +        ranges: &[(std::ops::Range<usize>, Priority)],
+    +    ) -> anyhow::Result<()> {
+    +        … // forward to internal chunk_tracker
+    +    }
+     }
+    ```
+    Cost: 1-3 person-weeks for upstream review + a librqbit point-
+    release. The agent CAN draft the PR text (and likely will, in
+    a Session 036+ scope) but cannot merge upstream — that's
+    ikatson's call.
+
+  - **(b) Fork librqbit via `[patch.crates-io]`** and apply the
+    upstream-PR-shaped patches locally to a `vendor/librqbit-fork/`
+    git submodule or vendored copy. Cost: substantial fork-
+    maintenance overhead — librqbit's transitive ABI (librqbit-
+    core, -buffers, -utp, -dualstack-sockets) churns; a fork falls
+    behind on security patches; rebases multiply when upstream
+    refactors. Recommended only if (a) is rejected upstream AND
+    (d) is unacceptable to the human.
+
+  - **(c) Swap the torrent engine** to one whose public API
+    exposes both invariants. Candidates: `cratetorrent` (alpha,
+    very small surface), `rqbit`'s internal chunk-tracker (same
+    crate family, same problem), or a fresh write. High blast
+    radius: this is essentially redoing F-013 + F-014 + the
+    integration tests at `stream_roundtrip.rs` and
+    `buffer_monitor.rs`. PRD ADR-006 ("librqbit over libtorrent
+    C++ FFI") is locked, so any swap would itself need PRD
+    revision — defeating the goal.
+
+  - **(d) File a PRD revision request** under "PRD Issues" (THIS
+    entry) relaxing the two invariants to "best-effort, subject
+    to torrent engine API capabilities" so the human can ratify.
+    Cost: 0 person-weeks beyond Session 034. Fastest gate-
+    clearer if accepted. Closure: the human edits PRD.md per the
+    proposed text, a follow-up session flips the §6A entries to
+    RESOLVED and the Feature Tracker entries to `[x]` in one
+    STATE.md diff (no code changes — the existing stream-mode-
+    prioritisation behavior already matches the proposed "best-
+    effort" semantics).
+
+  **Recommendation: (d) for §6A clearance; (a) in parallel for
+  long-term correctness.** Per Session 027 audit recommendation:
+  "(a) is the right long-term answer; (d) is the fastest gate-
+  clearer". (b) and (c) are emergency-only.
+
+  **Proposed verbatim PRD revisions.**
+
+  PRD §F-013, line at `PRD.md:582`. Replace:
+  ```
+  - Max connections per torrent: 200
+  ```
+  With:
+  ```
+  - Max connections per torrent: 200 (best-effort, subject to torrent engine API capabilities; honored when the underlying torrent engine exposes a public connection-cap option, otherwise the engine's defaults apply)
+  ```
+
+  PRD §F-014, lines at `PRD.md:647-652`. Replace:
+  ```
+  Piece priorities mapped to librqbit:
+
+  - Window `[position, position + 60s]`: HIGHEST
+  - Window `[position + 60s, position + 300s]`: HIGH
+  - Last piece of the active file: HIGH
+  - All others: NORMAL
+  ```
+  With:
+  ```
+  Piece priorities mapped to librqbit (best-effort, subject to engine API):
+
+  - Where the engine exposes a public piece-priority API: window `[position, position + 60s]` → HIGHEST, `[position + 60s, position + 300s]` → HIGH, last piece of the active file → HIGH, all others → NORMAL
+  - Where the engine does NOT expose a public piece-priority API (librqbit 8.1.x as of 2026-05): rely on the engine's stream-mode prioritisation anchored at the active read offset (the existing `Session::stream(file_idx)` call site in `kino_torrent::engine::AddedTorrent::open_stream`)
+  ```
+
+  Both revisions preserve the PRD's intent ("downloads bias toward
+  what the player needs next; concurrent peer connections are
+  bounded") while making the specific invariants engine-capability-
+  dependent. The F-013 integration test at
+  `crates/kino-server/tests/stream_roundtrip.rs` (full HTTP path,
+  byte-for-byte assertion, Range semantics) and the F-014
+  integration tests at `crates/kino-torrent/tests/buffer_monitor.rs`
+  (fast-torrent → SAFE, synthetic-slow → NEEDS_PREBUFFER, position-
+  update → recompute) all pass under the stream-mode-prioritisation
+  path; the proposed revision does NOT change runtime behavior, it
+  only changes the PRD's gate language.
+
+  **Why not also propose ADR-006 revision?** ADR-006 ("librqbit
+  over libtorrent C++ FFI") was a `Rust + safety` choice that
+  remains correct regardless of the public-API gap. Revising ADR-
+  006 would imply an engine swap (option (c)), which is not the
+  proposed closure path. The librqbit-binding decision stands;
+  only the §F-013 / §F-014 mechanism-level text needs adjustment.
+
+  **What the human ratification flow looks like.**
+
+  1. Human reads this PRD Issues entry plus the linked §6A
+     entries for F-013 and F-014.
+  2. Human decides: accept the proposed PRD revisions, or pursue
+     option (a) / (b) / (c) instead.
+  3. If accepted: human edits PRD.md per the verbatim
+     replacement text above, commits to `main` (PRD edits are
+     human-only per the harness rule). A follow-up agent session
+     flips both §6A entries to RESOLVED + the F-013 / F-014
+     Feature Tracker checkboxes to `[x]` in one STATE.md edit.
+  4. If rejected and option (a) chosen: a follow-up agent
+     session drafts the upstream PR text in detail (in
+     `STATE.md` or a sibling file) and submits it via the GitHub
+     MCP server to ikatson/rqbit. The agent CANNOT merge
+     upstream; the human or upstream maintainer does that.
+     Once upstream lands and a new librqbit version is
+     published, a further agent session bumps the workspace dep
+     and wires the new fields.
+  5. If options (b) / (c) chosen: substantially larger multi-
+     session scope; the agent waits on the human's go-ahead.
+
+  **Impact on §6A:** conditions 1 and 2 ("Every F-XXX [x] in
+  STATE.md" and "Every code-acceptance criterion within each
+  F-XXX is satisfied by code on main") are NOT satisfied until
+  the human either ratifies this revision OR an alternative
+  closure path lands. The agent therefore does NOT declare
+  `PRD COMPLETE`; Step 15 prints the "§6A not yet complete"
+  branch. This entry is the formal closure-path file; the §6A
+  F-013 and F-014 entries below are amended with a "Closure path
+  filed (Session 034)" subsection pointing here.
+
 ---
 
 ## §6A Code-Acceptance Regressions
@@ -8487,6 +8974,19 @@ Recommendation: (a) is the right long-term answer; (d) is the
 fastest gate-clearer. (b)/(c) only if (a) is rejected upstream and
 (d) is unacceptable to the human.
 
+**Closure path filed (Session 034) — option (d) selected.** See
+the PRD Issues entry "§F-013 max_connections + §F-014 piece-
+priority — librqbit 8.1.1 public API gap" above for the verbatim
+proposed PRD revision text, librqbit public-API survey (cross-
+checked 2026-05-19 against the registry copy at
+`peer_connection.rs:57-65` / `session.rs:382-432` / `limits.rs:10-12`
+/ `chunk_tracker.rs:218`), upstream-PR diff sketch for parallel
+option (a), and human-ratification flow. This entry STAYS OPEN
+until the human ratifies the proposed PRD revision (option (d))
+OR an alternative closure path (a/b/c) lands; ADR-132 formalizes
+the "human-gated §6A regression" classification. The F-013
+Feature Tracker checkbox stays `[ ]`.
+
 ### F-014 / Piece-priority window assignment
 
 **PRD §F-014 (locked):**
@@ -8509,6 +9009,21 @@ upstream PR that exposes `max_connections_per_torrent` should
 also expose the piece-priority / per-file priority API surface
 (`update_only_files`, `file_priorities`, `chunk_tracker_*`)
 currently in `pub(crate)`.
+
+**Closure path filed (Session 034) — option (d) selected.** See
+the PRD Issues entry "§F-013 max_connections + §F-014 piece-
+priority — librqbit 8.1.1 public API gap" above for the verbatim
+proposed PRD revision text replacing the `PRD.md:647-652` block
+with a tiered "where the engine exposes a public piece-priority
+API ... where it does not" formulation. The proposal cites
+`chunk_tracker.rs:218`'s `file_priorities: &'a FilePriorities`
+`pub(crate)` visibility as the API gap; the upstream-PR diff
+sketch in the PRD Issues block proposes lifting `FilePriorities`
+to `pub` and adding a `Live::update_file_piece_priorities(file_idx,
+ranges)` public method to enable option (a) in a future session.
+This entry STAYS OPEN until the human ratifies the proposed PRD
+revision (option (d)) OR an alternative closure path (a/b/c) lands.
+The F-014 Feature Tracker checkbox stays `[ ]`.
 
 ### ~~F-015 / Android DV decoder forcing~~ — RESOLVED in Session 033
 
