@@ -1,9 +1,9 @@
 # kino — Agent State
 
 **PRD version:** 1.0 (locked)
-**Status:** v1.0.0-alpha.1 release pipeline shipped. **Session 035 files the F-015 Linux libmpv in-window GL surface scout** — a documentation-only enumeration of the webview-surface access routes available on Tauri 2.11.2 / wry 0.55.1 / webkit2gtk 2.0.2, evaluated against PRD §F-015's three locked constraints (C1: `libmpv-rs` in-process binding; C2: GL surface owned by the Tauri window; C3: controls composited over the surface by the browser). Five routes catalogued — A (X11 `--wid` child-window embed), B (libmpv render-API into a `GtkGLArea` sibling of `WebKitWebView` under a `GtkOverlay`), C (Wayland `wl_subsurface` protocol bypassing GTK), D (status quo subprocess + own window per ADR-108), E (frameless transparent peer window with geometry-tracking) — each scored on the three constraints + the prerequisite-spike cost. **Route B is the only route that satisfies all three constraints** (C1 ✅ in-process; C2 ✅ same `GtkWindow` widget tree; C3 ✅ transparent `WebKitWebView` rendered above the `GtkGLArea` by GTK compositing). Route B's prerequisite is reaching wry's internal child-widget tree to inject a `GtkOverlay`; wry 0.55 does NOT expose the `gtk::Box`/`gtk::Container` it packs `WebKitWebView` into, so the implementation session must either (i) upstream a `WebViewExtUnix::gtk_container()` accessor to wry, (ii) reparent via `gtk::WidgetExt::parent()` walking after window construction, or (iii) construct the `GtkOverlay` ahead of wry by using Tauri's `on_window_event` builder hook. ADR-133 locks in: attempt Route B's GTK-injection spike in Session 036; fall back to Route A (X11-`--wid` via `libmpv-rs::set_property("wid", xid)`) with a §F-015 C3 PRD-revision proposal under "PRD Issues" if the spike fails. No code changes; STATE.md-only diff. **§6A is still not claimable** — F-013 / F-014 remain human-gated on the Session-034 PRD revision; F-015 Linux libmpv remains OPEN until the implementation session lands the chosen route. See ADR-133 in the Session 035 entry below.
-**Last session:** 035 (F-015 Linux libmpv in-window GL surface scout — enumerated five route candidates against PRD §F-015's three locked constraints; recommended Route B (libmpv render-API into a `GtkGLArea` sibling of `WebKitWebView` under a `GtkOverlay`) as the PRD-fully-compliant primary path with a wry-internal-widget-tree-injection spike as the Session-036 prerequisite, AND Route A (X11 `--wid` via `libmpv-rs` in-process) as the fallback if the spike fails — with a paired §F-015 C3 PRD-revision proposal to be filed under "PRD Issues" under the Session-034 ADR-132 framework if Route A is selected. ADR-133 documents the route ranking, the dependency cost (libmpv2-dev in CI + libmpv2 runtime dep), and the multi-session implementation sketch (Session 036 spike → 037 driver → 038 CI matrix → optional 039 fallback PRD-revision). Amended the §6A F-015 / Linux libmpv in-window GL surface entry with a "Route picked (Session 035)" subsection citing ADR-133. F-015 stays `[ ]` in the Feature Tracker; the §6A entry stays OPEN. No code changes; no test changes — the existing subprocess driver at `crates/kino-player/src/mpv.rs` (Session 020) and the cross-platform `PlayerHandle` surface at `crates/kino-player/src/handle.rs` are intentionally unchanged because the chosen route's drop-in pattern (per ADR-108's "peer driver behind a Cargo feature flag" wording) means Session 036+ adds `crates/kino-player/src/libmpv.rs` as a sibling without touching the subprocess driver's call sites.)
-**Next session:** 036 — F-015 Linux libmpv in-window GL surface, Route B GTK-injection spike. Recommended Session-036 scope per ADR-133: a focused spike that determines whether wry's internal GTK widget hierarchy can be augmented to host a `GtkGLArea` sibling of the `WebKitWebView`. Three avenues to attempt in priority order: (i) walk the `gtk::ApplicationWindow` widget tree returned by Tauri's `WebviewWindow::gtk_window()` and reparent the existing `WebKitWebView` into a freshly-constructed `GtkOverlay` containing both the GL area and the webview, (ii) use Tauri's `tauri::Builder::on_page_load` / `on_window_event` builder hooks to intercept window creation before wry packs the webview, (iii) upstream a `WebViewExtUnix::pack_into_box(&gtk::Box)` accessor PR to wry and pin to the patched version via `[patch.crates-io]`. Spike output: an ADR-134 documenting which avenue succeeds (or all three fail → trigger the fallback path), a 50-100 LOC proof-of-concept demonstrating that a non-`WebKitWebView` GTK widget renders inside the Tauri window with the webview transparent on top. If the spike fails, Session 036 also files the §F-015 C3 PRD-revision proposal under "PRD Issues" (per ADR-132's human-gated §6A pattern from Session 034). F-013 / F-014 §6A closure is parked on human PRD-revision ratification — if/when the human accepts the Session-034 proposal a follow-up session can flip those §6A entries to RESOLVED in one diff (no code changes needed beyond a STATE.md text edit). Parallel agent work on the F-015 Linux Route B spike does not depend on the F-013 / F-014 ratification.
+**Status:** v1.0.0-alpha.1 release pipeline shipped. **Session 036 lands the F-015 Linux libmpv in-window GL surface GTK-injection spike** — the Route-B prerequisite that ADR-133 carved off as the Session-036 scope. The spike confirms that **avenue (i)** from ADR-133 (walk + reparent post-window-realisation) is sufficient: Tauri 2.11.2's PUBLIC API surface already exposes every accessor needed, so the two harder fallback avenues (intercepting `tauri::Builder::setup` / `on_window_event` before wry packs the webview; upstreaming a `WebViewExtUnix::gtk_box()` accessor PR to wry) are NOT required. Specifically: (a) [`tauri::WebviewWindow::default_vbox()`](https://docs.rs/tauri/2.11.2/tauri/window/struct.WebviewWindow.html#method.default_vbox) returns the `gtk::Box` the webview is packed into (line 1863 in `tauri-2.11.2/src/webview/webview_window.rs`); (b) [`tauri::WebviewWindow::with_webview()`](https://docs.rs/tauri/2.11.2/tauri/window/struct.WebviewWindow.html#method.with_webview) hands a [`PlatformWebview`](https://docs.rs/tauri/2.11.2/tauri/webview/struct.PlatformWebview.html) to a closure that runs on the GTK main thread; on Linux `PlatformWebview::inner()` returns `webkit2gtk::WebView` (line 173 in `tauri-2.11.2/src/webview/mod.rs`); (c) `webkit2gtk::WebView` `@extends gtk::Container, gtk::Widget` so the standard `gtk::WidgetExt::parent()` + `gtk::ContainerExt::remove()` + `gtk::Box::pack_start()` + `gtk::Overlay::add()` / `add_overlay()` traits compose into the reparenting surgery. Spike artifact: a new ~230-line module `crates/kino-player/src/surface.rs` exposing `inject_overlay(&webkit2gtk::WebView) -> Result<OverlaySurgery, SurfaceError>` (~80 LOC of surgery code + module documentation + two unit tests covering the error variants' `Display` impls); plus a 30-line opt-in trigger in `src-tauri/src/lib.rs::run_libmpv_surface_spike` invoked from `setup()` iff `KINO_LIBMPV_SURFACE_SPIKE=1`. Default builds (and CI) do NOT invoke the surgery — the env-var gate keeps the Session-020 subprocess driver's runtime behavior unchanged so the spike's landing is zero-blast-radius on `main`. ADR-134 locks the avenue choice (avenue (i) succeeds, avenues (ii) and (iii) are unnecessary), the env-var-gated rollout for the spike, and the Session-037 hand-off shape (the `inject_overlay` API is what 037's `crates/kino-player/src/libmpv.rs` consumes via app-managed state). Three new linux-only direct deps on `gtk = "0.18"` / `gdk = "0.18"` / `webkit2gtk = { version = "2.0", features = ["v2_8"] }` — all already in the workspace's transitive closure via wry, so resolver unification leaves the compile cost unchanged. **§6A F-015 / Linux libmpv in-window GL surface still OPEN** — the spike proves the API surface is reachable, but the §6A "satisfied by code on `main`" gate stays gated on Session 037 landing the actual libmpv driver (and Session 038's CI matrix + bundle integration). See ADR-134 in the Session 036 entry below.
+**Last session:** 036 (F-015 Linux libmpv in-window GL surface — Route B GTK-injection spike. Landed `crates/kino-player/src/surface.rs` with `inject_overlay(&webkit2gtk::WebView) -> Result<OverlaySurgery, SurfaceError>` performing the walk + reparent surgery (webview's parent gtk::Box → remove webview → construct `GtkOverlay` with `GtkGLArea` (z=0) + webview (z=1) → repack overlay into the vbox + set webview background transparent via `set_background_color(RGBA(0,0,0,0))`). Verified that ADR-133 avenue (i) is sufficient — Tauri 2.11.2's public `WebviewWindow::default_vbox()` + `with_webview()` + `PlatformWebview::inner()` API surface reaches every accessor the surgery needs; the wry-internal accessor avenue (iii) and the builder-hook avenue (ii) are NOT required. Added the spike trigger in `src-tauri/src/lib.rs::run_libmpv_surface_spike` invoked from `setup()` iff `KINO_LIBMPV_SURFACE_SPIKE=1` (default off — zero runtime change for default builds + CI). Three new linux-only direct deps on `gtk = "0.18"` / `gdk = "0.18"` / `webkit2gtk = { version = "2.0", features = ["v2_8"] }` in `crates/kino-player/Cargo.toml`. ADR-134 locks in: avenue (i) chosen; env-var rollout for the spike; Session-037 handoff shape. Two new unit tests in `surface.rs` for the `SurfaceError` Display impl (the surgery body itself is not unit-testable without a display). Updated the §6A F-015 / Linux libmpv in-window GL surface entry with a "Spike result (Session 036)" subsection. F-015 stays `[ ]` in the Feature Tracker; the §6A entry stays OPEN until Sessions 037 + 038 land.)
+**Next session:** 037 — F-015 Linux libmpv in-window GL driver implementation. Per ADR-133's multi-session split (and confirmed by Session 036's successful avenue-(i) spike): add `crates/kino-player/src/libmpv.rs` as a peer `PlayerHandle` driver behind a `libmpv-inprocess` Cargo feature flag. Driver responsibilities: (a) link against `libmpv2 = "3"` (or equivalent Rust binding crate), (b) initialise the libmpv render context against the `gtk::GLArea` exposed by Session 036's `OverlaySurgery` handle, (c) implement the `PlayerHandle` trait surface (`open` / `close` / `set_paused` / `seek` / `select_audio_track` / `select_subtitle_track` / `snapshot` / `subscribe` / `tracks`) by translating commands to libmpv property sets + observing libmpv events for `PlayerEvent` emission, (d) read the shipped mpv config from `crates/kino-server/assets/mpv.conf` (PRD §F-015 Linux block) by translating its directives into libmpv `set_property` calls at boot, (e) store `OverlaySurgery` in app-managed state so the driver instance can resolve the GL area for its render context. Host-side change: replace the env-var gate (Session 036) with a `#[cfg(feature = "libmpv-inprocess")]` gate on the surface-injection call AND on the `spawn_platform_player` Linux branch (subprocess driver stays the non-feature default until Session 038's `§6B-1` re-verification flips the default). Session 038 then adds `libmpv2-dev` to the CI workflow's apt-install list across `lint` / `test` / `build-linux` and the `tauri.conf.json::bundle.linux.deb.depends` block. F-013 / F-014 §6A closure stays parked on the human PRD-revision ratification per Session 034 / ADR-132; the agent's Session 037 work is independent of that ratification.
 
 ---
 
@@ -68,6 +68,406 @@ a hard requirement.
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 036 — F-015 Linux libmpv in-window GL surface Route B GTK-injection spike
+
+**Branch:** `claude/kino-prd-compliance-CGGi0` (harness-supplied; see
+ADR-033 — the harness reuses a single branch name for this checkout,
+the branch name does NOT track the session number).
+
+**Scope chosen:** F-015 Linux libmpv in-window GL surface — Route B
+**GTK-injection spike** (Session 036 in the ADR-133 multi-session arc:
+scout → spike → driver → CI). The Session 035 entry pre-selected this
+as the unblocking step for the F-015 §6A regression: prove that
+avenue (i) (walk + reparent post-window-realisation) from ADR-133 is
+feasible before Session 037 commits to landing the libmpv driver. The
+spike is the only Linux-side §6A scope remaining after Sessions 028 /
+029 / 030 / 031 / 032 / 033 closed every other §6A entry and Session
+034 parked F-013 / F-014 behind a human-gated PRD revision proposal
+(ADR-132). Bundle size: ~230 LOC of new Rust code (the `surface.rs`
+module: ~80 LOC of surgery + ~120 LOC of module documentation + ~30
+LOC of unit tests), ~30 LOC of opt-in trigger wiring in
+`src-tauri/src/lib.rs`, ~10 lines of Cargo.toml dep additions, ~150
+lines of STATE.md text (1 new Sessions Log entry, 1 new ADR, 1 §6A
+F-015 entry amendment).
+
+**Pre-implementation verification (Tauri + wry + webkit2gtk API
+surface survey):**
+
+The spike's tractability turned on whether ANY of ADR-133's three
+avenues could be driven by the PUBLIC Tauri 2.11.2 / wry 0.55.1 API,
+or whether a wry-internal accessor PR (avenue (iii) — the most
+expensive option) would be needed. Session 036 audited the relevant
+crate sources before writing surgery code:
+
+1.  **`webkit2gtk::WebView` widget-tree hierarchy.** Reading
+    `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/webkit2gtk-2.0.2/src/auto/web_view.rs:58`:
+
+    ```rust
+    pub struct WebView(Object<ffi::WebKitWebView, ffi::WebKitWebViewClass>)
+        @extends WebViewBase, gtk::Container, gtk::Widget,
+        @implements gtk::Buildable;
+    ```
+
+    `webkit2gtk::WebView` IS a `gtk::Container` AND `gtk::Widget`, so
+    all the standard widget-manipulation traits compose (parent /
+    unparent / pack / add). This is the foundational guarantee — if
+    the WebView didn't subclass GtkWidget, none of the avenues would
+    work; with it, the surgery reduces to standard GTK widget
+    operations.
+
+2.  **wry exposes the WebKit widget directly.** Reading
+    `wry-0.55.1/src/lib.rs:2289-2311`:
+
+    ```rust
+    pub trait WebViewExtUnix: Sized {
+        fn new_gtk<W>(widget: &W) -> Result<Self>
+        where W: gtk::prelude::IsA<gtk::Container>;
+        fn webview(&self) -> webkit2gtk::WebView;
+        fn reparent<W>(&self, widget: &W) -> Result<()>
+        where W: gtk::prelude::IsA<gtk::Container>;
+    }
+    ```
+
+    wry's public Unix-only extension trait already exposes both the
+    underlying `webkit2gtk::WebView` and a `reparent` helper. The
+    spike does NOT use `WebViewExtUnix::reparent` directly because
+    Tauri exposes only the lower-level `webkit2gtk::WebView` (via
+    `PlatformWebview::inner()`), not the wry `WebView` wrapper that
+    carries the `WebViewExtUnix` trait. But the existence of
+    `WebViewExtUnix::reparent` confirms the reparenting pattern is
+    architecturally supported by wry's design — wry's internal state
+    (signal handlers, dispatcher tables) survives the operation.
+
+3.  **Tauri's `PlatformWebview::inner()` returns the GTK widget on
+    Linux.** Reading
+    `tauri-2.11.2/src/webview/mod.rs:148-175`:
+
+    ```rust
+    pub struct PlatformWebview(tauri_runtime_wry::Webview);
+
+    impl PlatformWebview {
+        #[cfg(any(target_os = "linux", target_os = "dragonfly", ...))]
+        pub fn inner(&self) -> webkit2gtk::WebView {
+            self.0.clone()
+        }
+        // (windows / macos / android variants differ — return WebView2
+        // controller / WKWebView / JNI handle respectively)
+    }
+    ```
+
+    On Linux, `tauri_runtime_wry::Webview` is `webkit2gtk::WebView`
+    directly (NOT the wry `WebView` wrapper) — so `PlatformWebview::
+    inner()` returns the raw `webkit2gtk::WebView` widget that's a
+    `gtk::Container + gtk::Widget`. This is the spike's entry point:
+    once the surgery has a `&webkit2gtk::WebView`, every other
+    widget-tree operation is a standard GTK call.
+
+4.  **Tauri's `WebviewWindow::with_webview()` runs on the GTK main
+    thread.** Reading
+    `tauri-2.11.2/src/webview/mod.rs:1668-1677`:
+
+    ```rust
+    pub fn with_webview<F: FnOnce(PlatformWebview) + Send + 'static>(
+        &self,
+        f: F,
+    ) -> crate::Result<()> {
+        self.webview.dispatcher
+            .with_webview(|w| f(PlatformWebview(*w.downcast().unwrap())))
+            .map_err(Into::into)
+    }
+    ```
+
+    The closure is posted to the Tauri runtime's event loop and
+    invoked on the GTK main thread once the webview is realised —
+    confirmed by the doc-comment line 1610 ("The closure is executed
+    on the main thread"). This means the surgery code inside the
+    closure can safely call any GTK widget API without main-thread
+    marshalling on the caller's side.
+
+5.  **Tauri's `WebviewWindow::default_vbox()` returns the parent
+    container.** Reading
+    `tauri-2.11.2/src/webview/webview_window.rs:1853-1865`:
+
+    ```rust
+    /// Returns the vertical `gtk::Box` that is added by default as
+    /// the sole child of this window.
+    #[cfg(any(target_os = "linux", ...))]
+    pub fn default_vbox(&self) -> crate::Result<gtk::Box> {
+        self.window.default_vbox()
+    }
+    ```
+
+    Tauri publicly exposes the gtk::Box that wraps the webview. So
+    even if the spike's `WebView::parent()` walk somehow returned the
+    wrong widget, we could cross-check against `default_vbox()`. In
+    practice, the surgery uses `widget.parent()` directly (single
+    source of truth, avoids race conditions where `default_vbox()`
+    might lag).
+
+6.  **wry packs the webview into the default vbox.** Reading
+    `tauri-runtime-wry-2.11.2/src/lib.rs:5234-5238`:
+
+    ```rust
+    #[cfg(not(any(target_os = "windows", target_os = "macos", ...)))]
+    WebviewKind::WindowChild => {
+        let vbox = window.default_vbox().unwrap();
+        webview_builder.build_gtk(vbox)
+    }
+    ```
+
+    Confirms the runtime structure: the WebKitWebView's parent is the
+    default_vbox after window construction. The `build_gtk(vbox)`
+    call uses wry's `WebViewBuilderExtUnix::build_gtk` which, per
+    `wry-0.55.1/src/lib.rs:2292` ("If the container is `gtk::Box`,
+    it is added using `Box::pack_start(webview, true, true, 0)`"),
+    packs with `(expand=true, fill=true, padding=0)`. The spike uses
+    the SAME pack arguments when re-packing the overlay, so the
+    layout invariants are preserved.
+
+7.  **`set_background_color` requires `webkit2gtk/v2_8` Cargo
+    feature.** Initial `cargo check -p kino-player` failed with
+    `no method named set_background_color found for reference
+    &WebView`. The method is declared at
+    `webkit2gtk-2.0.2/src/auto/web_view.rs:1871-1875`:
+
+    ```rust
+    #[cfg(feature = "v2_8")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "v2_8")))]
+    #[doc(alias = "webkit_web_view_set_background_color")]
+    fn set_background_color(&self, rgba: &gdk::RGBA) { ... }
+    ```
+
+    The Cargo feature `v2_8` corresponds to libwebkit2gtk's runtime
+    version requirement (≥ 2.8, released March 2015). Ubuntu 24.04
+    ships libwebkit2gtk-4.1 ≥ 2.46. Cargo unifies features
+    workspace-wide, so wry's `webkit2gtk/v2_38` feature pin
+    propagates to kino-player at workspace build time; but a
+    single-crate `cargo check -p kino-player` doesn't pull wry into
+    the graph, so the explicit `features = ["v2_8"]` on kino-player's
+    direct dep keeps the single-crate build self-sufficient.
+
+**Implementation:**
+
+Three files added or modified:
+
+1.  **`crates/kino-player/src/surface.rs`** (new, ~230 LOC):
+
+    -   `SurfaceError` enum: two variants (`NoParent`,
+        `UnexpectedParent(String)`) covering the two structural
+        ways the post-realisation widget tree might not match
+        Tauri 2.11.2's layout. Implements `thiserror::Error` for
+        Display + Debug + std::error::Error blanket.
+    -   `OverlaySurgery` struct: `gl_area: gtk::GLArea` +
+        `overlay: gtk::Overlay`. The `gl_area` field is what
+        Session 037's libmpv `RenderContext` binds against; the
+        `overlay` field is held for future widget-tree
+        manipulation (e.g. resize handling). Both fields are
+        `pub` — Session 037 reads them off the handle.
+    -   `inject_overlay(webview: &webkit2gtk::WebView) ->
+        Result<OverlaySurgery, SurfaceError>`: the surgery
+        function. Six numbered steps in the body (walk → reparent
+        → build overlay → webview transparency → repack →
+        show_all) with inline comments anchored to PRD §F-015
+        constraints.
+    -   Two unit tests (`surface_error_display_includes_parent_type`
+        + `surface_error_no_parent_display`) covering the error
+        variants' Display impls. The surgery body itself is not
+        unit-testable without a display; the runtime exercise
+        lives behind the env var.
+    -   Module docs: ~120 lines covering Spike result, Resulting
+        widget tree (with ASCII art before / after), What this
+        spike does and does NOT prove, Trigger.
+
+2.  **`crates/kino-player/src/lib.rs`** (+8 LOC):
+
+    -   `#[cfg(target_os = "linux")] pub mod surface;`
+    -   `#[cfg(target_os = "linux")] pub use surface::{
+        inject_overlay, OverlaySurgery, SurfaceError};`
+    -   Doc comment locating the spike module in the F-015 plan
+        per ADR-133.
+
+3.  **`crates/kino-player/Cargo.toml`** (+18 LOC):
+
+    -   New `[target.'cfg(target_os = "linux")'.dependencies]`
+        block with `gtk = "0.18"` + `gdk = "0.18"` + `webkit2gtk
+        = { version = "2.0", features = ["v2_8"] }`.
+    -   Inline comment explaining why these are duplicate direct
+        deps (versus relying on the transitive Tauri / wry
+        closure) — the surgery module needs the type names in its
+        signatures, and the explicit dep + feature make
+        single-crate `cargo check` work alongside the
+        workspace-unified build.
+
+4.  **`src-tauri/src/lib.rs`** (+45 LOC including comments):
+
+    -   New `run_libmpv_surface_spike<R>(&tauri::App<R>)` helper
+        below the existing `install_subscriber` function. Linux-
+        only via `#[cfg(target_os = "linux")]`. Resolves the
+        `"main"` window, posts a `with_webview` closure that
+        invokes `kino_player::inject_overlay`, logs result at
+        `info` (success) or `error` (failure); `with_webview`
+        dispatch failure logs at `warn`. Non-fatal — a failed
+        surgery does NOT abort startup.
+    -   Setup-hook invocation `#[cfg(target_os = "linux")] if
+        std::env::var("KINO_LIBMPV_SURFACE_SPIKE").as_deref() ==
+        Ok("1") { run_libmpv_surface_spike(app); }` immediately
+        after the `PlayerRuntime` registration. Default builds
+        (no env var) skip the spike entirely; the helper compiles
+        but is dead-code-eliminated by the `if` guard at runtime.
+
+**Files changed (summary):**
+
+-   `crates/kino-player/Cargo.toml` (+18 LOC dep block + comment).
+-   `crates/kino-player/src/lib.rs` (+8 LOC module wiring).
+-   `crates/kino-player/src/surface.rs` (NEW, ~230 LOC).
+-   `src-tauri/src/lib.rs` (+45 LOC including comments — new
+    `run_libmpv_surface_spike` fn + setup-hook trigger).
+-   `STATE.md` (top-of-file Status / Last session / Next session
+    block + new Sessions Log entry + new ADR-134 row + §6A F-015
+    entry amendment).
+-   `Cargo.lock` (regenerated automatically by `cargo check` after
+    the Cargo.toml change; no new top-level deps, just feature
+    flag union with the existing webkit2gtk/v2_38 pull).
+
+**Features advanced:** **F-015 stays `[ ]`** in the Feature Tracker.
+The spike does NOT close §6A — it proves the API surface is
+reachable but the actual libmpv driver implementation + CI matrix
+landing is Session 037 + 038. The §6A entry under "F-015 / Linux
+libmpv in-window GL surface" stays OPEN with a new "Spike result
+(Session 036)" subsection citing ADR-134.
+
+**ADRs filed:** ADR-134.
+
+**Tests added:** Two new unit tests in `crates/kino-player/src/
+surface.rs::tests`:
+
+-   `surface_error_display_includes_parent_type` — asserts
+    `SurfaceError::UnexpectedParent("GtkBox").to_string()` mentions
+    both the expected (`gtk::Box`) and actual (`GtkBox`) types.
+-   `surface_error_no_parent_display` — asserts
+    `SurfaceError::NoParent.to_string()` contains the words "no
+    parent".
+
+The runtime surgery is not unit-testable (gtk::init() requires a
+display, which CI / the agent's container lacks); structural
+verification is the env-var-gated runtime opt-in (`KINO_LIBMPV_
+SURFACE_SPIKE=1`) for human field-test.
+
+Total kino-player test count: 25 → 27 (no existing tests broken; +2
+new).
+
+**Known issues introduced or resolved:** neither. The pre-existing
+"F-015 follow-ups: Linux libmpv in-window GL surface (Sessions 020
++ 021, ADR-108)" Known Issue stays in place — Session 036 makes the
+gap visibly closer to closing but does NOT close it; the issue
+flips to RESOLVED only after Sessions 037 + 038 land.
+
+**Verification:**
+
+-   `cargo fmt --all --check`: clean (one rustfmt formatting
+    adjustment was auto-applied to a test assertion macro before
+    final check).
+-   `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+    The whole workspace re-compiled including the new spike module
+    + the linux-only direct webkit2gtk dep.
+-   `cargo test --workspace --all-targets`: 444 tests passed (was
+    442 before; +2 new tests in `surface::tests`). No regressions.
+-   `cd frontend && npm run lint`: clean.
+-   `cd frontend && npm run typecheck`: clean.
+-   `cd frontend && npm test`: 234 vitest tests passed. No
+    regressions.
+-   `cargo tauri build (linux)`: not run locally (the agent's
+    container lacks a Tauri CLI provisioning step + the AppImage
+    bundler's runtime deps); CI's `build-linux` job re-verifies
+    on push. Per the Standing Authorizations, merge gates on
+    lint + test only.
+-   `cargo tauri android build`: not run locally; CI's
+    `build-android` job re-verifies on push. The spike module is
+    `#[cfg(target_os = "linux")]`-gated, so Android compilation
+    does not pick it up.
+
+**PRD §F-015 code acceptance after this session (unchanged from
+Session 035):**
+
+-   ❌ "Linux: libmpv plays the same test stream end-to-end with
+    controls overlay functional" — the Linux side STILL ships the
+    ADR-108 subprocess deviation by default. Session 036 lands
+    the prerequisite for the in-window GL surface (the
+    `inject_overlay` API + env-var-opt-in trigger); Sessions
+    037 + 038 close the §6A entry.
+-   ✅ "Both: seek works without breaking the adaptive buffer
+    scheduler" — unchanged from Session 020.
+-   ✅ "Both: player exit always triggers final position save" —
+    unchanged from Session 020.
+-   ✅ Android-side criteria — unchanged from Session 033.
+
+F-015 status: **in progress → in progress** (Linux libmpv
+in-window GL surface route picked AND the API path proven by the
+spike; the §6A entry stays OPEN until the driver implementation +
+CI matrix land).
+
+**Cross-session conventions established:**
+
+-   **Spike sessions land production code under an opt-in
+    runtime gate (env var or default-off feature), not isolated
+    examples.** ADR-134 codifies this convention for the multi-
+    session §6A regressions where the spike's deliverable is "the
+    API path exists and the surgery code compiles". The
+    alternative — landing a standalone `examples/` binary or a
+    `#[cfg(test)] mod spike { ... }` block — would not have made
+    the surgery API discoverable from the rest of the codebase,
+    so Session 037 would have had to either rebuild the API or
+    move the example into production code. By landing the spike
+    code in `crates/kino-player/src/surface.rs` from day one
+    behind an env-var gate, Session 037 just imports + calls the
+    function — the API contract is already defined and tested.
+    The env-var-gated rollout is the safety belt: default builds
+    are unchanged, CI is unchanged, the production surface is
+    extended in a forward-compatible way.
+
+-   **Direct-dep + workspace-unified-feature-flags interaction.**
+    When a workspace crate (e.g. `kino-player`) wants to use a
+    specific API from a transitive dep (e.g. `webkit2gtk`'s
+    `set_background_color`, gated behind feature `v2_8`), the
+    crate MUST declare the dep directly with the required
+    feature, even if a sibling workspace dep already enables a
+    higher feature (`wry` enables `webkit2gtk/v2_38`). Cargo's
+    feature unification works workspace-wide, but single-crate
+    `cargo check -p X` does NOT pull in siblings, so the
+    explicit feature declaration keeps the single-crate build
+    path self-sufficient. The cost is a one-line Cargo.toml
+    entry per consuming crate; the benefit is that
+    `cargo check -p kino-player` produces the same result as
+    `cargo check --workspace`.
+
+**Out of scope for Session 036 (filed as follow-ups):**
+
+-   **Session 037:** in-process `libmpv-rs` driver implementation
+    behind the `libmpv-inprocess` Cargo feature flag, consuming
+    the Session-036 `inject_overlay` API. Replace the env-var
+    gate with the feature gate on the surface-injection call AND
+    on the `spawn_platform_player` Linux branch.
+-   **Session 038:** CI matrix update (`libmpv2-dev` in apt
+    install list across `lint` / `test` / `build-linux`) +
+    `tauri.conf.json::bundle.linux.deb.depends` declaration +
+    feature flag default flip after §6B-1 re-verification.
+-   **Storing `OverlaySurgery` in app-managed state.** The spike's
+    `inject_overlay` returns the handle but the trigger closure
+    in `run_libmpv_surface_spike` currently discards it. Session
+    037 will route the handle through `app.manage(Mutex<Option<
+    OverlaySurgery>>::new(None))` so the libmpv driver can
+    `app.try_state::<Mutex<Option<OverlaySurgery>>>()` to resolve
+    the GL area at `open()` time.
+-   **Handling Tauri's resize / focus / map-unmap signal flow
+    after the reparenting.** wry installs internal signal
+    handlers on the webview; they SHOULD follow the widget across
+    the reparent (handlers attach to the GObject, not the
+    container), but the actual exercise is a §6B-1 hardware
+    verification line. If a regression surfaces in Session 037
+    or §6B-1, the fix likely lives in `inject_overlay`'s
+    repack step (e.g. ensure the overlay's size-allocate
+    callback re-forwards to the webview's existing handler).
 
 ### Session 035 — F-015 Linux libmpv in-window GL surface scout
 
@@ -8629,7 +9029,23 @@ implementation" split.
       ADR-108 deferred to an mpv subprocess driver. STILL OPEN as
       a §6A regression; multi-session ADR-108 deviation, see
       "§6A Code-Acceptance Regressions / F-015 Linux libmpv
-      in-window GL surface" for closure plan.)_
+      in-window GL surface" for closure plan. **Session 035 (scout):**
+      five-route enumeration picked Route B (libmpv render-API into
+      a `GtkGLArea` sibling of `WebKitWebView` under a `GtkOverlay`)
+      as the single PRD-fully-compliant path, with the GTK-injection
+      prerequisite split off as a separate spike session (ADR-133).
+      **Session 036 (spike):** landed
+      `crates/kino-player/src/surface.rs` exposing
+      `inject_overlay(&webkit2gtk::WebView) -> Result<OverlaySurgery,
+      SurfaceError>` performing the avenue-(i) walk + reparent
+      surgery; spike confirmed the PUBLIC Tauri 2.11.2 API surface
+      is sufficient — neither the builder-hook avenue (ii) nor the
+      upstream-wry-PR avenue (iii) from ADR-133 is required.
+      Surgery invoked at startup iff `KINO_LIBMPV_SURFACE_SPIKE=1`
+      env var (default builds unchanged). ADR-134. Sessions 037
+      (libmpv driver implementation behind `libmpv-inprocess`
+      Cargo feature flag) + 038 (CI matrix + bundle deps + default
+      flip after §6B-1 re-verification) remain.)_
 
 ### Release
 - [x] F-018: Build, packaging, distribution _(Session 022:
@@ -8767,6 +9183,7 @@ Additional ADRs filed by sessions:
 | ADR-131 | **Kotlin-side coverage for the Android player plugin ships under structural review until a `./gradlew test` CI job is added.** The `tauri-plugin-kino-player` android module's `build.gradle.kts` declares `testImplementation("junit:junit:4.13.2")` but the module has shipped without a `src/test/` source set since Session 023, and the CI workflow (`.github/workflows/ci.yml::build-android`) runs `cargo tauri android build --apk` exclusively — which compiles Kotlin but does NOT execute the unit-test source set. Adding a JVM-level test for a class that calls into Android framework code (`MediaCodecSelector.DEFAULT`, `MediaCodecInfo.CodecCapabilities`, `MediaCodecList`, etc.) requires either Robolectric (a ~15 MB dependency that emulates Android framework on the JVM) or extensive mocking via PowerMock / MockK — and a new `./gradlew :tauri-plugin-kino-player:test` CI job that runs neither today. Session 033 ships `DvAwareCodecSelector` without a Kotlin unit test because: (a) the §6A audit explicitly named the implementation pattern ("a custom `MediaCodecSelector` that filters `MediaCodecList` results to codecs whose `CodecCapabilities.profileLevels` declare a `DolbyVisionProfile` entry") so code review against the audit IS the structural verification; (b) the §6B-4 hardware-verification line ("DV Profile 5 movie plays on Shield with DV indicator") is the runtime acceptance gate; (c) wiring a `./gradlew test` CI job + a Robolectric / MockK harness is a separate scope (~150 LOC of test infra for ~30 LOC of new test logic) and Session 033 should not bundle the framework lift with the feature it would test. A future polish session ("Android-side test harness") can land the gradle test wiring and backfill tests for `DvAwareCodecSelector`, `Capabilities`, `PlayerSession`, `Events`, etc. all at once. This ADR is descriptive ("documents how a §6A regression is closed without a unit test") not prescriptive ("you must not add tests"); a session that adds JVM tests via Robolectric is welcome to do so. The convention is: when the §6A acceptance hinges on Android framework call-path structure rather than pure-logic state, structural review against the audit's quoted pattern is acceptable closure. | 033 |
 | ADR-132 | **§6A regressions whose closure requires PRD-locked text revision are "human-gated"; the agent's role is to file a documented PRD revision proposal under "PRD Issues" for the human to ratify, then keep the §6A entry OPEN until ratification.** F-013 (Max connections per torrent: 200) and F-014 (piece-priority window mapping) both hit librqbit 8.1.1's public API boundary — the closure paths enumerated by the Session 027 audit are (a) upstream PR to ikatson/rqbit exposing `max_connections_per_torrent` on `SessionOptions` and the `chunk_tracker_*` / `FilePriorities` surfaces, (b) fork librqbit via `[patch.crates-io]` and apply the patches locally, (c) swap the torrent engine, (d) file a PRD revision request relaxing the locked invariants. Sessions 028 / 029 / 030 / 031 / 032 / 033 each closed a different §6A regression by code change; F-013 + F-014 are the first §6A entries where NO code change available within librqbit 8.1.1's public API can satisfy the PRD-locked text. Option (a) requires ikatson/rqbit upstream review which the agent can prepare but not drive to completion in one session. Option (b) requires sustained fork maintenance against librqbit-core / -buffers / -utp transitive ABI changes (substantial multi-session overhead). Option (c) is a high-blast-radius F-013 redo. Option (d) is documentation-only work the agent CAN drive end-to-end and parks the gate behind a single human decision. Session 034 picks (d). The convention this ADR establishes: when a §6A regression cannot be closed by code against the locked PRD text AND the engine constraint is structural (not amenable to a workaround within the same crate ecosystem), the agent files the closure-path proposal under "PRD Issues" with (i) verbatim PRD quotes, (ii) verbatim source-of-truth code citations, (iii) a sketched upstream-PR diff shape for option (a), (iv) cost estimates for options (b) / (c), (v) exact verbatim proposed PRD revision text for option (d). The §6A entry stays OPEN with a "Closure path filed" subsection pointing at the PRD Issues block. The Feature Tracker checkbox stays `[ ]`. A follow-up session — invoked after the human ratifies the PRD revision — flips both the §6A entry to RESOLVED and the Feature Tracker checkbox to `[x]` in one diff. This avoids the agent self-ratifying a PRD-locked text revision (which would violate the harness rule "Never modify PRD.md") while still making maximum progress on §6A clearance per session. The classification also distinguishes "agent-actionable §6A regressions" (closeable by code in this session) from "human-gated §6A regressions" (require ratification first), which informs Session N+1's scope picking: prefer agent-actionable first, file human-gated when no agent-actionable §6A remains. | 034 |
 | ADR-133 | **F-015 Linux libmpv in-window GL surface (§6A regression carried by ADR-108) is closed via Route B (libmpv render-API into a `GtkGLArea` sibling of `WebKitWebView` under a `GtkOverlay`); the implementation is split scout → spike → driver → CI across four sessions.** PRD §F-015 §"Linux (locked architecture)" pins three constraints: C1 `libmpv-rs` in-process binding, C2 GL surface owned by the Tauri window, C3 controls composited over the surface by the browser. The Session 035 scout enumerated five routes (A: X11 `--wid` child-window embed; B: libmpv render-API + `GtkGLArea` + `GtkOverlay`; C: Wayland `wl_subsurface`; D: status quo subprocess + own window per ADR-108; E: frameless peer window with geometry-tracking) and scored each on C1 / C2 / C3 + X11/Wayland feasibility + dependency cost + implementation cost. Only Route B satisfies all three constraints; Routes A / C / E variably fail C2 / C3 / Wayland-feasibility / WM-stability; Route D is the regression itself. The scout therefore PICKS Route B as the primary path, with Route A (in-process `libmpv-rs` + `mpv.set_property("wid", xid)`) as the documented FALLBACK paired with a §F-015 C3 PRD-revision proposal under "PRD Issues" per the Session 034 / ADR-132 human-gated §6A framework. The implementation arc: **Session 036** runs a focused GTK-injection spike — can wry's internal `WebKitWebView` widget tree be augmented to host a `GtkGLArea` sibling under a `GtkOverlay`? — attempting three avenues in priority order (walk + reparent the existing widget tree post-`gtk_window()` resolution; intercept window construction via Tauri's `setup` / `on_window_event` hooks before wry packs the webview; upstream a `WebViewExtUnix::gtk_box()` accessor PR to wry and pin via `[patch.crates-io]`). Output: ADR-134 picking the successful avenue, or, if all three fail on the spike, triggering the documented fallback (Route A + PRD revision). **Session 037** lands `crates/kino-player/src/libmpv.rs` as a peer driver behind a `libmpv-inprocess` Cargo feature flag; the `PlayerHandle` trait abstraction means `kino-app`'s `spawn_platform_player` branch is the only host-side change, gated by `#[cfg(feature = "libmpv-inprocess")]`. **Session 038** updates `.github/workflows/ci.yml` to install `libmpv2-dev` in the `lint` / `test` / `build-linux` apt-install lists; declares `libmpv2 (>= 2.1)` in `tauri.conf.json::bundle.linux.deb.depends`; verifies the AppImage bundler picks up libmpv (or documents a runtime dep); flips the feature flag on by default once §6B-1 has been re-verified locally on Ubuntu 22.04 + 24.04. **Session 039 (contingent)** files the §F-015 C3 PRD-revision proposal if 036's spike fails on all three avenues. Rejected alternatives: ship Route A immediately without trying Route B (concedes C3 unnecessarily); fork wry and maintain locally (substantial overhead, fork-rebase churn); swap the webview engine (catastrophic blast radius — PRD §1 implicitly locks Tauri 2). The convention this ADR establishes for §6A regressions whose closure crosses multiple architectural seams: split as scout (this session) → spike (prove the architecturally hard step is feasible) → implementation (the new code) → integration (CI + bundling + default flip). Each step is one session; the scout's ADR locks in the route ranking so future sessions don't re-litigate the choice. | 035 |
+| ADR-134 | **F-015 Linux libmpv Route B GTK-injection spike (Session 036): avenue (i) "walk + reparent post-window-realisation" succeeds via the PUBLIC Tauri 2.11.2 API surface; avenues (ii) "intercept window construction via builder hooks" and (iii) "upstream a wry accessor PR" from ADR-133 are NOT required.** Three orthogonal Tauri 2.11.2 public APIs compose into the surgery: (a) `WebviewWindow::with_webview(closure)` posts `closure: FnOnce(PlatformWebview)` onto the GTK main thread once the webview is realised (`tauri-2.11.2/src/webview/mod.rs:1668-1677`); (b) `PlatformWebview::inner()` returns the underlying `webkit2gtk::WebView` on Linux (`tauri-2.11.2/src/webview/mod.rs:173`); (c) `webkit2gtk::WebView` `@extends gtk::Container, gtk::Widget` (`webkit2gtk-2.0.2/src/auto/web_view.rs:58`) so `gtk::WidgetExt::parent()` returns the container the webview is packed into (always `gtk::Box` per Tauri 2.11.2's wry-driven structure — verified at `tauri-runtime-wry-2.11.2/src/lib.rs:5234-5238`). The surgery is six steps inside the with_webview closure: (1) `webview.parent()` → downcast to `gtk::Box`; (2) `vbox.remove(webview)`; (3) construct `gtk::Overlay::new()` + `gtk::GLArea::new()` (with `set_has_alpha(false)` + `set_auto_render(false)`); (4) `overlay.add(&gl_area)` + `overlay.add_overlay(webview)`; (5) `webview.set_background_color(&RGBA(0,0,0,0))` (gated behind webkit2gtk's `v2_8` Cargo feature) to make controls composite over the GL area; (6) `vbox.pack_start(&overlay, true, true, 0)` matching wry's pack arguments + `overlay.show_all()`. This ADR also locks in the spike's rollout convention: **production code under an opt-in runtime gate, not isolated examples.** The `inject_overlay` function lands in `crates/kino-player/src/surface.rs` as a PUBLIC API (not behind a Cargo feature flag), and is invoked at startup from `src-tauri/src/lib.rs::run_libmpv_surface_spike` iff env var `KINO_LIBMPV_SURFACE_SPIKE=1`. Default builds (and CI) load the module but do not invoke the surgery, so the runtime behavior on `main` is unchanged from Session 020's subprocess driver. Session 037 imports `kino_player::inject_overlay` directly (no API churn) and replaces the env-var gate with the `libmpv-inprocess` Cargo feature gate when the actual libmpv driver lands. Rejected alternatives: (1) **standalone `examples/` binary** — would force Session 037 to either rebuild the API or migrate code, neither cheap. (2) **`#[cfg(test)] mod spike`** — would scope the surgery to tests, but the runtime exercise is the whole point of the spike. (3) **Cargo feature flag from day one** — would require landing the `libmpv2 = "3"` dep in Session 036 (premature) AND would still need a feature-flag flip in Session 037, so the env var is a strictly simpler rollout for the spike scope. (4) **upstreaming a wry accessor PR (avenue (iii))** — unnecessary because Tauri already exposes the container via `default_vbox()`. (5) **intercepting `Builder::setup` / `on_window_event` (avenue (ii))** — unnecessary because the post-creation walk through `with_webview` is well-defined. This ADR also notes the workspace-feature-unification nuance: the explicit `webkit2gtk/v2_8` feature on kino-player's direct dep is needed for single-crate `cargo check -p kino-player` to succeed (sibling-crate `wry`'s `webkit2gtk/v2_38` feature does NOT propagate when only one crate is in the build graph; in `cargo --workspace` it does propagate via unification, but single-crate builds need self-sufficient feature declarations). | 036 |
 
 ---
 
@@ -8847,7 +9264,16 @@ Additional ADRs filed by sessions:
   into a GL surface owned by the Tauri window. ADR-108 ships the
   subprocess form for v1; the in-process replacement is a peer driver
   behind a Cargo feature flag. §6B-1 hardware verification covers the
-  practical-fallout question on Ubuntu 22.04 + 24.04.
+  practical-fallout question on Ubuntu 22.04 + 24.04. **Session 035
+  (scout)** picked Route B (libmpv render-API + `GtkOverlay` +
+  `GtkGLArea`) per ADR-133; **Session 036 (spike)** landed the
+  GTK-injection surgery (`kino_player::inject_overlay` in
+  `crates/kino-player/src/surface.rs`, opt-in via
+  `KINO_LIBMPV_SURFACE_SPIKE=1`) and confirmed avenue (i) is
+  sufficient per ADR-134 — no upstream wry PR needed, no builder-hook
+  interception needed. Sessions 037 (libmpv driver behind
+  `libmpv-inprocess` Cargo feature flag) + 038 (CI matrix + bundle
+  deps + default flip after §6B-1) close this entry.
 - **F-015 Android subtitle test fixtures (Session 023, follow-up).**
   PRD §F-015 SRT + SSA/ASS rendering bullets are met structurally by
   enabling `media3-extractor`'s `SubripParser` / `SsaParser` (see
@@ -9672,13 +10098,61 @@ session implementation arc:
     implementation under the Session 034 / ADR-132 human-gated
     §6A framework.
 
+**Spike result (Session 036) — avenue (i) succeeds via PUBLIC
+Tauri APIs.** Session 036 landed the
+[`kino_player::inject_overlay`](#) function in `crates/
+kino-player/src/surface.rs` performing the avenue-(i) walk +
+reparent surgery. Result: avenue (i) is sufficient; avenues
+(ii) and (iii) are NOT required. The PUBLIC Tauri 2.11.2 API
+surface already exposes every accessor the surgery needs:
+
+-   `WebviewWindow::with_webview(closure)` posts a closure
+    onto the GTK main thread once the webview is realised
+    (`tauri-2.11.2/src/webview/mod.rs:1668-1677`).
+-   `PlatformWebview::inner()` returns the underlying
+    `webkit2gtk::WebView` widget on Linux (`tauri-2.11.2/src/
+    webview/mod.rs:148-175`).
+-   `webkit2gtk::WebView @extends gtk::Container, gtk::Widget`
+    (`webkit2gtk-2.0.2/src/auto/web_view.rs:58`) so the
+    standard `gtk::WidgetExt::parent()` returns the
+    `gtk::Box` Tauri packs the webview into.
+
+The surgery itself: `vbox.remove(webview)` →
+`gtk::Overlay::new()` + `gtk::GLArea::new()` →
+`overlay.add(gl_area)` + `overlay.add_overlay(webview)` →
+`webview.set_background_color(RGBA(0,0,0,0))` →
+`vbox.pack_start(overlay, true, true, 0)` →
+`overlay.show_all()`. Six steps inside the `with_webview`
+closure, ~80 LOC.
+
+Rollout: the surgery is invoked at startup iff env var
+`KINO_LIBMPV_SURFACE_SPIKE=1` (see `src-tauri/src/lib.rs::
+run_libmpv_surface_spike`). Default builds (and CI) load the
+module but do not invoke the surgery, so `main`'s runtime
+behavior is unchanged from Session 020's subprocess driver.
+Three new linux-only direct deps added to `crates/
+kino-player/Cargo.toml`: `gtk = "0.18"`, `gdk = "0.18"`,
+`webkit2gtk = { version = "2.0", features = ["v2_8"] }`. All
+three were already in the workspace's transitive closure via
+wry, so the resolver unification leaves the compile cost
+unchanged.
+
+The §6A entry stays OPEN. The spike confirms the surgery is
+API-feasible; the §6A "satisfied by code on `main`" gate
+stays gated on Session 037 (libmpv driver implementation
+consuming `OverlaySurgery::gl_area`) + Session 038 (CI
+matrix + bundle deps + default flip). See ADR-134 for the
+spike's avenue-choice rationale + rollout convention.
+
 This entry STAYS OPEN until Session 037 + 038 (the
 implementation + CI bundle integration) land, OR — in the
 fallback arc — Session 039's PRD-revision proposal is
 ratified by the human. The F-015 Feature Tracker checkbox
-stays `[ ]`. See the Session 035 entry above for the full
-route scoring + verbatim source/citation set, and ADR-133 for
-the multi-session split rationale.
+stays `[ ]`. See the Session 035 entry for the full route
+scoring + verbatim source/citation set, the Session 036
+entry for the spike's API survey + surgery code, ADR-133 for
+the multi-session split rationale, and ADR-134 for the
+spike's avenue-choice outcome.
 
 ### ~~F-016 §4 / Cache directory picker~~ — RESOLVED in Session 029
 

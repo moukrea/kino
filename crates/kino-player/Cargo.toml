@@ -27,6 +27,27 @@ tokio = { workspace = true }
 async-trait = { workspace = true }
 uuid = { workspace = true }
 
+# Linux-only GTK + WebKit2GTK deps for the F-015 libmpv in-window GL
+# surface (Session 036 spike for ADR-133 Route B). The webkit2gtk crate
+# is already in the workspace's transitive closure via tauri-runtime-wry;
+# adding it here as a direct dep just makes the type names available to
+# `crates/kino-player/src/surface.rs`. All three crates pin to the
+# 0.18 / 2.0 series that Tauri 2.11.2 / wry 0.55.1 / webkit2gtk-2.0.2
+# already resolve to, so this is a single resolver unification — no
+# duplicate-crate compile cost.
+#
+# `webkit2gtk/v2_8` is explicitly enabled because
+# `WebViewExt::set_background_color` (used by the spike to make the
+# overlay webview transparent) is feature-gated behind it. wry 0.55.1
+# already enables `v2_38` on the same crate, so the workspace-unified
+# feature set is `v2_38`; the explicit `v2_8` here just makes the
+# single-crate `cargo check -p kino-player` build (which doesn't pull
+# in wry) self-sufficient.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+gdk = "0.18"
+webkit2gtk = { version = "2.0", features = ["v2_8"] }
+
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = "3"
