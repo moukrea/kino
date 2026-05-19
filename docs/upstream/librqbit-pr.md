@@ -20,10 +20,16 @@ Until upstream lands, kino's §6A entries stay OPEN. Once upstream
 publishes a release containing **PR A** (the smaller change), the
 follow-up kino session bumps `librqbit` in `Cargo.toml`, wires the
 new field through `kino_torrent::engine`, and flips the F-013 §6A
-entry to RESOLVED. **PR B** is more invasive and would close F-014's
-§6A; if upstream rejects or stalls it, the PRD Issues entry's
+entry to RESOLVED. **PR B** is split into two independently-mergeable
+sub-PRs: **PR B1** (per-stream lookahead, drafted fully in this doc)
+and **PR B2** (per-piece priority enum + tiered scheduler walk,
+drafted as a design proposal). Wiring B1 honors PRD §F-014's HIGHEST
+window approximately (lookahead sized to 60s of file bitrate); B2
+adds the HIGH window and last-piece-HIGH special-case. If upstream
+rejects or stalls either of B1/B2, the PRD Issues entry's
 **option (d)** (PRD revision relaxing the language to "best-effort,
-subject to engine API capabilities") remains the §6A clearance lever.
+subject to engine API capabilities") remains the §6A clearance
+lever.
 
 ---
 
@@ -418,36 +424,373 @@ PR B is therefore drafted as **two independently-mergeable sub-PRs**:
 
 **Title:** `feat(streaming): make per-stream lookahead buffer size configurable`
 
-The simpler half. Replaces the hardcoded
+**Summary:** Replaces the hardcoded
 `PER_STREAM_BUF_DEFAULT: u64 = 32 * 1024 * 1024` constant
-(`torrent_state/streaming.rs:27`) with a per-stream value, settable
-via a new `FileStream::set_lookahead_bytes(usize)` method or
-constructor-time argument on `ManagedTorrent::stream(file_id)`.
+(`torrent_state/streaming.rs:27`) with a per-stream value carried on
+`StreamState` and selectable at stream-construction time via a new
+`ManagedTorrent::stream_with_lookahead(file_id, lookahead_bytes)`
+method. The pre-existing `ManagedTorrent::stream(file_id)` delegates
+to the new method with `PER_STREAM_BUF_DEFAULT` so all existing
+callers see no behavior change.
+
+**Why:** the lookahead value is the size of the HIGHEST-priority
+piece queue `TorrentStreams::iter_next_pieces` produces for an
+active stream. Downstream applications need to tune it to the active
+file's bitrate and the user's network conditions:
+
+-   A 4K Blu-ray rip (~80 Mbit/s) benefits from a larger window so
+    `iter_next_pieces`'s round-robin doesn't fall behind the player.
+-   A low-bitrate web rip (~3 Mbit/s) over a slow mobile link
+    benefits from a smaller window so the scheduler picks up
+    downstream pieces (subtitles, audio, end-of-file `moov` atom)
+    sooner.
+
+The constant has been internal since librqbit's streaming API
+landed; this PR is the smallest possible surface change that
+exposes it.
+
+**Surface area:** one new field on a crate-internal struct, one new
+public method, one delegate change in the existing public method.
+Zero behavior change for default builds.
+
+### Files changed
+
+#### 1. `librqbit/src/torrent_state/streaming.rs` (lines 29-35 — `StreamState`)
+
+Add `lookahead_bytes: u64` to the per-stream state struct. The field
+is non-`Option<…>` because the resolution-from-default happens at
+construction time (see file 4).
 
 ```diff
--pub fn stream(self: Arc<Self>, file_id: usize) -> anyhow::Result<FileStream> {
-+pub fn stream(self: Arc<Self>, file_id: usize) -> anyhow::Result<FileStream> {
-+    self.stream_with_lookahead(file_id, PER_STREAM_BUF_DEFAULT)
-+}
-+
-+/// Like [`Self::stream`] but with a custom lookahead window (the
-+/// number of bytes ahead of the current read position that the
-+/// scheduler treats as HIGHEST priority). Default is
-+/// [`PER_STREAM_BUF_DEFAULT`].
-+pub fn stream_with_lookahead(
-+    self: Arc<Self>,
-+    file_id: usize,
+ struct StreamState {
+     file_id: usize,
+     file_len: u64,
+     file_abs_offset: u64,
+     position: u64,
+     waker: Option<Waker>,
++    /// Per-stream HIGHEST-priority lookahead window, in bytes.
++    /// Set at construction time via [`ManagedTorrent::stream_with_lookahead`]
++    /// (or the default [`PER_STREAM_BUF_DEFAULT`] via [`ManagedTorrent::stream`]).
 +    lookahead_bytes: u64,
-+) -> anyhow::Result<FileStream> {
+ }
 ```
 
-Plus the matching `StreamState::queue` change to read the per-stream
-lookahead value instead of the module-level constant.
+#### 2. `librqbit/src/torrent_state/streaming.rs` (lines 42-49 — `StreamState::queue`)
 
-This sub-PR is **complete enough to draft fully** but has been
-elided here to keep the document focused on the harder mechanics.
-A follow-up agent session can land it once PR A is merged upstream,
-or the human can submit both PRs simultaneously.
+Read `self.lookahead_bytes` instead of the module-level constant. The
+loop body is otherwise unchanged.
+
+```diff
+     fn queue<'a>(&self, lengths: &'a Lengths) -> impl Iterator<Item = ValidPieceIndex> + 'a {
+         let start = self.file_abs_offset + self.position;
+-        let end = (start + PER_STREAM_BUF_DEFAULT).min(self.file_abs_offset + self.file_len);
++        let end = (start + self.lookahead_bytes).min(self.file_abs_offset + self.file_len);
+         let dpl = lengths.default_piece_length();
+         let start_id = (start / dpl as u64).try_into().unwrap();
+         let end_id = end.div_ceil(dpl as u64).try_into().unwrap();
+         (start_id..end_id).filter_map(|i| lengths.validate_piece_index(i))
+     }
+```
+
+#### 3. `librqbit/src/lib.rs` (re-export `PER_STREAM_BUF_DEFAULT`)
+
+Promote the existing module-level constant to a public re-export so
+callers can refer to the historical default by name (parallel to
+the `DEFAULT_PEER_CONNECTIONS_PER_TORRENT` constant introduced by
+PR A).
+
+```diff
+ pub use torrent_state::{
+     ManagedTorrent, ManagedTorrentShared, ManagedTorrentState, TorrentMetadata, TorrentStats,
+     TorrentStatsState,
+ };
++
++/// Default per-stream lookahead window in bytes (32 MiB). This is the
++/// size of the HIGHEST-priority piece queue produced for each active
++/// [`ManagedTorrent::stream`]. Override per-stream via
++/// [`ManagedTorrent::stream_with_lookahead`].
++pub const PER_STREAM_BUF_DEFAULT: u64 = torrent_state::streaming::PER_STREAM_BUF_DEFAULT;
+```
+
+(`PER_STREAM_BUF_DEFAULT` in `streaming.rs` needs to be `pub(crate)`
+instead of file-private for the re-export to compile — a one-token
+change. Alternatively, redeclare the constant in `lib.rs` and pass
+it by value to `stream(file_id)` at the call site; either approach
+is fine.)
+
+#### 4. `librqbit/src/torrent_state/streaming.rs` (lines 327-365 — `ManagedTorrent::stream` and new `stream_with_lookahead`)
+
+Split the existing `stream(file_id)` into a thin delegate plus the
+substantive `stream_with_lookahead(file_id, lookahead_bytes)`. The
+construction body moves verbatim into the new method except for the
+`StreamState` literal, which gains the new field.
+
+```diff
+-    pub fn stream(self: Arc<Self>, file_id: usize) -> anyhow::Result<FileStream> {
++    /// Open a streaming read handle to the given file, using the
++    /// default HIGHEST-priority lookahead window
++    /// ([`PER_STREAM_BUF_DEFAULT`] = 32 MiB).
++    ///
++    /// For finer control over the lookahead window, see
++    /// [`Self::stream_with_lookahead`].
++    pub fn stream(self: Arc<Self>, file_id: usize) -> anyhow::Result<FileStream> {
++        self.stream_with_lookahead(file_id, PER_STREAM_BUF_DEFAULT)
++    }
++
++    /// Like [`Self::stream`] but with a custom lookahead window. The
++    /// `lookahead_bytes` parameter is the number of bytes ahead of the
++    /// current read position that the scheduler treats as HIGHEST
++    /// priority (i.e. the size of the queue
++    /// [`TorrentStreams::iter_next_pieces`] produces for this stream).
++    ///
++    /// Smaller values let the scheduler pick up downstream pieces
++    /// (subtitles, audio, end-of-file metadata) sooner on slow links;
++    /// larger values pre-fetch more aggressively for high-bitrate
++    /// content. The default is 32 MiB
++    /// ([`PER_STREAM_BUF_DEFAULT`]); a typical streaming client picks
++    /// a value somewhere between 8 MiB and 256 MiB depending on the
++    /// active file's bitrate.
++    ///
++    /// `lookahead_bytes = 0` is accepted and disables lookahead
++    /// entirely; the scheduler then relies on the player's read
++    /// position alone (the current piece is still fetched HIGHEST
++    /// because `iter_next_pieces` always emits the read-position's
++    /// piece first).
++    pub fn stream_with_lookahead(
++        self: Arc<Self>,
++        file_id: usize,
++        lookahead_bytes: u64,
++    ) -> anyhow::Result<FileStream> {
+         let metadata = self
+             .metadata
+             .load_full()
+             .context("torrent metadata is not resolved")?;
+         let (fd_len, fd_offset) = self.with_storage_and_file(
+             file_id,
+             |_fd, fi| (fi.len, fi.offset_in_torrent),
+             &metadata,
+         )?;
+         let streams = self.streams()?;
+         let s = FileStream {
+             stream_id: streams.next_id(),
+             streams: streams.clone(),
+             file_id,
+             position: 0,
+
+             file_len: fd_len,
+             file_torrent_abs_offset: fd_offset,
+             torrent: self,
+             spawner: BlockingSpawner::default(),
+             metadata,
+         };
+         s.torrent.maybe_reconnect_needed_peers_for_file(file_id);
+         streams.streams.insert(
+             s.stream_id,
+             StreamState {
+                 file_id,
+                 position: 0,
+                 waker: None,
+                 file_len: fd_len,
+                 file_abs_offset: fd_offset,
++                lookahead_bytes,
+             },
+         );
+
+-        debug!(stream_id = s.stream_id, file_id, "started stream");
++        debug!(stream_id = s.stream_id, file_id, lookahead_bytes, "started stream");
+
+         Ok(s)
+     }
+```
+
+### Tests
+
+Add to `librqbit/src/tests/e2e_stream.rs` (the existing streaming
+e2e module). The existing `test_e2e_stream` test covers the default
+path; the new tests below cover the custom-lookahead path and the
+zero-lookahead degenerate case. All three reuse the
+`create_default_random_dir_with_torrents` test helper that the
+existing test already uses.
+
+```rust
+// librqbit/src/tests/e2e_stream.rs (appended)
+use crate::PER_STREAM_BUF_DEFAULT;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_stream_default_lookahead_matches_constant() -> anyhow::Result<()> {
+    // Sanity check: the default `stream(file_id)` produces a stream
+    // whose lookahead equals the documented constant.
+    timeout(Duration::from_secs(10), e2e_stream_with_assertion(|streams_arc, _| {
+        let stream_state = streams_arc.streams.iter().next().unwrap();
+        assert_eq!(stream_state.value().lookahead_bytes, PER_STREAM_BUF_DEFAULT);
+    }))
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_stream_with_custom_lookahead() -> anyhow::Result<()> {
+    // Custom lookahead flows from the constructor through StreamState
+    // to iter_next_pieces' queue iteration.
+    const CUSTOM_LOOKAHEAD: u64 = 4 * 1024 * 1024; // 4 MiB; smaller than default
+    timeout(
+        Duration::from_secs(10),
+        e2e_stream_with_lookahead(CUSTOM_LOOKAHEAD, |streams_arc, lengths| {
+            let stream_state = streams_arc.streams.iter().next().unwrap();
+            assert_eq!(stream_state.value().lookahead_bytes, CUSTOM_LOOKAHEAD);
+            // The queue iteration is bounded by the smaller of:
+            // (lookahead_bytes / piece_length) or (file_len / piece_length)
+            // and inclusive of the boundary piece. For an 8 KiB file at
+            // 1 KiB pieces, the queue must fit within the file even if
+            // lookahead is much larger.
+            let queue_len = stream_state.value().queue(lengths).count();
+            let max_pieces = (lengths.total_length() as u64).div_ceil(lengths.default_piece_length() as u64);
+            assert!(queue_len as u64 <= max_pieces);
+        }),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_stream_with_zero_lookahead_still_streams() -> anyhow::Result<()> {
+    // `lookahead_bytes = 0` is accepted and the stream still
+    // completes — the read-position's current piece is fetched
+    // HIGHEST because `iter_next_pieces` always emits the
+    // read-position's piece first regardless of the lookahead value.
+    timeout(Duration::from_secs(10), e2e_stream_with_lookahead(0, |_streams_arc, _| ())).await?
+}
+
+// Helper that builds the server/client sessions from `e2e_stream` but
+// opens the client read stream with the given lookahead and runs an
+// inspection callback on the client's TorrentStreams + Lengths before
+// reading to completion.
+async fn e2e_stream_with_lookahead<F>(
+    lookahead_bytes: u64,
+    inspect: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(&std::sync::Arc<crate::torrent_state::streaming::TorrentStreams>, &librqbit_core::lengths::Lengths),
+{
+    // ... duplicates the setup body of `e2e_stream()` (test_util fixture,
+    // server session w/ peer_id, AddTorrent::from_bytes, client session,
+    // wait_until_initialized) and then calls
+    // `client_handle.stream_with_lookahead(0, lookahead_bytes)` instead of
+    // `client_handle.stream(0)`. The inspect callback runs after the
+    // stream is registered but before `read_to_end`.
+    todo!("extract `e2e_stream`'s body into a helper accepting `(lookahead, inspect)`")
+}
+
+async fn e2e_stream_with_assertion<F>(inspect: F) -> anyhow::Result<()>
+where
+    F: FnOnce(&std::sync::Arc<crate::torrent_state::streaming::TorrentStreams>, &librqbit_core::lengths::Lengths),
+{
+    e2e_stream_with_lookahead(PER_STREAM_BUF_DEFAULT, inspect).await
+}
+```
+
+(The PR author will want to extract `e2e_stream()`'s common setup
+into the `e2e_stream_with_lookahead` helper so all four tests share
+the fixture-build / dual-session / wait-init scaffolding — about
+80 lines of currently-inline code at lines 16-105 of
+`tests/e2e_stream.rs`. The existing `test_e2e_stream` becomes a
+one-line caller of the new helper with the default lookahead and a
+no-op inspect callback.)
+
+A `pub(crate)` accessor on `TorrentStreams::streams` (or a new
+`pub(crate) fn iter(&self)`) is needed so the inspect callback can
+read `StreamState::lookahead_bytes` — the field itself is the only
+new test-observable state. The accessor can be `cfg(test)`-gated if
+maintainers prefer to keep the field strictly internal in
+production builds.
+
+### PR description (paste verbatim into the upstream PR for B1)
+
+```markdown
+## Summary
+
+Make the per-stream HIGHEST-priority lookahead window size
+configurable. Currently the constant
+`PER_STREAM_BUF_DEFAULT: u64 = 32 * 1024 * 1024` in
+`torrent_state/streaming.rs:27` controls how many bytes ahead of each
+active stream's read position are pulled into the HIGHEST-priority
+piece queue produced by `TorrentStreams::iter_next_pieces`. This PR
+exposes that value as a per-stream configurable.
+
+- New `ManagedTorrent::stream_with_lookahead(file_id, lookahead_bytes)`
+  constructor.
+- The pre-existing `ManagedTorrent::stream(file_id)` becomes a thin
+  delegate that passes `PER_STREAM_BUF_DEFAULT`, so no existing caller
+  sees a behavior change.
+- `PER_STREAM_BUF_DEFAULT` is promoted to a public crate-level
+  constant so callers can refer to the historical default by name.
+
+## Motivation
+
+Streaming clients want to tune the lookahead based on the active
+file's bitrate and the user's network conditions:
+
+- A 4K Blu-ray rip (~80 Mbit/s sustained) needs a larger lookahead
+  so the scheduler's round-robin across streams doesn't fall behind
+  the player.
+- A low-bitrate web rip (~3 Mbit/s) on a slow mobile link benefits
+  from a smaller window so the scheduler picks up downstream pieces
+  (subtitles, audio, end-of-file `moov` atom) sooner.
+- An audio-only stream (e.g. a music torrent) doesn't need 32 MiB
+  of lookahead at all; an 8 MiB lookahead halves the buffered byte
+  count without affecting playback continuity.
+
+The constant has been internal since librqbit's streaming API
+landed; this PR is the smallest possible surface change that exposes
+it.
+
+## Surface area
+
+- One new field on the crate-internal `StreamState`
+  (`lookahead_bytes: u64`).
+- One line changed in `StreamState::queue` (reads `self.lookahead_bytes`
+  instead of the constant).
+- One new public method on `ManagedTorrent`
+  (`stream_with_lookahead`).
+- One delegate change in the existing `ManagedTorrent::stream` (now
+  calls `stream_with_lookahead` with `PER_STREAM_BUF_DEFAULT`).
+- `PER_STREAM_BUF_DEFAULT` re-exported from the crate root.
+
+## Tests
+
+Three new `#[tokio::test(flavor = "multi_thread")]` tests in
+`librqbit/src/tests/e2e_stream.rs`:
+
+1. `test_e2e_stream_default_lookahead_matches_constant` — the
+   default `stream(file_id)` produces a stream whose
+   `lookahead_bytes` equals `PER_STREAM_BUF_DEFAULT`.
+2. `test_e2e_stream_with_custom_lookahead` — a 4 MiB custom
+   lookahead flows through to `StreamState` and bounds
+   `iter_next_pieces`' queue iteration accordingly.
+3. `test_e2e_stream_with_zero_lookahead_still_streams` — the
+   degenerate `lookahead_bytes = 0` case still reads the file to
+   completion (the read-position's current piece is fetched HIGHEST
+   independent of the lookahead value).
+
+The existing `test_e2e_stream` test is refactored to call the new
+`e2e_stream_with_lookahead` helper with the default lookahead and a
+no-op inspect callback, sharing the fixture-build + dual-session +
+wait-init scaffolding across all four tests.
+
+## Backwards compatibility
+
+`stream(file_id)` is unchanged in shape and behavior; all existing
+callers see no diff. The new method is additive. The
+`PER_STREAM_BUF_DEFAULT` re-export is additive. `StreamState` is
+crate-internal so adding a field has no semver impact.
+
+## Future work (not in this PR)
+
+The matching "tiered after-lookahead priority window" mechanism
+proposed in librqbit's PRD-driven streaming use case (HIGH window
+`[pos+60s, pos+300s]` beyond the HIGHEST lookahead) is structurally
+bigger and will be drafted as a follow-up PR — see the linked design
+proposal in the same downstream consumer's notes for the per-piece
+priority enum + tiered scheduler walk sketch.
+```
 
 ### Sub-PR B2: piece-priority enum + tiered scheduler walk
 
@@ -501,41 +844,11 @@ Sub-PR B2 is therefore drafted here as a **design proposal**, not a
 full diff. A separate agent session (or the human directly) can
 land the full implementation once the design is accepted upstream.
 
-### PR description (paste verbatim into the upstream PR for B1)
-
-```markdown
-## Summary
-
-Make per-stream lookahead window size configurable. Currently the
-constant `PER_STREAM_BUF_DEFAULT: u64 = 32 * 1024 * 1024` in
-`torrent_state/streaming.rs:27` controls how many bytes ahead of each
-active stream's read position get pulled into the HIGHEST-priority
-queue by `TorrentStreams::iter_next_pieces`. This PR exposes that
-value as a per-stream configurable.
-
-New `ManagedTorrent::stream_with_lookahead(file_id, lookahead_bytes)`
-constructor; the existing `ManagedTorrent::stream(file_id)` delegates
-to it with the historical default.
-
-## Motivation
-
-Streaming clients want to tune the lookahead based on the active
-file's bitrate and the user's network conditions. A 4K Blu-ray rip
-benefits from a much larger lookahead than a low-bitrate web rip;
-likewise, a slow mobile connection benefits from a smaller window so
-the scheduler picks up downstream pieces (subtitles, audio) sooner.
-
-## Backwards compatibility
-
-`stream(file_id)` is unchanged; all existing callers see no behavior
-change. The new method is additive.
-```
-
 ---
 
 ## Post-merge kino-side wiring (informative)
 
-Once PR A lands and librqbit publishes (say) `8.2.0`:
+### After PR A lands (librqbit `8.2.0` hypothetical)
 
 1. Bump `librqbit = "8.2"` in `crates/kino-torrent/Cargo.toml`
    (or `Cargo.toml` workspace deps).
@@ -553,14 +866,99 @@ Once PR A lands and librqbit publishes (say) `8.2.0`:
    };
    ```
 
-3. Remove the `pub(crate)` ADR-103 deferral comment in the same
-   region and the §6A entry for F-013 in `STATE.md` flips to
-   RESOLVED.
-4. Same flow for PR B once the streaming or piece-priority APIs
-   land; F-014 §6A flips at that time.
+3. Remove the ADR-103 deferral comment in the same region and the
+   §6A entry for F-013 in `STATE.md` flips to RESOLVED.
 
-If upstream rejects either PR — or the timeline stretches past the
-v1 ship window — the **PRD revision option (d)** filed in
+### After PR B1 lands (librqbit `8.3.0` hypothetical)
+
+1. Bump `librqbit = "8.3"` in the workspace `Cargo.toml`.
+2. `crates/kino-torrent/src/engine.rs:233-246` (the
+   `AddedTorrent::open_stream` body) becomes:
+
+   ```rust
+   pub fn open_stream(&self, file_index: usize) -> Result<Box<dyn FileStream>> {
+       if file_index >= self.inner_files.len() {
+           return Err(EngineError::FileIndexOutOfRange {
+               requested: file_index,
+               file_count: self.inner_files.len(),
+           });
+       }
+       // PRD §F-014 HIGHEST window = [position, position + 60s]. Until
+       // upstream lands the per-piece priority API (PR B2 / F-014 §6A
+       // closure path 'a'), kino approximates the window as a per-stream
+       // lookahead sized to 60s of the file's bitrate, clamped to a
+       // sensible range so audio-only streams don't over-buffer and 4K
+       // streams don't underrun. The clamp constants live in
+       // `kino_core::constants` next to the PRD-locked window values.
+       let lookahead = self
+           .file_bitrate_bps(file_index)
+           .map(|bps| {
+               let raw = (bps as u64)
+                   .saturating_mul(kino_core::constants::PIECE_PRIORITY_HIGH_WINDOW_S as u64)
+                   / 8;
+               raw.clamp(
+                   kino_core::constants::LOOKAHEAD_MIN_BYTES,
+                   kino_core::constants::LOOKAHEAD_MAX_BYTES,
+               )
+           })
+           .unwrap_or(librqbit::PER_STREAM_BUF_DEFAULT);
+
+       let s = self
+           .inner
+           .clone()
+           .stream_with_lookahead(file_index, lookahead)
+           .map_err(EngineError::Internal)?;
+       Ok(Box::new(s))
+   }
+   ```
+
+3. New constants in `crates/kino-core/src/constants.rs` next to
+   `PIECE_PRIORITY_HIGH_WINDOW_S`:
+
+   ```rust
+   /// Per-stream HIGHEST-priority lookahead floor (PRD §F-014).
+   /// Below this even very-low-bitrate streams keep enough buffer
+   /// to absorb player seek overshoot.
+   pub const LOOKAHEAD_MIN_BYTES: u64 = 8 * 1024 * 1024;
+
+   /// Per-stream HIGHEST-priority lookahead ceiling (PRD §F-014).
+   /// Above this the buffered byte count crowds out parallel
+   /// downstream-piece fetches (subtitles, audio, end-of-file moov).
+   pub const LOOKAHEAD_MAX_BYTES: u64 = 256 * 1024 * 1024;
+   ```
+
+4. PRD §F-014's HIGHEST window is partially honored (the lookahead
+   approximation); the §6A entry stays OPEN with a "PR B1 wired;
+   awaiting PR B2 for HIGH window + last-piece-HIGH" status update
+   until PR B2 also lands.
+
+### After PR B2 lands (librqbit `8.4.0` hypothetical)
+
+1. Bump `librqbit = "8.4"` in the workspace `Cargo.toml`.
+2. New module `crates/kino-torrent/src/piece_priority.rs` exposing a
+   per-stream `update_for_position(position_s, file_bitrate_bps)`
+   function that calls
+   `ManagedTorrent::set_piece_priorities(file_id, ranges)` with:
+   - HIGHEST ranges: pieces covering `[position_s, position_s + 60s]`
+     of file bitrate.
+   - HIGH ranges: pieces covering `[position_s + 60s, position_s + 300s]`.
+   - HIGH single piece: the file's final piece (`FileInfo::piece_range`'s
+     `.end - 1`).
+3. `crates/kino-torrent/src/monitor.rs::BufferMonitor` calls the new
+   function on every position-event recompute (sampled every 1s per
+   PRD §F-014).
+4. F-014 §6A entry in `STATE.md` flips to RESOLVED.
+
+### Closure-path summary
+
+| Upstream PR | librqbit version | kino §6A entry resolved |
+|---|---|---|
+| PR A | `8.2.0` | F-013 (max_connections_per_torrent) |
+| PR B1 | `8.3.0` | F-014 partial (HIGHEST window via lookahead approximation) |
+| PR B2 | `8.4.0` | F-014 fully (HIGH window + last-piece-HIGH) |
+
+If upstream rejects any of these — or the timeline stretches past
+the v1 ship window — the **PRD revision option (d)** filed in
 `STATE.md::PRD Issues` is the human-ratification fallback. The
 proposed revision text is already drafted in that entry; a follow-up
 session flips the §6A entries to RESOLVED in a one-line STATE.md
@@ -580,12 +978,17 @@ diff if the human ratifies.
   own GitHub identity) is the standard inbound contribution flow.
   The patches above don't carry kino-specific text; everything is
   written as a polite upstream PR.
-- **Don't bundle PR A and PR B.** They are independently mergeable
-  and address distinct PRD invariants. A maintainer is more likely
-  to accept a small, focused PR (PR A) than a 500-line "feature PR"
-  that mixes concerns.
+- **Don't bundle PR A, B1, and B2.** All three are independently
+  mergeable and address distinct PRD invariants. A maintainer is
+  more likely to accept three small, focused PRs than one feature
+  PR that mixes concerns. The recommended submission order is PR A
+  → PR B1 → PR B2 (smallest surface first; B2 builds on the design
+  context B1 establishes).
 - **CI signal.** rqbit's CI runs `cargo test` and `cargo clippy --
-  -D warnings`. PR A's new code should be `clippy`-clean (no
-  warnings from `clippy::pedantic`'s `must_use_candidate` etc.;
-  document the new constant + struct fields with `///` doc comments
-  to satisfy `missing_docs` if upstream enforces it).
+  -D warnings`. New code in all three PRs should be `clippy`-clean
+  (no warnings from `clippy::pedantic`'s `must_use_candidate` etc.;
+  document new constants and struct fields with `///` doc comments
+  to satisfy `missing_docs` if upstream enforces it). PR A's new
+  fields on the public `SessionOptions` and `AddTorrentOptions`
+  structs especially need doc comments since those structs are part
+  of the crate's stable surface.
