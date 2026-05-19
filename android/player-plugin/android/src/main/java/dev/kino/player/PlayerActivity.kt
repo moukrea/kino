@@ -29,7 +29,6 @@ import androidx.media3.common.Tracks
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.ui.PlayerView
 import app.tauri.plugin.JSObject
@@ -67,7 +66,11 @@ import dev.kino.player.events.TrackListBuilder
  *
  *  - `DefaultRenderersFactory`:
  *      - `EXTENSION_RENDERER_MODE_OFF` (hardware preferred via
- *        `MediaCodecSelector.DEFAULT`)
+ *        [DvAwareCodecSelector], which wraps `MediaCodecSelector.DEFAULT`
+ *        for non-DV mimetypes and, for `video/dolby-vision`, filters
+ *        the candidate list to decoders whose
+ *        `CodecCapabilities.profileLevels` declare a DV profile entry
+ *        — implements the PRD §F-015 "force DV-capable decoder" rule).
  *      - DV passthrough enabled (relies on hardware decoder picking
  *        up `dvhe.05` / `dvhe.08` profiles per [Capabilities]).
  *      - `setEnableAudioTrackPlaybackParams(true)` + audio attributes
@@ -190,7 +193,7 @@ class PlayerActivity : AppCompatActivity() {
         val renderersFactory = DefaultRenderersFactory(this)
             .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_OFF)
             .setEnableDecoderFallback(true)
-            .setMediaCodecSelector(MediaCodecSelector.DEFAULT)
+            .setMediaCodecSelector(DvAwareCodecSelector)
             .setEnableAudioTrackPlaybackParams(true)
 
         val selector = DefaultTrackSelector(this).apply {

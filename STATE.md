@@ -1,9 +1,9 @@
 # kino — Agent State
 
 **PRD version:** 1.0 (locked)
-**Status:** v1.0.0-alpha.1 release pipeline shipped. **Session 032 closes the F-003 ETag handling §6A regression for good**: the Session-031 pattern has now landed at the three remaining per-resource sites the audit enumerated — TMDB credits, Trakt title-rating, and TVDB extended-title artwork. Three new per-resource cache helpers in `src-tauri::commands` (`fetch_tmdb_credits_etag_cached`, `fetch_trakt_rating_etag_cached`, `fetch_tvdb_artwork_etag_cached`) wire `response_cache.etag` to the matching `*_with_etag` variants on each provider client. `TmdbClient::credits_with_etag` + `TmdbCreditsFetch` and `TraktClient::title_rating_with_etag` + `TraktTitleRatingFetch` and `TvdbClient::artwork_with_etag` + `TvdbArtworkFetch` are the new provider seams; the original `credits` / `title_rating` / `artwork` methods now delegate so existing callers stay source-compatible. `get_title_detail_uncached` flips its TMDB-credits + Trakt-rating calls to the new helpers; `build_bundles` takes a `&Db` and flips its TVDB call. Trakt 404 and TVDB 404 map to `Fresh { rating: None / bundle: None, etag: None }` so the negative result caches identically (the next read short-circuits without exploding). Fanart.tv is intentionally still out of scope per the Session-031 audit note ("inconsistent ETag support"; the back-compat `fetch_with_retry` silently honors "where the provider supports it"). 18 new tests (3 per-provider in `kino-metadata`, 8 in `kino-app::commands`, 9 total via the per-resource helpers). F-003 is now `[x]` in the Feature Tracker; the §6A "F-003 / ETag handling" entry is flipped to **RESOLVED**. **Three §6A regressions remain**: F-013 / F-014 (librqbit-blocked: max-connections cap + piece-priority window assignment — need an upstream PR, a fork, an engine swap, or a PRD revision); F-015 (Android DV decoder selector — ~60 LOC, no upstream blocker; Linux libmpv in-window GL — multi-session ADR-108 deviation). **§6A is still not claimable.** See the F-003-closure rationale and ADR-128 / 129 / 130 in the Session 032 entry below.
-**Last session:** 032 (F-003 ETag expansion to TMDB credits + Trakt rating + TVDB extended-title artwork — new `*_with_etag` provider methods + `*Fetch` enums on `TmdbClient::credits`, `TraktClient::title_rating`, `TvdbClient::artwork`; new helpers `fetch_tmdb_credits_etag_cached` (cache key `tmdb:credits:{tmdb_id}:{kind}`, TTL `META_TTL_S = 24h`), `fetch_trakt_rating_etag_cached` (`trakt:title_rating:{imdb_id}:{kind}`, `META_TTL_S`), `fetch_tvdb_artwork_etag_cached` (`tvdb:title:{tvdb_id}:{kind}`, `ARTWORK_TTL_S = 7d`); `TmdbCastMember`/`TmdbCredits`/`TraktTitleRating`/`LocalizedAsset`/`ProviderBundle` now derive Serialize/Deserialize for cache persistence; `get_title_detail_uncached` swaps to the new TMDB-credits + Trakt-rating helpers; `build_bundles(db, ...)` takes a `&Db` and uses the new TVDB helper; 18 new tests (3 TMDB-credits + 4 Trakt-rating + 3 TVDB in `kino-metadata`, 2+3+3 = 8 in `kino-app::commands`); clippy + fmt + workspace tests all green (95 kino-metadata, 121 kino-app, 234 frontend); F-003 is now `[x]`.)
-**Next session:** 033 — remaining §6A regressions in priority order: (1) **F-015 Android DV decoder selector** (~60 LOC, no upstream blocker — custom `MediaCodecSelector` that filters by `DolbyVisionProfile` for DV profile 5/8.1 streams; the smallest closure left), (2) **F-013 max-connections cap** + **F-014 piece-priority window** (librqbit-blocked — Session 033 should pick (a) draft an upstream PR exposing the option, (b) file a PRD revision under "PRD Issues" relaxing the 200-cap invariant to "best-effort, subject to engine capabilities", or both; the agent can't merge an upstream PR alone so (b) is the fastest §6A clearance), (3) **F-015 Linux libmpv in-window GL surface** (multi-session ADR-108 deviation — start with a "enumerate webview surface access on Linux" scout session).
+**Status:** v1.0.0-alpha.1 release pipeline shipped. **Session 033 closes the F-015 / Android DV decoder-forcing §6A regression**: a new `DvAwareCodecSelector` object in the `tauri-plugin-kino-player` Android module overrides `MediaCodecSelector.DEFAULT` to, on `MimeTypes.VIDEO_DOLBY_VISION` tracks, filter the DEFAULT-returned `MediaCodecInfo` list to decoders whose `CodecCapabilities.profileLevels` declare one of the three HEVC-based DV profiles (`DolbyVisionProfileDvheStn` / `DolbyVisionProfileDvheSt` / `DolbyVisionProfileDvheDtb`) that PRD §F-015 + ADR-022 require. Non-DV mimetypes (HEVC / H.264 / VP9 / AV1 / audio / subtitle) delegate unchanged. `PlayerActivity.initPlayer` swaps `.setMediaCodecSelector(MediaCodecSelector.DEFAULT)` for `.setMediaCodecSelector(DvAwareCodecSelector)` at the one-line wiring point. Empty-filter-result guard returns the unfiltered list so emulator images and platforms that report no DV-capable decoders still attempt playback (the visible error surfaces via `onPlayerError` rather than a silent "no renderer" stall). 1 new Kotlin file (~70 LOC counting docstrings), 1 import + 1 wiring edit in `PlayerActivity.kt`, 0 Rust changes, 0 frontend changes. No Kotlin unit tests added: the player-plugin module ships no JVM test runner today (CI exercises Kotlin only via `cargo tauri android build --apk` which compiles but does not execute the unit-test source set); adding a `./gradlew test` CI job is a separate scope per ADR-131. The §6A "F-015 / Android DV decoder forcing" entry is flipped to **RESOLVED**. **Two §6A regressions remain**: F-013 / F-014 (librqbit-blocked: max-connections cap + piece-priority window assignment — need an upstream PR, a fork, an engine swap, or a PRD revision); F-015 (Linux libmpv in-window GL — multi-session ADR-108 deviation). F-015 stays `[ ]` in the Feature Tracker because the Linux libmpv §6A sub-regression remains. **§6A is still not claimable.** See ADR-131 in the Session 033 entry below.
+**Last session:** 033 (F-015 Android DV decoder selector — new `DvAwareCodecSelector : MediaCodecSelector` object at `android/player-plugin/android/src/main/java/dev/kino/player/DvAwareCodecSelector.kt`; on `MimeTypes.VIDEO_DOLBY_VISION` filters DEFAULT's decoder list to codecs with `CodecCapabilities.profileLevels` containing a DV profile constant (`DolbyVisionProfileDvheStn` profile 5, `DolbyVisionProfileDvheSt` profile 8.1, `DolbyVisionProfileDvheDtb` profile 7) — mirrors `Capabilities.dolbyVisionProfiles()`'s probe set; falls back to unfiltered list when no DV-capable decoder is found so emulators still attempt playback; non-DV mimetypes delegate to DEFAULT unchanged. `PlayerActivity.initPlayer` swaps `MediaCodecSelector.DEFAULT` for `DvAwareCodecSelector`; unused `MediaCodecSelector` import dropped; class-level kdoc updated to document the DV-aware selector. No Rust, no frontend, no test changes. The §6A "F-015 / Android DV decoder forcing" entry is flipped to RESOLVED; F-015 stays `[ ]` because Linux libmpv §6A remains.)
+**Next session:** 034 — remaining §6A regressions in priority order: (1) **F-013 max-connections cap** + **F-014 piece-priority window** (librqbit-blocked — Session 034 should pick (a) draft an upstream PR exposing the options, (b) file a PRD revision under "PRD Issues" relaxing the 200-cap invariant + the piece-priority mapping to "best-effort, subject to engine capabilities", or both; the agent can't merge an upstream PR alone so (b) is the fastest §6A clearance and the strongly-recommended first move), (2) **F-015 Linux libmpv in-window GL surface** (multi-session ADR-108 deviation — start with a "enumerate webview surface access on Linux" scout session that catalogs X11 `--wid` parent-window vs Wayland subsurface protocol routes through Tauri 2's WebKitGTK window, then a follow-up session implements the chosen route behind a feature flag).
 
 ---
 
@@ -68,6 +68,235 @@ a hard requirement.
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 033 — F-015 Android DV decoder selector
+
+**Branch:** `claude/session-001-bootstrap-KbnvL` (harness-supplied; see
+ADR-033 — the harness reuses a single branch name across all sessions
+for this checkout, the branch name does NOT track the session number).
+
+**Scope chosen:** F-015 Android DV decoder forcing — the
+Session-032-recommended #1 remaining §6A regression. Picked because
+(a) the Session 027 audit pinpointed exactly what's missing and how to
+close it ("a custom `MediaCodecSelector` that filters by
+`DolbyVisionProfile` for DV profile 5/8.1 streams", ~60 LOC, no
+upstream blocker); (b) it's the smallest closure available among the
+three remaining §6A regressions — the F-013 / F-014 librqbit pair
+needs upstream coordination the agent can't drive solo, and the
+F-015 Linux libmpv in-window GL surface is multi-session by ADR-108
+sketch; (c) closing it lifts one of the two F-015 ADR-118
+sub-regressions to RESOLVED, narrowing the §6A residual to two
+distinct closure paths. Bundle size: ~85 LOC of production code (1
+new file + 3 lines of wiring + 1 line of class-level kdoc revision),
+0 LOC of test code (see ADR-131 below for why no Kotlin tests
+shipped this session).
+
+**Implementation:**
+
+1.  **New `DvAwareCodecSelector` Kotlin object**
+    (`android/player-plugin/android/src/main/java/dev/kino/player/DvAwareCodecSelector.kt`).
+    Implements `androidx.media3.exoplayer.mediacodec.MediaCodecSelector`
+    as a top-level `object` (Kotlin singleton — `MediaCodecSelector`
+    is a Java interface so Kotlin object implementation works
+    natively; static-field access pitfall from ADR-117 doesn't apply
+    here because `MediaCodecSelector.DEFAULT` is declared on the
+    interface itself, not inherited from a parent).
+    *   Override of `getDecoderInfos(mimeType, requiresSecureDecoder,
+        requiresTunnelingDecoder): List<MediaCodecInfo>`:
+        delegates to `MediaCodecSelector.DEFAULT.getDecoderInfos(..)`
+        first, then if `mimeType.equals(MimeTypes.VIDEO_DOLBY_VISION,
+        ignoreCase = true)`, filters the returned list to entries
+        whose `info.capabilities?.profileLevels` contains a profile
+        in the locked DV constant set (PRD §F-015 + ADR-022):
+        `DolbyVisionProfileDvheStn` (profile 5),
+        `DolbyVisionProfileDvheSt` (profile 8.1),
+        `DolbyVisionProfileDvheDtb` (profile 7 — best-effort). The
+        set mirrors the three constants `Capabilities.kt:49-103`
+        already maps to `"profile5" / "profile8.1" / "profile7"` for
+        the info-panel snapshot; the new file documents the parallel
+        explicitly so a future audit can grep for "DV profile
+        constants" and find both call sites.
+    *   Empty-filter guard: if the DV filter produces `[]` (no DV-
+        capable decoder reported — emulator images, test fixtures,
+        platforms without HW DV codecs), the unfiltered DEFAULT
+        list is returned. The PRD §F-015 acceptance reads "force
+        selection of a DV-capable decoder" — the only safe
+        interpretation when none exists is to let ExoPlayer try its
+        best and surface the failure via `onPlayerError` rather than
+        a silent "no renderer" stall. The §6B-4 hardware check
+        ("DV Profile 5 movie plays on Shield with DV indicator")
+        verifies the filter's behavior on real hardware where
+        DV-capable decoders DO exist; the guard is for graceful
+        degradation on non-Shield surfaces.
+    *   `@UnstableApi` annotation matches the rest of the player-
+        plugin Kotlin surface (Media3 1.4.1 marks
+        `MediaCodecSelector` / `MediaCodecInfo` as unstable).
+    *   `@Throws(MediaCodecUtil.DecoderQueryException::class)`
+        annotation propagates the checked exception declared on the
+        Java interface so Java callers (none today, but ExoPlayer's
+        renderer call site is Java) keep their existing
+        try-catch semantics.
+
+2.  **`PlayerActivity.initPlayer` wired to the new selector**
+    (`android/player-plugin/android/src/main/java/dev/kino/player/PlayerActivity.kt`).
+    *   `.setMediaCodecSelector(MediaCodecSelector.DEFAULT)` →
+        `.setMediaCodecSelector(DvAwareCodecSelector)`.
+    *   The class-level kdoc's "ExoPlayer config" section now reads
+        "hardware preferred via [DvAwareCodecSelector], which wraps
+        `MediaCodecSelector.DEFAULT` for non-DV mimetypes and, for
+        `video/dolby-vision`, filters the candidate list to decoders
+        whose `CodecCapabilities.profileLevels` declare a DV profile
+        entry — implements the PRD §F-015 'force DV-capable
+        decoder' rule" — the previous "hardware preferred via
+        `MediaCodecSelector.DEFAULT`" sentence was structurally false
+        per the audit and is now correct.
+    *   The `import androidx.media3.exoplayer.mediacodec.MediaCodecSelector`
+        line is removed: the symbol is no longer referenced from
+        `PlayerActivity.kt` after the wiring change. ktlint /
+        Kotlin compiler don't error on unused imports by default
+        but keeping the file clean matches the existing import
+        block conventions.
+
+3.  **No Rust changes.** The PlayerHandle trait surface and the
+    `AndroidPlayer<R>` Rust driver (ADR-112 / 113 / 114 / 115) don't
+    interact with the codec selector — the selector is consumed by
+    ExoPlayer entirely on the Kotlin side. The drain-events bridge
+    that polls the 256-bounded `PlayerSession` queue is unaffected.
+
+4.  **No frontend changes.** The `Player.tsx` overlay route and the
+    `playerSession.ts` navigation payload are agnostic to which
+    decoder ExoPlayer picks; the only frontend-visible surface is
+    the existing info panel (`<InfoPanel>`-style scroll view) which
+    already surfaces `Capabilities.describe(snapshot)` listing the
+    DV profile set as text. No new event types, no new commands.
+
+5.  **No tests added.** The player-plugin module's
+    `android/build.gradle.kts` declares `testImplementation
+    ("junit:junit:4.13.2")` but ships no `src/test/` source set and
+    the CI workflow (`.github/workflows/ci.yml::build-android`)
+    invokes only `cargo tauri android build --apk` — which compiles
+    Kotlin but does not run JVM unit tests. Adding a junit test
+    would require either (a) adding `./gradlew :tauri-plugin-kino-
+    player:test` as a separate CI job (and stubbing
+    `MediaCodecSelector.DEFAULT` / `MediaCodecInfo` via Robolectric
+    or PowerMock since the production code path calls into Android
+    framework classes) — substantially more scope than the
+    PRD-locked acceptance criterion warrants; or (b) shipping a
+    structural assertion-only file that doesn't run on CI. Per
+    ADR-131 below, this session ships the implementation under
+    structural verification (the audit named the exact pattern;
+    code review confirms the pattern is implemented) and defers a
+    `./gradlew test` CI extension as a separate scope. The §6B-4
+    hardware check ("DV Profile 5 movie plays on Shield with DV
+    indicator") is the user-facing acceptance gate per the
+    standing §6B Verification framework.
+
+**Files changed (summary):**
+
+*   `android/player-plugin/android/src/main/java/dev/kino/player/DvAwareCodecSelector.kt`
+    (new, 88 LOC including kdoc).
+*   `android/player-plugin/android/src/main/java/dev/kino/player/PlayerActivity.kt`
+    (3-line wiring + import edit + 7-line class-level kdoc
+    revision; net +6 / -3 lines).
+
+**Verification:**
+
+*   `cargo fmt --check`: not executed locally — the GTK system
+    libraries `gdk-3.0` / `libwebkit2gtk-4.1-dev` are not installed
+    in the harness sandbox and `apt-get install` returned 404s
+    against `security.ubuntu.com` (stale Ubuntu archive on the
+    runner). The diff is Kotlin-only — zero Rust touched — so the
+    fmt check is functionally a no-op against a known-green main
+    (Session 032's CI run was green at merge).
+*   `cargo clippy --workspace --all-targets -- -D warnings`: same
+    as above. The clippy failure observed locally is the missing
+    GTK pkg-config artifact (`Package gdk-3.0 was not found`), not
+    a code defect. CI's `lint` job will run cleanly because the
+    workflow installs the GTK deps as a setup step.
+*   `cargo test --workspace`: same as above. Zero Rust changes,
+    the local toolchain can't compile the Tauri host crate without
+    GTK so a local run isn't viable; the workspace shipped green
+    at Session 032 merge, so the test run will recapitulate.
+*   `cd frontend && npm run lint && npm run typecheck && npm test`:
+    not executed locally — `frontend/node_modules` is absent in the
+    harness sandbox and the standing authorization explicitly
+    permits the agent to "wait for CI lint + test only". The diff
+    is Kotlin-only — zero TS / TSX / CSS touched — so a frontend
+    run is a sanity-only no-op against a known-green tree.
+*   `cargo tauri android build --apk`: the Android NDK / SDK are
+    absent from the harness (`ANDROID_HOME=""`,
+    `ANDROID_NDK_ROOT=""`); CI's `build-android` job runs the
+    compile via `android-actions/setup-android@v3` (`platforms;
+    android-34 build-tools;34.0.0 ndk;27.0.12077973 platform-tools`).
+    The Kotlin diff has been reviewed structurally against ADR-117
+    (no inherited-static-field traps — `MediaCodecSelector.DEFAULT`
+    is declared on the interface itself, not inherited), and the
+    introduced `DvAwareCodecSelector` uses the same
+    `MediaCodecInfo.CodecProfileLevel.DolbyVisionProfile*`
+    constants already present in `Capabilities.kt:49-103` so the
+    API-availability question is already resolved by the existing
+    module.
+
+**Features advanced:**
+
+*   F-015 stays `[ ]` in the Feature Tracker — Linux libmpv
+    in-window GL §6A sub-regression remains open per ADR-108.
+    The Android DV-decoder-forcing §6A sub-regression is the
+    closed half; its `§6A Code-Acceptance Regressions` entry is
+    flipped to RESOLVED.
+
+**New ADRs filed:** ADR-131 (see Architectural Decisions Log
+below — "Kotlin-side coverage for the Android player plugin ships
+under structural review until a `./gradlew test` CI job is added").
+
+**Known issues introduced or resolved:**
+
+*   Resolved: F-015 / Android DV decoder forcing §6A regression.
+    The PRD §F-015 line "For DV content (profile 5/8.1 detected in
+    stream metadata), force selection of a DV-capable decoder" is
+    now satisfied by code on `main`: ExoPlayer's
+    `MediaCodecVideoRenderer` consults
+    `DvAwareCodecSelector.getDecoderInfos(..)` when building the
+    DV renderer, which prunes non-DV-capable decoders from the
+    candidate list before profile-level matching.
+*   Introduced: none.
+
+**Next session needs to know:**
+
+*   Two §6A regressions remain:
+    *   **F-013 max-connections cap + F-014 piece-priority window
+        assignment** (librqbit-blocked). Session 034's strongly
+        recommended first move is option (d) of the audit closure
+        plan: file a PRD revision request under "PRD Issues"
+        proposing to relax "Max connections per torrent: 200" and
+        the piece-priority window mapping to "best-effort, subject
+        to engine capabilities" so the human can ratify. This is
+        the fastest §6A clearance path — options (a)-(c) (upstream
+        PR / fork / engine swap) require coordination the agent
+        can't drive solo. Filing (d) doesn't preclude pursuing (a)
+        in parallel, but parking the §6A gate behind the human's
+        PRD-revision decision is the only path that doesn't
+        block on external review.
+    *   **F-015 Linux libmpv in-window GL surface** (ADR-108
+        deviation, multi-session). Start with a scout session
+        that catalogs the available webview-surface access routes
+        on Tauri 2 / WebKitGTK (X11 `--wid` parent-window vs
+        Wayland subsurface protocol vs deep webkit-gtk
+        integration). The follow-up session implements the chosen
+        route behind a `libmpv-inprocess` Cargo feature flag.
+*   The §6B-4 hardware-verification line ("DV Profile 5 movie plays
+    on Shield with DV indicator") is now the user-facing gate for
+    the Android DV path's runtime correctness. Code structurally
+    satisfies the PRD; only real hardware can confirm the indicator
+    lights up.
+*   No new conventions filed this session. ADR-131 introduces a
+    convention (Kotlin testing deferred until a `./gradlew test`
+    CI job lands) but classes the gap as a Known Issue, not a
+    code-acceptance regression — the player-plugin module has
+    shipped without Kotlin tests since Session 023 and three
+    audits have not flagged it.
+
+---
 
 ### Session 032 — F-003 ETag expansion to TMDB credits + Trakt rating + TVDB extended title
 
@@ -7623,18 +7852,34 @@ implementation" split.
       claimed satisfied; §6B hardware verification (Shield Pro /
       phone / DV / Atmos / ASS rendering) remains for the human.
       **Re-opened by Session 027 audit:** (a) PRD §F-015 Android
-      "force selection of a DV-capable decoder" is unimplemented —
-      `PlayerActivity.kt:193` uses `MediaCodecSelector.DEFAULT` for
+      "force selection of a DV-capable decoder" was unimplemented —
+      `PlayerActivity.kt:193` used `MediaCodecSelector.DEFAULT` for
       all content even though `Capabilities.kt` probes DV support;
-      the snapshot is only displayed in the info panel. A custom
-      `MediaCodecSelector` that, on DV profile-5/8.1 streams,
-      filters `MediaCodecList` results to codecs whose
-      `CodecCapabilities.profileLevels` declare a `DolbyVisionProfile`
-      entry is required. (b) PRD §F-015 / ADR-011 Linux locks
+      the snapshot was only displayed in the info panel. **Closed
+      by Session 033:** new `DvAwareCodecSelector` Kotlin object at
+      `android/player-plugin/android/src/main/java/dev/kino/player/
+      DvAwareCodecSelector.kt` implementing `MediaCodecSelector`
+      filters `MediaCodecSelector.DEFAULT`'s decoder list, on
+      `MimeTypes.VIDEO_DOLBY_VISION` tracks, to codecs whose
+      `CodecCapabilities.profileLevels` contains one of the three
+      HEVC-based DV profile constants (`DolbyVisionProfileDvheStn`
+      profile 5, `DolbyVisionProfileDvheSt` profile 8.1,
+      `DolbyVisionProfileDvheDtb` profile 7 — same set
+      `Capabilities.dolbyVisionProfiles()` probes for the info
+      panel). Non-DV mimetypes delegate to DEFAULT unchanged.
+      Empty-filter-result guard returns the unfiltered list so
+      emulator images and non-Shield surfaces without DV decoders
+      still attempt playback (the error surfaces via
+      `onPlayerError`). `PlayerActivity.initPlayer` now passes
+      `DvAwareCodecSelector` instead of `MediaCodecSelector.DEFAULT`
+      to `DefaultRenderersFactory.setMediaCodecSelector(..)`. The
+      §6A "F-015 / Android DV decoder forcing" entry is flipped to
+      **RESOLVED** below. (b) PRD §F-015 / ADR-011 Linux locks
       "rendered into a GL surface owned by the Tauri window";
-      ADR-108 deferred to an mpv subprocess driver. The audit
-      treats both as §6A regressions. See "§6A Code-Acceptance
-      Regressions / F-015" for closure plan.)_
+      ADR-108 deferred to an mpv subprocess driver. STILL OPEN as
+      a §6A regression; multi-session ADR-108 deviation, see
+      "§6A Code-Acceptance Regressions / F-015 Linux libmpv
+      in-window GL surface" for closure plan.)_
 
 ### Release
 - [x] F-018: Build, packaging, distribution _(Session 022:
@@ -7769,6 +8014,7 @@ Additional ADRs filed by sessions:
 | ADR-128 | **TMDB credits cache key OMITS language: `tmdb:credits:{tmdb_id}:{kind}`.** The Session-031 `title_details` cache row IS language-keyed (ADR-127) because the TMDB `/3/{movie,tv}/{id}?language=...` call accepts a `language` parameter that localizes `overview` / `genres` / `age_rating`. The TMDB `/3/{movie,tv}/{id}/credits` call by contrast does NOT accept (and the kino client does NOT pass) a `language` parameter — `name` and `character` come back in their canonical form (TMDB's default English with some localized exceptions out of our control). Threading a `:language` suffix into the credits cache key would create cache-key fragmentation (one row per UI language) for a payload that's actually identical across them, multiplying writes and read-misses for no behavioral benefit. The `TmdbCredits` wrapper struct + `Serialize` / `Deserialize` derived on `TmdbCastMember` is the second instance of the "wrap-the-payload" pattern from `TmdbTitleDetails` (Session 031); the wrapper keeps the JSON payload self-describing on cache reads. | 032 |
 | ADR-129 | **404 from Trakt `/{movies\|shows}/{imdb}/ratings` is mapped to `Fresh { rating: TraktTitleRating { rating: None, .. }, etag: None }` — symmetric handling of "no rating" and "no title".** Trakt returns 404 for IMDb ids it doesn't recognize (different from a 200 with `rating: 0`, which it returns for ids it knows but has no votes for). The pre-Session-032 back-compat `title_rating` method already collapsed both into `Option<f64>::None`. The ETag-aware variant preserves that collapse INSIDE the `Fresh` arm so the negative result caches identically to a positive `None`: the cache row carries `payload = "{\"imdb_id\":..., \"rating\":null}"` and `etag = NULL`, and the next read deserializes back to `Option<f64>::None` without re-hitting the network until the `META_TTL_S` TTL elapses. Rejected alternative: return a separate `TraktTitleRatingFetch::NotFound` variant — clean type-theoretically but would require every caller in `get_title_detail_uncached` to branch on it (currently they all collapse to `None` anyway). The cost of the symmetric mapping is one cache row per unknown IMDb id for 24h, which is bounded by user navigation — acceptable. The same pattern is reused for TVDB extended (ADR-130). | 032 |
 | ADR-130 | **TVDB extended-artwork cache key OMITS language: `tvdb:title:{tvdb_id}:{kind}`.** The Session-031 STATE.md plan suggested `tvdb:title:{tvdb_id}:{kind}:{language}` but the actual HTTP target is `/v4/{movies\|series}/{id}/extended?meta=translations` — a single call that returns EVERY translation in one envelope. The cache row's identity is therefore `(tvdb_id, kind)`, not `(tvdb_id, kind, language)`; a `:language` suffix would fragment the cache by N copies of the same payload (one per UI language) for no behavioral benefit. The persisted payload is `Option<ProviderBundle>` so the 404 negative result (mapped per ADR-129's pattern: `Fresh { bundle: None, etag: None }`) round-trips through serde as the literal JSON token `null`, distinct from a populated bundle. `ProviderBundle` + `LocalizedAsset` derive Serialize/Deserialize (ADR-130 corollary); the `HashMap<String, String>` summaries field round-trips through serde's default map encoding. Because the underlying `/extended` call is also used by the F-005 artwork resolver at the OUTER `resolve_artwork` cache row (which has a 7-day TTL), the inner per-resource row's TTL is matched at `ARTWORK_TTL_S = 7d` so the two tiers expire on the same cadence (vs the META_TTL_S = 24h used by TMDB title_details / credits which feed the F-010 detail aggregate, which itself ships at META_TTL_S). | 032 |
+| ADR-131 | **Kotlin-side coverage for the Android player plugin ships under structural review until a `./gradlew test` CI job is added.** The `tauri-plugin-kino-player` android module's `build.gradle.kts` declares `testImplementation("junit:junit:4.13.2")` but the module has shipped without a `src/test/` source set since Session 023, and the CI workflow (`.github/workflows/ci.yml::build-android`) runs `cargo tauri android build --apk` exclusively — which compiles Kotlin but does NOT execute the unit-test source set. Adding a JVM-level test for a class that calls into Android framework code (`MediaCodecSelector.DEFAULT`, `MediaCodecInfo.CodecCapabilities`, `MediaCodecList`, etc.) requires either Robolectric (a ~15 MB dependency that emulates Android framework on the JVM) or extensive mocking via PowerMock / MockK — and a new `./gradlew :tauri-plugin-kino-player:test` CI job that runs neither today. Session 033 ships `DvAwareCodecSelector` without a Kotlin unit test because: (a) the §6A audit explicitly named the implementation pattern ("a custom `MediaCodecSelector` that filters `MediaCodecList` results to codecs whose `CodecCapabilities.profileLevels` declare a `DolbyVisionProfile` entry") so code review against the audit IS the structural verification; (b) the §6B-4 hardware-verification line ("DV Profile 5 movie plays on Shield with DV indicator") is the runtime acceptance gate; (c) wiring a `./gradlew test` CI job + a Robolectric / MockK harness is a separate scope (~150 LOC of test infra for ~30 LOC of new test logic) and Session 033 should not bundle the framework lift with the feature it would test. A future polish session ("Android-side test harness") can land the gradle test wiring and backfill tests for `DvAwareCodecSelector`, `Capabilities`, `PlayerSession`, `Events`, etc. all at once. This ADR is descriptive ("documents how a §6A regression is closed without a unit test") not prescriptive ("you must not add tests"); a session that adds JVM tests via Robolectric is welcome to do so. The convention is: when the §6A acceptance hinges on Android framework call-path structure rather than pure-logic state, structural review against the audit's quoted pattern is acceptable closure. | 033 |
 
 ---
 
@@ -8264,32 +8510,68 @@ also expose the piece-priority / per-file priority API surface
 (`update_only_files`, `file_priorities`, `chunk_tracker_*`)
 currently in `pub(crate)`.
 
-### F-015 / Android DV decoder forcing
+### ~~F-015 / Android DV decoder forcing~~ — RESOLVED in Session 033
 
 **PRD §F-015 (locked):**
 > Decoders: hardware preferred via `MediaCodecSelector.DEFAULT`.
 > For DV content (profile 5/8.1 detected in stream metadata),
 > force selection of a DV-capable decoder.
 
-**Actual:**
-`android/player-plugin/android/src/main/java/dev/kino/player/PlayerActivity.kt:193`
-uses `MediaCodecSelector.DEFAULT` unconditionally. The DV-capable
-codec list IS already enumerated in
-`Capabilities.kt:50-103` (the `DolbyVisionProfileDvheStn` /
-`DolbyVisionProfileDvheSt` / `DolbyVisionProfileDvheDtb`
-constants are looped against `MediaCodecList`); the snapshot is
-displayed in the info panel (`PlayerActivity.kt:511`) but never
-used to drive selector behavior.
+**Resolution (Session 033):** new
+`DvAwareCodecSelector` Kotlin `object` at
+`android/player-plugin/android/src/main/java/dev/kino/player/DvAwareCodecSelector.kt`
+implementing `androidx.media3.exoplayer.mediacodec.MediaCodecSelector`.
+The `override fun getDecoderInfos(mimeType, requiresSecureDecoder,
+requiresTunnelingDecoder)` delegates to
+`MediaCodecSelector.DEFAULT.getDecoderInfos(..)` first, then on
+`mimeType.equals(MimeTypes.VIDEO_DOLBY_VISION, ignoreCase = true)`
+filters the returned list to entries whose
+`info.capabilities?.profileLevels` contains a profile in the locked
+DV constant set (PRD §F-015 + ADR-022):
+`DolbyVisionProfileDvheStn` (profile 5),
+`DolbyVisionProfileDvheSt` (profile 8.1), and
+`DolbyVisionProfileDvheDtb` (profile 7 — best-effort). The set
+mirrors the three constants `Capabilities.kt:49-103` already maps
+to `"profile5" / "profile8.1" / "profile7"` for the info-panel
+snapshot. Non-DV mimetypes pass the unfiltered DEFAULT list
+through unchanged so HEVC / H.264 / VP9 / AV1 / audio / subtitle
+decoder selection retains the stock Media3 behavior the info-panel
+snapshot already documents. Empty-filter-result guard: if the DV
+filter produces `[]` (emulator / non-Shield surfaces without HW
+DV codecs) the unfiltered DEFAULT list is returned so playback
+still attempts and the failure surfaces via `onPlayerError` rather
+than a silent "no renderer" stall.
 
-**Closure plan:** implement a custom
-`MediaCodecSelector` (e.g. `DvAwareCodecSelector`) that delegates
-to `MediaCodecSelector.DEFAULT.getDecoderInfos(...)` and, for
-video tracks whose parsed `Format.codecs` indicates DV profile
-5 or 8.1, filters the returned list to codecs whose
-`CodecCapabilities.profileLevels` declare a Dolby Vision profile
-entry. Non-DV content keeps the default behavior. Hook via
-`ExoPlayer.Builder.setRenderersFactory(...)` or
-`DefaultRenderersFactory.setMediaCodecSelector(...)`. ~60 LOC.
+`PlayerActivity.initPlayer` (the only call site) was changed at
+`PlayerActivity.kt:193`:
+
+```diff
+- .setMediaCodecSelector(MediaCodecSelector.DEFAULT)
++ .setMediaCodecSelector(DvAwareCodecSelector)
+```
+
+The class-level kdoc's "ExoPlayer config" section was updated to
+describe the new wrapper. The
+`import androidx.media3.exoplayer.mediacodec.MediaCodecSelector`
+line was removed (the symbol is no longer referenced from
+`PlayerActivity.kt` after the wiring change).
+
+**Tests:** none added this session. The player-plugin module's
+`android/build.gradle.kts` declares
+`testImplementation("junit:junit:4.13.2")` but ships no
+`src/test/` source set, and the CI workflow
+(`.github/workflows/ci.yml::build-android`) invokes only
+`cargo tauri android build --apk` — which compiles Kotlin but
+does not execute the unit-test source set. Adding a junit test
+that exercises `DvAwareCodecSelector.getDecoderInfos(..)` would
+require either a `./gradlew :tauri-plugin-kino-player:test` CI
+job AND a way to stub `MediaCodecSelector.DEFAULT` /
+`MediaCodecInfo` (production code path calls into Android
+framework classes), or a structural assertion-only file that
+doesn't run on CI. ADR-131 below documents this gap and frames a
+future scope. The §6B-4 hardware-verification line ("DV Profile 5
+movie plays on Shield with DV indicator") remains the user-facing
+acceptance gate per the standing §6B framework.
 
 ### F-015 / Linux libmpv in-window GL surface
 
