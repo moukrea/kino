@@ -184,22 +184,21 @@ pub fn run() {
             // lock.
             app.manage(Arc::new(PlayerRuntime::default()));
 
-            // PRD §F-015 / ADR-133 Route B (Session 036 spike): if
-            // `KINO_LIBMPV_SURFACE_SPIKE=1` is set, perform the GTK
-            // widget-tree surgery that wraps the Tauri webview in a
-            // GtkOverlay sibling of a GtkGLArea. The default build
-            // (and CI) does NOT invoke the surgery — the env-var
-            // gate keeps the Session-020 subprocess driver's runtime
-            // behavior unchanged. A human can opt-in by running
-            // `KINO_LIBMPV_SURFACE_SPIKE=1 cargo tauri dev` locally
-            // and watching for the structural log line. Session 037
-            // replaces this env-var gate with the `libmpv-inprocess`
-            // Cargo feature flag once the libmpv driver actually
-            // drives the GL area.
-            #[cfg(target_os = "linux")]
-            if std::env::var("KINO_LIBMPV_SURFACE_SPIKE").as_deref() == Ok("1") {
-                run_libmpv_surface_spike(app);
-            }
+            // PRD §F-015 / ADR-133 Route B (Session 037 driver): when
+            // the `libmpv-inprocess` Cargo feature is enabled, perform
+            // the GTK widget-tree surgery that wraps the Tauri webview
+            // in a `GtkOverlay` sibling of a `GtkGLArea`, then attach a
+            // [`kino_player::LibmpvPlayer`] to the freshly-exposed GL
+            // area and manage it as `Arc<dyn PlayerHandle>` app state.
+            // The Linux branch of [`commands::spawn_platform_player`]
+            // resolves that managed handle instead of spawning a new
+            // mpv subprocess. When the feature is OFF (default through
+            // Session 037), neither the surgery nor the libmpv driver
+            // runs — the Session-020 subprocess driver (ADR-108)
+            // remains the Linux player. Session 038 flips this on by
+            // default after §6B-1 re-verification.
+            #[cfg(all(target_os = "linux", feature = "libmpv-inprocess"))]
+            setup_libmpv_inprocess(app);
 
             tracing::info!("kino host started (PRD §F-002 persistence ready)");
             Ok(())
@@ -265,35 +264,62 @@ pub fn run() {
         .expect("kino: error while running tauri application");
 }
 
-/// Run the F-015 Linux libmpv in-window GL surface spike (ADR-133
-/// Route B, Session 036). Reads the main webview window from the app
-/// handle, posts a `with_webview` closure to the GTK main thread, and
-/// inside that closure performs the [`kino_player::inject_overlay`]
-/// surgery on the underlying `webkit2gtk::WebView`. Result is logged at
-/// `info` (success) or `error` (failure); a failed surgery is non-fatal
-/// — the app continues with the unmodified widget tree.
+/// Run the F-015 Linux libmpv in-window GL driver setup (ADR-133 Route
+/// B, Session 037). Reads the main webview window from the app handle,
+/// posts a `with_webview` closure to the GTK main thread, and inside
+/// that closure (a) performs the
+/// [`kino_player::inject_overlay`] surgery on the underlying
+/// `webkit2gtk::WebView`, (b) constructs a [`kino_player::LibmpvPlayer`]
+/// attached to the freshly-injected `GLArea`, and (c) `manage`s the
+/// player as a process-lifetime `Arc<dyn PlayerHandle>` in Tauri's
+/// state container so the
+/// [`commands::spawn_platform_player`] resolver can vend it on every
+/// `player_open`. Each of (a), (b), (c) is logged at `info` on success
+/// and `error` on failure; a failed step is non-fatal but DOES leave
+/// the host without a Linux libmpv driver — subsequent `player_open`
+/// calls fall through to the subprocess `MpvPlayer` (ADR-108) so the
+/// app remains operational.
 ///
-/// Invoked from `setup()` iff `KINO_LIBMPV_SURFACE_SPIKE=1`; default
-/// builds do NOT run this code path. The runtime opt-in lets a human
-/// verify the surgery on real hardware without changing CI behavior.
-#[cfg(target_os = "linux")]
-fn run_libmpv_surface_spike<R: tauri::Runtime>(app: &tauri::App<R>) {
+/// Invoked from `setup()` only when the `libmpv-inprocess` Cargo
+/// feature flag is enabled (Session 037 default OFF). Session 038
+/// flips the default after §6B-1 hardware verification.
+#[cfg(all(target_os = "linux", feature = "libmpv-inprocess"))]
+fn setup_libmpv_inprocess<R: tauri::Runtime>(app: &tauri::App<R>) {
+    use std::sync::Arc;
+    use tauri::Manager;
+
     let Some(window) = app.get_webview_window("main") else {
-        tracing::warn!("libmpv-surface-spike: no 'main' webview window found");
+        tracing::warn!("libmpv-inprocess: no 'main' webview window found");
         return;
     };
-    let result = window.with_webview(|platform_webview| {
+    let handle = app.handle().clone();
+    let result = window.with_webview(move |platform_webview| {
         let webview = platform_webview.inner();
-        match kino_player::inject_overlay(&webview) {
-            Ok(_surgery) => {
+        let surgery = match kino_player::inject_overlay(&webview) {
+            Ok(s) => {
                 tracing::info!(
-                    "libmpv-surface-spike: GtkOverlay injected; webview reparented above GtkGLArea (Route B Session 036 spike OK)"
+                    "libmpv-inprocess: GtkOverlay injected; webview reparented above GtkGLArea"
                 );
+                s
             }
             Err(e) => {
                 tracing::error!(
                     error = %e,
-                    "libmpv-surface-spike: surgery failed (Route B Session 036 spike FAILED)"
+                    "libmpv-inprocess: surgery failed; subprocess driver remains the Linux player"
+                );
+                return;
+            }
+        };
+        match kino_player::LibmpvPlayer::new_attached(surgery) {
+            Ok(player) => {
+                tracing::info!("libmpv-inprocess: LibmpvPlayer attached; managing as PlayerHandle");
+                let arc: Arc<dyn kino_player::PlayerHandle> = Arc::new(player);
+                handle.manage(LibmpvPlayerHandle(arc));
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "libmpv-inprocess: LibmpvPlayer attach failed; subprocess driver remains the Linux player"
                 );
             }
         }
@@ -301,10 +327,19 @@ fn run_libmpv_surface_spike<R: tauri::Runtime>(app: &tauri::App<R>) {
     if let Err(e) = result {
         tracing::warn!(
             error = %e,
-            "libmpv-surface-spike: with_webview dispatch failed; surgery not attempted"
+            "libmpv-inprocess: with_webview dispatch failed; surgery + driver attach not attempted"
         );
     }
 }
+
+/// Newtype wrapper for the libmpv `PlayerHandle` so Tauri's state map
+/// distinguishes it from any other `Arc<dyn PlayerHandle>` we might
+/// later `manage` (the Android plugin's `SharedPlayer` already lives
+/// in a wrapped form inside the plugin). The wrapper is consumed by
+/// [`commands::spawn_platform_player`] when the
+/// `libmpv-inprocess` feature is enabled on Linux.
+#[cfg(all(target_os = "linux", feature = "libmpv-inprocess"))]
+pub(crate) struct LibmpvPlayerHandle(pub(crate) std::sync::Arc<dyn kino_player::PlayerHandle>);
 
 /// Install the global `tracing` subscriber. When the per-platform config
 /// directory is writable, a daily-rotating file appender is layered next to

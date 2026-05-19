@@ -90,6 +90,18 @@ wiremock = { workspace = true }
 # scratch directory; tempfile gives a per-test cleanup-safe path.
 tempfile = "3"
 
+[features]
+default = []
+# F-015 Linux libmpv in-process driver (Session 037 / ADR-133 Route B).
+# Forwards to `kino-player`'s same-named feature; when ON the host's
+# setup() hook injects the GTK overlay surgery and constructs
+# `LibmpvPlayer` for `spawn_platform_player` to vend on Linux. When OFF
+# (default through Session 037) the subprocess `MpvPlayer` (ADR-108)
+# remains the Linux driver and no `libmpv2-dev` link-time dependency is
+# introduced. Session 038 adds the apt-install line + bundle deps and
+# flips the feature on by default after §6B-1 hardware verification.
+libmpv-inprocess = ["kino-player/libmpv-inprocess"]
+
 [lints.rust]
 unsafe_code = "forbid"
 

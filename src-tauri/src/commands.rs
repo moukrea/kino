@@ -4301,10 +4301,34 @@ async fn close_active_player(player: &State<'_, Arc<PlayerRuntime>>) -> bool {
     true
 }
 
+/// Linux player resolver.
+///
+/// Two paths under PRD §F-015 / ADR-133:
+///
+/// - **`libmpv-inprocess` feature ON** (Session 037+): the host's
+///   `setup()` hook constructs a single [`kino_player::LibmpvPlayer`]
+///   and stashes it as `LibmpvPlayerHandle` in Tauri's state. This
+///   function clones the managed `Arc<dyn PlayerHandle>` — the driver
+///   lives for the process lifetime. If the setup-time attach failed
+///   (e.g. GTK surgery couldn't run) the state isn't populated, and
+///   the function falls back to the subprocess driver below.
+/// - **Feature OFF** (default through Session 037): the subprocess
+///   `MpvPlayer` (ADR-108) is spawned fresh per `player_open` call,
+///   matching the pre-Session-037 behavior unchanged.
 #[cfg(target_os = "linux")]
 async fn spawn_platform_player(
-    _app: &tauri::AppHandle,
+    #[allow(unused_variables)] app: &tauri::AppHandle,
 ) -> Result<Arc<dyn PlayerHandle>, PlayerError> {
+    #[cfg(feature = "libmpv-inprocess")]
+    {
+        use tauri::Manager;
+        if let Some(managed) = app.try_state::<crate::LibmpvPlayerHandle>() {
+            return Ok(Arc::clone(&managed.0));
+        }
+        tracing::warn!(
+            "libmpv-inprocess feature enabled but LibmpvPlayerHandle missing in state; falling back to subprocess mpv"
+        );
+    }
     let player = MpvPlayer::spawn().await?;
     Ok(Arc::new(player))
 }

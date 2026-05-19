@@ -54,6 +54,15 @@ pub mod mpv;
 #[cfg(target_os = "linux")]
 pub mod surface;
 
+/// In-process libmpv driver gated by the `libmpv-inprocess` Cargo
+/// feature (Session 037 / ADR-133 Route B). When the feature is OFF
+/// (default through Session 037) this module is excluded from the
+/// build so the workspace does NOT require `libmpv2-dev` at link
+/// time. Session 038 adds the apt-install line + bundle deps and
+/// flips the feature on by default after §6B-1 hardware verification.
+#[cfg(all(target_os = "linux", feature = "libmpv-inprocess"))]
+pub mod libmpv;
+
 pub use error::PlayerError;
 pub use event::{PlayerEvent, PositionTick};
 pub use handle::{OpenRequest, PlayerHandle};
@@ -65,3 +74,6 @@ pub use mpv::MpvPlayer;
 
 #[cfg(target_os = "linux")]
 pub use surface::{inject_overlay, OverlaySurgery, SurfaceError};
+
+#[cfg(all(target_os = "linux", feature = "libmpv-inprocess"))]
+pub use libmpv::LibmpvPlayer;
