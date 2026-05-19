@@ -33,10 +33,13 @@ pub use fanart::FanartClient;
 // re-exports are kept here so existing imports `kino_metadata::HttpConfig` /
 // `kino_metadata::USER_AGENT` continue to compile.
 pub use kino_core::http::{HttpConfig, USER_AGENT};
-pub use tmdb::{TmdbCastMember, TmdbClient, TmdbTitleDetails, TmdbTitleDetailsFetch};
-pub use trakt::TraktClient;
+pub use tmdb::{
+    TmdbCastMember, TmdbClient, TmdbCredits, TmdbCreditsFetch, TmdbTitleDetails,
+    TmdbTitleDetailsFetch,
+};
+pub use trakt::{TraktClient, TraktTitleRating, TraktTitleRatingFetch};
 pub use trending::{aggregate, aggregate_pools, ProviderItem, TrendingPools};
-pub use tvdb::TvdbClient;
+pub use tvdb::{TvdbArtworkFetch, TvdbClient};
 
 /// `settings.key` storing the TMDB API key (PRD §F-003).
 pub const TMDB_API_KEY: &str = "tmdb_api_key";

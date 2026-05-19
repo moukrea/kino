@@ -1,9 +1,9 @@
 # kino — Agent State
 
 **PRD version:** 1.0 (locked)
-**Status:** v1.0.0-alpha.1 release pipeline shipped. **Session 031 closes the F-003 ETag handling §6A regression** — the single largest §6A gap the Session 027 audit flagged after Session 030's F-006 closure. The PRD §F-003 contract item "ETag handled where the provider supports it; stored in `response_cache.etag`" was previously unfulfilled: `db.cache_set` wrote `etag = NULL` unconditionally and no client sent `If-None-Match`. This session adds the workspace-wide infrastructure: `db.cache_set(key, payload, etag, expires_at)` now persists ETags; new `db.cache_get_with_etag` returns `(payload, Option<etag>)`; new `db.cache_refresh_expiry` covers the `304 Not Modified` happy path; new `kino_core::http::fetch_with_etag` + `FetchOutcome` round-trip `If-None-Match` and surface `304` as a first-class cache-hit success (no retry); `fetch_with_retry` becomes a back-compat wrapper. **One per-resource demonstration shipped end-to-end** through the per-tile-detail path: new `TmdbClient::title_details_with_etag` + `TmdbTitleDetailsFetch` enum, consumed by a new `fetch_tmdb_title_details_etag_cached(...)` helper in `src-tauri::commands` that wraps the TMDB title-details call inside `get_title_detail_uncached` with a per-resource cache row at key `tmdb:title_details:{tmdb_id}:{kind}:{language}` (TTL `META_TTL_S = 24h`). The aggregated `meta:{title_id}:...` row that `get_title_detail` already maintained is unchanged; the new inner row gives ETag a 1:1 HTTP target. F-003 stays open in the Feature Tracker because the audit explicitly enumerated ETag round-trip "where the provider supports it" — TMDB title_details is one site, with TMDB credits + Trakt rating + TVDB title still pending (filed as follow-up under PRD Issues with the recommended next-session expansion). Three §6A feature regressions still open: F-013 / F-014 (librqbit-blocked: max-connections cap + piece-priority window assignment), F-015 (Android DV decoder selector + Linux libmpv in-window GL). **§6A is still not claimable.** See the F-003-closure rationale and ADR-124 / 125 / 126 / 127 in the Session 031 entry below.
-**Last session:** 031 (F-003 ETag handling infrastructure + TMDB title_details demonstration — `cache_set(.., etag, expires_at)` + `cache_get_with_etag` + `cache_refresh_expiry` in `kino_core::Db`; `fetch_with_etag` + `FetchOutcome` enum in `kino_core::http` with `If-None-Match` / 304 round-trip; `title_details_with_etag` + `TmdbTitleDetailsFetch` on `TmdbClient`; new `fetch_tmdb_title_details_etag_cached` helper in `src-tauri::commands` wiring TMDB title-details through `response_cache.etag` at TTL `META_TTL_S = 24h`; all 6 existing `cache_set` call sites in `commands.rs` migrated to `None` etag; 22 new tests (7 in `kino-core::http`, 6 in `kino-core::db`, 5 in `kino-metadata::tmdb`, 4 in `kino-app::commands`); `wiremock` added to `kino-core` dev-deps so the new HTTP helper can be tested in isolation; clippy + fmt + workspace tests all green. F-003 stays `[ ]` pending TMDB credits + Trakt rating + TVDB title round-trip — filed as Session-032 scope.)
-**Next session:** 032 — recommended order from the remaining §6A Code-Acceptance Regressions section: (1) F-003 ETag expansion to TMDB credits + Trakt rating + TVDB title (medium scope: replicate the Session-031 pattern at three more per-resource call sites in `get_title_detail_uncached`, ~150 LOC counting tests), (2) F-015 Android DV decoder selector (~60 LOC), (3) F-013 / F-014 librqbit-blocked items (need an upstream PR, a fork, or a human PRD revision — file under "PRD Issues" if blocked), (4) F-015 Linux libmpv in-window GL surface (multi-session, ADR-108 deviation).
+**Status:** v1.0.0-alpha.1 release pipeline shipped. **Session 032 closes the F-003 ETag handling §6A regression for good**: the Session-031 pattern has now landed at the three remaining per-resource sites the audit enumerated — TMDB credits, Trakt title-rating, and TVDB extended-title artwork. Three new per-resource cache helpers in `src-tauri::commands` (`fetch_tmdb_credits_etag_cached`, `fetch_trakt_rating_etag_cached`, `fetch_tvdb_artwork_etag_cached`) wire `response_cache.etag` to the matching `*_with_etag` variants on each provider client. `TmdbClient::credits_with_etag` + `TmdbCreditsFetch` and `TraktClient::title_rating_with_etag` + `TraktTitleRatingFetch` and `TvdbClient::artwork_with_etag` + `TvdbArtworkFetch` are the new provider seams; the original `credits` / `title_rating` / `artwork` methods now delegate so existing callers stay source-compatible. `get_title_detail_uncached` flips its TMDB-credits + Trakt-rating calls to the new helpers; `build_bundles` takes a `&Db` and flips its TVDB call. Trakt 404 and TVDB 404 map to `Fresh { rating: None / bundle: None, etag: None }` so the negative result caches identically (the next read short-circuits without exploding). Fanart.tv is intentionally still out of scope per the Session-031 audit note ("inconsistent ETag support"; the back-compat `fetch_with_retry` silently honors "where the provider supports it"). 18 new tests (3 per-provider in `kino-metadata`, 8 in `kino-app::commands`, 9 total via the per-resource helpers). F-003 is now `[x]` in the Feature Tracker; the §6A "F-003 / ETag handling" entry is flipped to **RESOLVED**. **Three §6A regressions remain**: F-013 / F-014 (librqbit-blocked: max-connections cap + piece-priority window assignment — need an upstream PR, a fork, an engine swap, or a PRD revision); F-015 (Android DV decoder selector — ~60 LOC, no upstream blocker; Linux libmpv in-window GL — multi-session ADR-108 deviation). **§6A is still not claimable.** See the F-003-closure rationale and ADR-128 / 129 / 130 in the Session 032 entry below.
+**Last session:** 032 (F-003 ETag expansion to TMDB credits + Trakt rating + TVDB extended-title artwork — new `*_with_etag` provider methods + `*Fetch` enums on `TmdbClient::credits`, `TraktClient::title_rating`, `TvdbClient::artwork`; new helpers `fetch_tmdb_credits_etag_cached` (cache key `tmdb:credits:{tmdb_id}:{kind}`, TTL `META_TTL_S = 24h`), `fetch_trakt_rating_etag_cached` (`trakt:title_rating:{imdb_id}:{kind}`, `META_TTL_S`), `fetch_tvdb_artwork_etag_cached` (`tvdb:title:{tvdb_id}:{kind}`, `ARTWORK_TTL_S = 7d`); `TmdbCastMember`/`TmdbCredits`/`TraktTitleRating`/`LocalizedAsset`/`ProviderBundle` now derive Serialize/Deserialize for cache persistence; `get_title_detail_uncached` swaps to the new TMDB-credits + Trakt-rating helpers; `build_bundles(db, ...)` takes a `&Db` and uses the new TVDB helper; 18 new tests (3 TMDB-credits + 4 Trakt-rating + 3 TVDB in `kino-metadata`, 2+3+3 = 8 in `kino-app::commands`); clippy + fmt + workspace tests all green (95 kino-metadata, 121 kino-app, 234 frontend); F-003 is now `[x]`.)
+**Next session:** 033 — remaining §6A regressions in priority order: (1) **F-015 Android DV decoder selector** (~60 LOC, no upstream blocker — custom `MediaCodecSelector` that filters by `DolbyVisionProfile` for DV profile 5/8.1 streams; the smallest closure left), (2) **F-013 max-connections cap** + **F-014 piece-priority window** (librqbit-blocked — Session 033 should pick (a) draft an upstream PR exposing the option, (b) file a PRD revision under "PRD Issues" relaxing the 200-cap invariant to "best-effort, subject to engine capabilities", or both; the agent can't merge an upstream PR alone so (b) is the fastest §6A clearance), (3) **F-015 Linux libmpv in-window GL surface** (multi-session ADR-108 deviation — start with a "enumerate webview surface access on Linux" scout session).
 
 ---
 
@@ -68,6 +68,185 @@ a hard requirement.
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 032 — F-003 ETag expansion to TMDB credits + Trakt rating + TVDB extended title
+
+**Branch:** `claude/session-001-bootstrap-OKjOG` (harness-supplied; see
+ADR-033 — the harness reuses a single branch name across all sessions
+for this checkout, the branch name does NOT track the session number).
+
+**Scope chosen:** F-003 ETag expansion to the three per-resource sites
+the Session-031 audit enumerated as remaining work (TMDB credits, Trakt
+title_rating, TVDB extended title artwork). Picked because (a) the
+audit's plan was concrete and bounded — replicate the Session-031
+pattern at three more call sites, no architectural surprises;
+(b) closing F-003 is the single largest §6A clearance available
+without upstream coordination (the F-013 / F-014 librqbit-blocked
+items and the F-015 Linux libmpv in-window GL surface all need work
+the agent can't drive alone); (c) the infra is in place from Session
+031 so every new site is a ~30 LOC opt-in. Bundle size: ~430 LOC of
+production code (270 in `kino-metadata`, 160 in `kino-app::commands`,
+including derive additions) + ~480 LOC of tests, all in the Rust
+workspace; no frontend touches (frontend tests rerun unchanged to
+prove no regression — 234 green).
+
+**Implementation:**
+
+1.  **TMDB credits ETag round-trip** (`kino-metadata::tmdb`,
+    `kino-app::commands`).
+    - New `TmdbCredits { tmdb_id, kind, cast }` wrapper struct +
+      `Serialize` / `Deserialize` derived on `TmdbCastMember` so the
+      cast roster can be persisted in `response_cache` (ADR-128).
+    - New `TmdbCreditsFetch { NotModified | Fresh { credits, etag } }`
+      enum + `TmdbClient::credits_with_etag(tmdb_id, kind,
+      prior_etag) -> Result<TmdbCreditsFetch, Error>`. The original
+      `credits()` method now delegates to `credits_with_etag(.., None)`
+      and unwraps the `Fresh` arm; existing callers stay
+      source-compatible.
+    - New `fetch_tmdb_credits_etag_cached(db, client, tmdb_id, kind)`
+      helper in `src-tauri::commands` at cache key
+      `tmdb:credits:{tmdb_id}:{kind}` (no language suffix — TMDB's
+      `/credits` endpoint doesn't accept a `language` parameter,
+      character strings come back in the canonical form), TTL
+      `META_TTL_S = 24h`.
+    - `get_title_detail_uncached`'s TMDB credits call is flipped to
+      the new helper.
+
+2.  **Trakt title_rating ETag round-trip** (`kino-metadata::trakt`,
+    `kino-app::commands`).
+    - New `TraktTitleRating { imdb_id, kind, rating: Option<f64> }`
+      wrapper struct + `Serialize` / `Deserialize` (the `Option<f64>`
+      naturally encodes both the "no votes" and the "unknown title"
+      cases so the cached payload is self-describing).
+    - New `TraktTitleRatingFetch { NotModified | Fresh { rating, etag } }`
+      enum + `TraktClient::title_rating_with_etag(imdb_id, kind,
+      prior_etag) -> Result<TraktTitleRatingFetch, Error>`. A `404`
+      from Trakt (unknown title) maps to `Fresh { rating:
+      TraktTitleRating { .., rating: None }, etag: None }` so the
+      negative result caches identically to a positive `Option<f64>::
+      None` (ADR-129 — symmetric handling of "no rating" and "no
+      title"). The original `title_rating()` method delegates and
+      unwraps to `Option<f64>`; existing callers unchanged.
+    - New `fetch_trakt_rating_etag_cached(db, client, imdb_id, kind)`
+      helper at cache key `trakt:title_rating:{imdb_id}:{kind}`, TTL
+      `META_TTL_S = 24h`.
+    - `get_title_detail_uncached`'s Trakt rating call is flipped to
+      the new helper.
+
+3.  **TVDB extended-title artwork ETag round-trip**
+    (`kino-metadata::artwork`, `kino-metadata::tvdb`,
+    `kino-app::commands`).
+    - `Serialize` / `Deserialize` derived on `LocalizedAsset` and
+      `ProviderBundle` so the parsed bundle can be persisted in
+      `response_cache` (ADR-130).
+    - New `TvdbArtworkFetch { NotModified | Fresh { bundle:
+      Option<ProviderBundle>, etag } }` enum + `TvdbClient::
+      artwork_with_etag(tvdb_id, kind, prior_etag) ->
+      Result<TvdbArtworkFetch, Error>`. A `404` from TVDB (unknown
+      id) maps to `Fresh { bundle: None, etag: None }` mirroring the
+      Trakt pattern. The original `artwork()` method delegates and
+      unwraps to `Option<ProviderBundle>`.
+    - New `fetch_tvdb_artwork_etag_cached(db, client, tvdb_id, kind)`
+      helper at cache key `tvdb:title:{tvdb_id}:{kind}` (no language
+      suffix — the underlying `/v4/{movies|series}/{id}/extended?
+      meta=translations` returns every translation in a single
+      envelope; ADR-130's STATE.md plan suggested
+      `:{language}`-suffix but the actual HTTP target is
+      `(tvdb_id, kind)`-keyed so the cache key must match). TTL
+      `ARTWORK_TTL_S = 7d` (matches the outer `resolve_artwork`
+      aggregate row's TTL so the two tiers expire on the same
+      cadence).
+    - `build_bundles` gains a `&Db` parameter and its TVDB future
+      flips to the new helper. TMDB and Fanart paths still go
+      straight to the network through the back-compat methods — they
+      don't have per-resource cache rows yet (the outer
+      `meta:{title_id}:...` aggregate row covers them) and Fanart was
+      excluded by the Session-031 audit as "inconsistent ETag
+      support". The only call site of `build_bundles` is
+      `get_artwork`, which already has a `db` in scope.
+
+**Tests (18 new):**
+
+- `kino-metadata::tmdb`: 3 new (`credits_with_etag_no_prior_returns_
+  fresh_with_server_etag`, `credits_with_etag_prior_sends_if_none_
+  match_and_304_yields_not_modified`,
+  `credits_back_compat_unchanged_when_server_sends_etag`).
+- `kino-metadata::trakt`: 4 new (`title_rating_with_etag_no_prior_
+  returns_fresh_with_server_etag`, `title_rating_with_etag_prior_
+  sends_if_none_match_and_304_yields_not_modified`,
+  `title_rating_with_etag_404_yields_fresh_none_so_absence_is_
+  cacheable`, `title_rating_back_compat_unchanged_when_server_sends_
+  etag`).
+- `kino-metadata::tvdb`: 3 new (`artwork_with_etag_no_prior_returns_
+  fresh_with_server_etag`, `artwork_with_etag_prior_sends_if_none_
+  match_and_304_yields_not_modified`, `artwork_with_etag_404_yields_
+  fresh_none_so_absence_is_cacheable`).
+- `kino-app::commands`: 8 new (2 TMDB credits + 3 Trakt rating + 3
+  TVDB artwork, all end-to-end through the per-resource helper:
+  `_first_call_persists_etag_in_response_cache`, `_second_call_sends_
+  if_none_match_and_consumes_304`, `_caches_404_absence` / `_negative_
+  result` where applicable).
+
+**Files changed (summary):**
+
+- `crates/kino-metadata/src/tmdb.rs` (+credits ETag variant + tests)
+- `crates/kino-metadata/src/trakt.rs` (+title_rating ETag variant +
+  tests)
+- `crates/kino-metadata/src/tvdb.rs` (+artwork ETag variant + tests)
+- `crates/kino-metadata/src/artwork.rs` (+Serialize/Deserialize on
+  `LocalizedAsset` + `ProviderBundle`)
+- `crates/kino-metadata/src/lib.rs` (+re-exports for the new
+  `Tmdb{Credits,CreditsFetch}` / `Trakt{TitleRating,
+  TitleRatingFetch}` / `TvdbArtworkFetch` types)
+- `src-tauri/src/commands.rs` (+3 per-resource ETag helpers; flipped
+  call sites in `get_title_detail_uncached` and `build_bundles`;
+  imports updated; tests added at the bottom of the test module
+  mirroring the Session-031 layout)
+
+**Features advanced:**
+
+- F-003: `[ ]` → `[x]`. PRD §F-003 "ETag handled where the provider
+  supports it; stored in `response_cache.etag`" is now satisfied at
+  every per-resource site in `get_title_detail_uncached` and
+  `build_bundles` where the provider supports it. Fanart.tv stays
+  on back-compat `fetch_with_retry` (the Session-031 audit ratified
+  this as "where the provider supports it" — Fanart is the explicit
+  carve-out). The §6A "F-003 / ETag handling" entry is flipped to
+  RESOLVED.
+
+**New ADRs filed:** ADR-128 / 129 / 130 (see Architectural Decisions
+Log below).
+
+**Known issues introduced or resolved:**
+
+- Resolved: F-003 §6A regression.
+- Introduced: none.
+
+**Next session needs to know:**
+
+- §6A is still not claimable. Three regressions remain:
+  - **F-015 Android DV decoder selector** (~60 LOC, no upstream
+    blocker — the highest-leverage Session-033 scope; closes one of
+    two F-015 ADR-118 sub-regressions without coordination).
+  - **F-013 max-connections cap** + **F-014 piece-priority window
+    assignment** (librqbit-blocked — Session 033 should pick (a)
+    draft an upstream PR exposing the option, (b) file a PRD
+    revision under "PRD Issues" relaxing the 200-cap invariant to
+    "best-effort, subject to engine capabilities", or both; the
+    agent can't merge an upstream PR alone so (b) is the fastest
+    §6A clearance).
+  - **F-015 Linux libmpv in-window GL surface** (multi-session
+    ADR-108 deviation; start with a "enumerate webview surface
+    access on Linux" scout session).
+- The Session-031 plan suggested cache key `tvdb:title:{tvdb_id}:
+  {kind}:{language}`; the actual key shipped is
+  `tvdb:title:{tvdb_id}:{kind}` (no language). Reason: TVDB's
+  `/extended?meta=translations` returns every translation in one
+  envelope, so the HTTP target's identity does not include
+  language. The plan was off; documenting here so a future audit
+  doesn't flag the deviation as a regression. See ADR-130.
+
+---
 
 ### Session 031 — F-003 ETag handling infrastructure + TMDB title_details demonstration
 
@@ -7213,25 +7392,37 @@ implementation" split.
   migrations + install_id bootstrap, KV/CW/addons API + Tauri commands, 16 tests)_
 
 ### Metadata & Catalogs
-- [ ] F-003: Metadata clients (TMDB / Trakt / TVDB / Fanart.tv) _(Session 004:
+- [x] F-003: Metadata clients (TMDB / Trakt / TVDB / Fanart.tv) _(Session 004:
   per-provider HTTP clients with locked retry/User-Agent, `test_credentials()`
   on each, 4 Tauri test commands, 12 wiremock tests. **Re-opened by Session
   027 audit:** PRD §F-003 "ETag handled where the provider supports it;
-  stored in `response_cache.etag`" was unimplemented — `db.rs` wrote
-  `etag = NULL` on UPSERT, no client sent `If-None-Match`, no `304 Not
-  Modified` path. **Partially closed by Session 031:** workspace-wide
-  infrastructure shipped (`cache_set(.., etag, expires_at)` +
-  `cache_get_with_etag` + `cache_refresh_expiry` in `kino_core::Db`;
-  `fetch_with_etag` + `FetchOutcome` in `kino_core::http`;
-  `title_details_with_etag` + `TmdbTitleDetailsFetch` on `TmdbClient`;
-  per-resource `fetch_tmdb_title_details_etag_cached` wiring TMDB
-  title-details through `response_cache.etag` at TTL `META_TTL_S = 24h`).
-  22 new tests. F-003 stays `[ ]` because the PRD wording ("ETag
-  handled where the provider supports it") implies coverage of every
-  per-resource caller — TMDB credits, Trakt title_rating, and TVDB
-  title still call the back-compat `fetch_with_retry`. See "§6A
-  Code-Acceptance Regressions / F-003" for the closure plan for the
-  remaining three sites.)_
+  stored in `response_cache.etag`" was unimplemented. **Partially closed
+  by Session 031:** workspace-wide infrastructure shipped (`cache_set(..,
+  etag, expires_at)` + `cache_get_with_etag` + `cache_refresh_expiry` in
+  `kino_core::Db`; `fetch_with_etag` + `FetchOutcome` in
+  `kino_core::http`; `title_details_with_etag` + `TmdbTitleDetailsFetch`
+  on `TmdbClient`; per-resource `fetch_tmdb_title_details_etag_cached`
+  wiring TMDB title-details through `response_cache.etag` at TTL
+  `META_TTL_S = 24h`). 22 new tests. **Closed by Session 032:** the
+  remaining three per-resource ETag-supporting sites identified by the
+  Session-031 plan now round-trip ETag end-to-end through
+  `response_cache` — TMDB credits via `credits_with_etag` +
+  `fetch_tmdb_credits_etag_cached` (key `tmdb:credits:{tmdb_id}:
+  {kind}`, `META_TTL_S`); Trakt title_rating via
+  `title_rating_with_etag` + `fetch_trakt_rating_etag_cached` (key
+  `trakt:title_rating:{imdb_id}:{kind}`, `META_TTL_S`); TVDB extended
+  artwork via `artwork_with_etag` + `fetch_tvdb_artwork_etag_cached`
+  (key `tvdb:title:{tvdb_id}:{kind}`, `ARTWORK_TTL_S = 7d`).
+  `TmdbCastMember` / `TmdbCredits` / `TraktTitleRating` /
+  `LocalizedAsset` / `ProviderBundle` now derive Serialize/Deserialize
+  for cache persistence; original `credits()` / `title_rating()` /
+  `artwork()` methods delegate to the `*_with_etag` variants so
+  existing callers stay source-compatible; Trakt 404 and TVDB 404 map
+  to `Fresh { rating: None / bundle: None, etag: None }` so negative
+  results cache identically. Fanart.tv stays on back-compat
+  `fetch_with_retry` per the audit's "where the provider supports
+  it" carve-out. 18 new tests. The §6A "F-003 / ETag handling" entry
+  is flipped to RESOLVED.)_
 - [x] F-004: Trending aggregation with diversity _(Session 006: per-provider
   trending fetchers, the locked merge/split/alternate/seeded-shuffle
   aggregator, `get_trending` Tauri command, day-long output cache via
@@ -7575,6 +7766,9 @@ Additional ADRs filed by sessions:
 | ADR-125 | **`Db::cache_set` signature breaks (adds `etag: Option<&str>`) rather than introducing a parallel `cache_set_with_etag`.** PRD §F-003 says ETag is handled "where the provider supports it" — implying every cache row OUGHT to be ETag-aware; the column is part of the schema, not an extension. A parallel method would mean every future caller has to remember which one is the "correct" one to use, and the dead-NULL-etag failure mode that triggered the §6A re-open in the first place would be one accidental call site away from regressing. Breaking the signature forces every caller to make an explicit `etag` decision at call time, even if that decision is `None`. The migration cost was bounded (six call sites in `commands.rs` + four in the existing `db.rs` unit tests, all aggregated caches where `None` is correct), so the one-time pain bought a durable invariant. `cache_get` stays source-compatible (now a thin wrapper around `cache_get_with_etag` that strips the etag tuple element) because all eight of its call sites don't yet need the etag — they're in flows that don't round-trip revalidation. The Session-032 expansion will migrate them one at a time. | 031 |
 | ADR-126 | **Aggregated cache rows (F-004 trending, F-005 artwork, F-008 search, F-008 weekly trending, F-008 addon catalogs, F-010 aggregated title detail) pass `etag = None` to `cache_set`.** PRD §F-003 ETag round-trip is meaningful only when a cache row maps 1:1 with a single HTTP response — a 304 from a server applies to a SPECIFIC URL, and an aggregated row is the merged output of N upstream calls. The right place for ETag round-trip with aggregates is INSIDE the aggregation, at the per-resource layer (Session 031's TMDB title-details is the demonstration). The outer aggregate's `expires_at` is governed by the TTL (`META_TTL_S = 24h`, `ARTWORK_TTL_S = 7d`, etc.) and not by upstream change detection — that's already the case today, so this ADR just documents the gap rather than introducing it. The six existing call sites in `commands.rs` migrated to `, None,` without behavior change. | 031 |
 | ADR-127 | **Per-resource TMDB title-details cache key includes the language: `tmdb:title_details:{tmdb_id}:{kind}:{language}`.** TMDB's `/3/{movie,tv}/{id}?language=<lang>` returns localized `overview`, `genres`, `age_rating` — three of the six fields the F-010 title detail UI displays. The ETag the server returns is therefore per-language too: a `304 Not Modified` against an English-language `If-None-Match` confirms the English payload, not the French one. The key shape mirrors the OUTER aggregated cache key (`meta:{title_id}:{kind}:{chain_hash}` — which DOES hash the whole lang_pref chain rather than just `primary_lang`) but flattens to a single language because the per-resource TMDB call is itself per-language. A future enhancement could vary the resolver to walk the full lang_pref chain and cache each language separately under its own ETag; v1 ships the simpler "first language wins" pattern matching what `get_title_detail_uncached` already does at the aggregate layer (`primary_lang = lang_pref.first()`). | 031 |
+| ADR-128 | **TMDB credits cache key OMITS language: `tmdb:credits:{tmdb_id}:{kind}`.** The Session-031 `title_details` cache row IS language-keyed (ADR-127) because the TMDB `/3/{movie,tv}/{id}?language=...` call accepts a `language` parameter that localizes `overview` / `genres` / `age_rating`. The TMDB `/3/{movie,tv}/{id}/credits` call by contrast does NOT accept (and the kino client does NOT pass) a `language` parameter — `name` and `character` come back in their canonical form (TMDB's default English with some localized exceptions out of our control). Threading a `:language` suffix into the credits cache key would create cache-key fragmentation (one row per UI language) for a payload that's actually identical across them, multiplying writes and read-misses for no behavioral benefit. The `TmdbCredits` wrapper struct + `Serialize` / `Deserialize` derived on `TmdbCastMember` is the second instance of the "wrap-the-payload" pattern from `TmdbTitleDetails` (Session 031); the wrapper keeps the JSON payload self-describing on cache reads. | 032 |
+| ADR-129 | **404 from Trakt `/{movies\|shows}/{imdb}/ratings` is mapped to `Fresh { rating: TraktTitleRating { rating: None, .. }, etag: None }` — symmetric handling of "no rating" and "no title".** Trakt returns 404 for IMDb ids it doesn't recognize (different from a 200 with `rating: 0`, which it returns for ids it knows but has no votes for). The pre-Session-032 back-compat `title_rating` method already collapsed both into `Option<f64>::None`. The ETag-aware variant preserves that collapse INSIDE the `Fresh` arm so the negative result caches identically to a positive `None`: the cache row carries `payload = "{\"imdb_id\":..., \"rating\":null}"` and `etag = NULL`, and the next read deserializes back to `Option<f64>::None` without re-hitting the network until the `META_TTL_S` TTL elapses. Rejected alternative: return a separate `TraktTitleRatingFetch::NotFound` variant — clean type-theoretically but would require every caller in `get_title_detail_uncached` to branch on it (currently they all collapse to `None` anyway). The cost of the symmetric mapping is one cache row per unknown IMDb id for 24h, which is bounded by user navigation — acceptable. The same pattern is reused for TVDB extended (ADR-130). | 032 |
+| ADR-130 | **TVDB extended-artwork cache key OMITS language: `tvdb:title:{tvdb_id}:{kind}`.** The Session-031 STATE.md plan suggested `tvdb:title:{tvdb_id}:{kind}:{language}` but the actual HTTP target is `/v4/{movies\|series}/{id}/extended?meta=translations` — a single call that returns EVERY translation in one envelope. The cache row's identity is therefore `(tvdb_id, kind)`, not `(tvdb_id, kind, language)`; a `:language` suffix would fragment the cache by N copies of the same payload (one per UI language) for no behavioral benefit. The persisted payload is `Option<ProviderBundle>` so the 404 negative result (mapped per ADR-129's pattern: `Fresh { bundle: None, etag: None }`) round-trips through serde as the literal JSON token `null`, distinct from a populated bundle. `ProviderBundle` + `LocalizedAsset` derive Serialize/Deserialize (ADR-130 corollary); the `HashMap<String, String>` summaries field round-trips through serde's default map encoding. Because the underlying `/extended` call is also used by the F-005 artwork resolver at the OUTER `resolve_artwork` cache row (which has a 7-day TTL), the inner per-resource row's TTL is matched at `ARTWORK_TTL_S = 7d` so the two tiers expire on the same cadence (vs the META_TTL_S = 24h used by TMDB title_details / credits which feed the F-010 detail aggregate, which itself ships at META_TTL_S). | 032 |
 
 ---
 
@@ -7879,7 +8073,7 @@ highest-priority scope (alongside any open §6B Regressions); the
 closure of every entry below is required before `PRD COMPLETE` can
 be declared per the harness AGENT_PROMPT Step 15._
 
-### F-003 / ETag handling — partially closed in Session 031
+### ~~F-003 / ETag handling~~ — RESOLVED in Session 032 (infra Session 031, expansion Session 032)
 
 **PRD §F-003 (locked):** "ETag handled where the provider supports
 it; stored in `response_cache.etag`".
@@ -7893,14 +8087,12 @@ unconditionally on every cache UPSERT, and no `kino-metadata`
 client sent an `If-None-Match` header or handled a `304 Not
 Modified` response. The schema column was dead.
 
-**Resolution-in-progress (Session 031):** the workspace-wide
-infrastructure has shipped, and one per-resource site — TMDB title-
-details — round-trips ETag end-to-end through `response_cache`. The
-remaining work is replicating the same pattern at the other ETag-
-supporting per-resource sites; the infra is in place and every new
-site is a ~30 LOC opt-in.
+**Resolution (Session 031 + Session 032):** PRD §F-003 ETag
+round-trip is now shipped at every per-resource ETag-supporting
+site in `get_title_detail_uncached` (the title-detail builder) and
+`build_bundles` (the F-005 artwork cascade dispatcher).
 
-**Shipped:**
+**Workspace infra (Session 031):**
 - `kino_core::Db::cache_set` signature `(.., etag: Option<&str>,
   expires_at)` — UPSERT now binds the etag column.
 - `kino_core::Db::cache_get_with_etag(key) -> Option<(String,
@@ -7914,41 +8106,35 @@ site is a ~30 LOC opt-in.
 - `kino_core::http::fetch_with_retry` is now a back-compat wrapper
   (calls `fetch_with_etag(.., None, ..)`); every pre-existing caller
   stays source-compatible.
-- `TmdbClient::title_details_with_etag` + `TmdbTitleDetailsFetch`
-  enum; `TmdbTitleDetails` derives Serialize/Deserialize.
-- `src-tauri::commands::fetch_tmdb_title_details_etag_cached` wires
-  the TMDB title-details call inside `get_title_detail_uncached`
-  through `response_cache.etag` at cache key
-  `tmdb:title_details:{tmdb_id}:{kind}:{language}` with
-  `META_TTL_S = 24h`.
 
-**Remaining (Session 032 scope):** replicate the Session-031 pattern
-at the other PRD §F-003 ETag-supporting sites:
+**Per-resource sites (Session 031 + Session 032):**
 
-1. **TMDB credits** (`TmdbClient::credits` — used by
-   `get_title_detail_uncached` right after `title_details`). Cache
-   key: `tmdb:credits:{tmdb_id}:{kind}`. TTL: `META_TTL_S`.
-   Estimated ~40 LOC.
-2. **Trakt title rating** (`TraktClient::title_rating` — used in the
-   same function). Cache key:
-   `trakt:title_rating:{imdb_id}:{kind}`. TTL: `META_TTL_S`.
-   Estimated ~40 LOC.
-3. **TVDB extended title** (`TvdbClient` — used by F-005 artwork
-   cascade; the aggregated artwork cache at the outer
-   `resolve_artwork` layer doesn't have a per-resource cache row
-   yet). Cache key: `tvdb:title:{tvdb_id}:{kind}:{language}`.
-   Slightly larger because the existing `TvdbClient` API may not
-   yet have an ergonomic seam for ETag like
-   `title_details_with_etag` did; budget ~70 LOC.
+| Site | Provider seam | Helper | Cache key | TTL |
+|---|---|---|---|---|
+| TMDB title details | `title_details_with_etag` + `TmdbTitleDetailsFetch` | `fetch_tmdb_title_details_etag_cached` | `tmdb:title_details:{tmdb_id}:{kind}:{language}` | `META_TTL_S = 24h` |
+| TMDB credits | `credits_with_etag` + `TmdbCreditsFetch` | `fetch_tmdb_credits_etag_cached` | `tmdb:credits:{tmdb_id}:{kind}` | `META_TTL_S` |
+| Trakt title rating | `title_rating_with_etag` + `TraktTitleRatingFetch` | `fetch_trakt_rating_etag_cached` | `trakt:title_rating:{imdb_id}:{kind}` | `META_TTL_S` |
+| TVDB extended artwork | `artwork_with_etag` + `TvdbArtworkFetch` | `fetch_tvdb_artwork_etag_cached` | `tvdb:title:{tvdb_id}:{kind}` | `ARTWORK_TTL_S = 7d` |
+
+The original `credits` / `title_rating` / `artwork` methods on each
+provider client now delegate to their `*_with_etag` variants and
+unwrap the `Fresh` arm; existing callers stay source-compatible.
+404s (Trakt unknown title; TVDB unknown id) map to `Fresh { rating:
+None / bundle: None, etag: None }` so negative results cache
+identically to positive `None` results (ADR-129 / ADR-130).
 
 Fanart.tv is intentionally not in scope: the provider is
-inconsistent about sending `ETag` (the audit's note), and the
-infra's tolerance of absent ETag (`fetch_with_etag` returns `etag:
-None` on missing header → cache row stores NULL → next read sends
-no `If-None-Match` → server returns fresh 200 normally) covers the
+inconsistent about sending `ETag`, and the infra's tolerance of
+absent ETag (`fetch_with_etag` returns `etag: None` on missing
+header → cache row stores NULL → next read sends no
+`If-None-Match` → server returns fresh 200 normally) covers the
 "where the provider supports it" qualifier in PRD §F-003.
 
-Owner: Session 032 — recommended scope.
+**Tests:** Session 031 added 22 (7 `kino-core::http`, 6
+`kino-core::db`, 5 `kino-metadata::tmdb`, 4 `kino-app::commands`).
+Session 032 added 18 (3 TMDB credits + 4 Trakt rating + 3 TVDB
+artwork in `kino-metadata`, plus 2 + 3 + 3 = 8 per-resource helper
+tests in `kino-app::commands`). 40 total, all green.
 
 ### ~~F-006 / Frontend availability filter UI~~ — RESOLVED in Session 030
 

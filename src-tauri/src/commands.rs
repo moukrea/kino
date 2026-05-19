@@ -25,12 +25,14 @@ use kino_core::http::HttpConfig;
 use kino_core::stream::{Audio, Codec, Hdr, ParsedTags, Quality};
 use kino_core::title::{Artwork, TitleKind, TitleSummary};
 use kino_core::Db;
+use kino_metadata::artwork::ProviderBundle;
 use kino_metadata::artwork::{cascade, lang_chain_hash, CachedArtwork, ProviderBundles};
 use kino_metadata::tmdb::TitleIds;
 use kino_metadata::{
-    aggregate, FanartClient, ProviderItem, TmdbCastMember, TmdbClient, TmdbTitleDetails,
-    TmdbTitleDetailsFetch, TraktClient, TvdbClient, FANART_API_KEY, TMDB_API_KEY, TRAKT_API_KEY,
-    TVDB_API_KEY,
+    aggregate, FanartClient, ProviderItem, TmdbCastMember, TmdbClient, TmdbCredits,
+    TmdbCreditsFetch, TmdbTitleDetails, TmdbTitleDetailsFetch, TraktClient, TraktTitleRating,
+    TraktTitleRatingFetch, TvdbArtworkFetch, TvdbClient, FANART_API_KEY, TMDB_API_KEY,
+    TRAKT_API_KEY, TVDB_API_KEY,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -955,6 +957,7 @@ pub async fn resolve_artwork(
     let ids = resolve_title_ids(&title_id, kind, tmdb_client.as_ref()).await?;
 
     let bundles = build_bundles(
+        &db,
         kind,
         &lang_pref,
         &ids,
@@ -1061,8 +1064,15 @@ async fn resolve_title_ids(
 /// [`ProviderBundles`] for the cascade. A `None` bundle means the provider
 /// produced nothing usable (no key, no resolvable id, or a transport failure
 /// we logged and elided).
+///
+/// `db` is threaded through so the TVDB fetch can use the PRD §F-003
+/// per-resource `ETag` cache (Session 032). TMDB and Fanart paths don't
+/// have per-resource cache rows yet (the outer `resolve_artwork`
+/// `meta:{...}` aggregate row covers them); both still go straight to the
+/// network through the back-compat methods.
 #[allow(clippy::similar_names)] // PRD-locked provider names (tmdb / tvdb).
 async fn build_bundles(
+    db: &Db,
     kind: TitleKind,
     lang_pref: &[String],
     ids: &TitleIds,
@@ -1113,7 +1123,7 @@ async fn build_bundles(
     let tvdb_fut = async move {
         let client = tvdb?;
         let tvdb_id = ids.tvdb_id?;
-        match client.artwork(tvdb_id, kind).await {
+        match fetch_tvdb_artwork_etag_cached(db, client, tvdb_id, kind).await {
             Ok(Some(b)) => Some(b),
             Ok(None) => None,
             Err(e) => {
@@ -1951,7 +1961,7 @@ async fn get_title_detail_uncached(
             Ok(details) => apply_tmdb_details(&mut payload, &details),
             Err(e) => tracing::warn!(error = %e, "tmdb title_details failed"),
         }
-        match client.credits(tmdb_id, kind).await {
+        match fetch_tmdb_credits_etag_cached(db, client, tmdb_id, kind).await {
             Ok(cast) => apply_tmdb_cast(&mut payload, cast),
             Err(e) => tracing::warn!(error = %e, "tmdb credits failed"),
         }
@@ -1959,7 +1969,7 @@ async fn get_title_detail_uncached(
 
     // (3) Trakt overlay.
     if let (Some(client), Some(imdb)) = (trakt_client.as_ref(), stremio_id.as_deref()) {
-        match client.title_rating(imdb, kind).await {
+        match fetch_trakt_rating_etag_cached(db, client, imdb, kind).await {
             Ok(r) => payload.trakt_rating = r,
             Err(e) => tracing::warn!(error = %e, "trakt title_rating failed"),
         }
@@ -2057,6 +2067,202 @@ async fn fetch_tmdb_title_details_etag_cached(
                 }
             }
             Ok(details)
+        }
+    }
+}
+
+/// Fetch TMDB credits with PRD §F-003 `ETag` round-trip via
+/// `response_cache` (Session 032 expansion of the Session-031 pattern).
+///
+/// Per-resource cache key: `tmdb:credits:{tmdb_id}:{kind}`. No language
+/// suffix — TMDB's `/credits` endpoint does not accept (and we do not
+/// pass) a `language` parameter; the returned `character` strings are
+/// the canonical English ones, identical across UI locales.
+async fn fetch_tmdb_credits_etag_cached(
+    db: &Db,
+    client: &TmdbClient,
+    tmdb_id: u64,
+    kind: TitleKind,
+) -> Result<Vec<TmdbCastMember>, String> {
+    let cache_key = format!("tmdb:credits:{tmdb_id}:{kind}", kind = kind.as_str());
+
+    let cached = match db.cache_get_with_etag(&cache_key).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "tmdb credits cache_get_with_etag failed");
+            None
+        }
+    };
+    let prior_etag = cached.as_ref().and_then(|(_, etag)| etag.clone());
+    let prior_payload = cached.as_ref().map(|(payload, _)| payload.clone());
+
+    let expires_at = now_unix()
+        .saturating_add(i64::try_from(kino_core::constants::META_TTL_S).unwrap_or(i64::MAX));
+
+    let fetch = client
+        .credits_with_etag(tmdb_id, kind, prior_etag.as_deref())
+        .await
+        .map_err(ipc)?;
+
+    match fetch {
+        TmdbCreditsFetch::NotModified => {
+            if let Err(e) = db.cache_refresh_expiry(&cache_key, expires_at).await {
+                tracing::warn!(error = %e, "tmdb credits cache_refresh_expiry failed");
+            }
+            let payload = prior_payload.ok_or_else(|| {
+                "tmdb credits: server returned 304 with no prior cache row".to_string()
+            })?;
+            let credits: TmdbCredits = serde_json::from_str(&payload).map_err(|e| e.to_string())?;
+            Ok(credits.cast)
+        }
+        TmdbCreditsFetch::Fresh { credits, etag } => {
+            match serde_json::to_string(&credits) {
+                Ok(serialized) => {
+                    if let Err(e) = db
+                        .cache_set(&cache_key, &serialized, etag.as_deref(), expires_at)
+                        .await
+                    {
+                        tracing::warn!(error = %e, "tmdb credits cache_set failed");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "tmdb credits serialize failed");
+                }
+            }
+            Ok(credits.cast)
+        }
+    }
+}
+
+/// Fetch Trakt title-rating with PRD §F-003 `ETag` round-trip via
+/// `response_cache` (Session 032).
+///
+/// Per-resource cache key: `trakt:title_rating:{imdb_id}:{kind}`. The
+/// `Option<f64>` rating is wrapped in [`TraktTitleRating`] so the cached
+/// JSON payload is self-describing — a missing rating (Trakt 404 or
+/// zero-votes) caches as `rating: null` and the next read short-circuits
+/// without re-hitting the network until the TTL elapses.
+async fn fetch_trakt_rating_etag_cached(
+    db: &Db,
+    client: &TraktClient,
+    imdb_id: &str,
+    kind: TitleKind,
+) -> Result<Option<f64>, String> {
+    let cache_key = format!("trakt:title_rating:{imdb_id}:{kind}", kind = kind.as_str(),);
+
+    let cached = match db.cache_get_with_etag(&cache_key).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "trakt title_rating cache_get_with_etag failed");
+            None
+        }
+    };
+    let prior_etag = cached.as_ref().and_then(|(_, etag)| etag.clone());
+    let prior_payload = cached.as_ref().map(|(payload, _)| payload.clone());
+
+    let expires_at = now_unix()
+        .saturating_add(i64::try_from(kino_core::constants::META_TTL_S).unwrap_or(i64::MAX));
+
+    let fetch = client
+        .title_rating_with_etag(imdb_id, kind, prior_etag.as_deref())
+        .await
+        .map_err(ipc)?;
+
+    match fetch {
+        TraktTitleRatingFetch::NotModified => {
+            if let Err(e) = db.cache_refresh_expiry(&cache_key, expires_at).await {
+                tracing::warn!(error = %e, "trakt title_rating cache_refresh_expiry failed");
+            }
+            let payload = prior_payload.ok_or_else(|| {
+                "trakt title_rating: server returned 304 with no prior cache row".to_string()
+            })?;
+            let rating: TraktTitleRating =
+                serde_json::from_str(&payload).map_err(|e| e.to_string())?;
+            Ok(rating.rating)
+        }
+        TraktTitleRatingFetch::Fresh { rating, etag } => {
+            match serde_json::to_string(&rating) {
+                Ok(serialized) => {
+                    if let Err(e) = db
+                        .cache_set(&cache_key, &serialized, etag.as_deref(), expires_at)
+                        .await
+                    {
+                        tracing::warn!(error = %e, "trakt title_rating cache_set failed");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "trakt title_rating serialize failed");
+                }
+            }
+            Ok(rating.rating)
+        }
+    }
+}
+
+/// Fetch TVDB extended title artwork with PRD §F-003 `ETag` round-trip
+/// via `response_cache` (Session 032 — third per-resource site).
+///
+/// Per-resource cache key: `tvdb:title:{tvdb_id}:{kind}`. No language
+/// suffix — the underlying `/v4/{movies|series}/{id}/extended?meta=
+/// translations` call returns every translation in a single envelope, so
+/// the HTTP target is `(tvdb_id, kind)`-keyed and the `ETag`'s scope must
+/// match. TTL: `ARTWORK_TTL_S = 7d` (matches the outer `resolve_artwork`
+/// cache row's TTL so the two tiers expire on the same cadence).
+async fn fetch_tvdb_artwork_etag_cached(
+    db: &Db,
+    client: &TvdbClient,
+    tvdb_id: u64,
+    kind: TitleKind,
+) -> Result<Option<ProviderBundle>, String> {
+    let cache_key = format!("tvdb:title:{tvdb_id}:{kind}", kind = kind.as_str());
+
+    let cached = match db.cache_get_with_etag(&cache_key).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "tvdb artwork cache_get_with_etag failed");
+            None
+        }
+    };
+    let prior_etag = cached.as_ref().and_then(|(_, etag)| etag.clone());
+    let prior_payload = cached.as_ref().map(|(payload, _)| payload.clone());
+
+    let expires_at = now_unix().saturating_add(i64::try_from(ARTWORK_TTL_S).unwrap_or(i64::MAX));
+
+    let fetch = client
+        .artwork_with_etag(tvdb_id, kind, prior_etag.as_deref())
+        .await
+        .map_err(ipc)?;
+
+    match fetch {
+        TvdbArtworkFetch::NotModified => {
+            if let Err(e) = db.cache_refresh_expiry(&cache_key, expires_at).await {
+                tracing::warn!(error = %e, "tvdb artwork cache_refresh_expiry failed");
+            }
+            let payload = prior_payload.ok_or_else(|| {
+                "tvdb artwork: server returned 304 with no prior cache row".to_string()
+            })?;
+            // The persisted payload is `Option<ProviderBundle>` so the
+            // 404-cached negative result round-trips identically to a
+            // populated one.
+            let bundle: Option<ProviderBundle> =
+                serde_json::from_str(&payload).map_err(|e| e.to_string())?;
+            Ok(bundle)
+        }
+        TvdbArtworkFetch::Fresh { bundle, etag } => {
+            match serde_json::to_string(&bundle) {
+                Ok(serialized) => {
+                    if let Err(e) = db
+                        .cache_set(&cache_key, &serialized, etag.as_deref(), expires_at)
+                        .await
+                    {
+                        tracing::warn!(error = %e, "tvdb artwork cache_set failed");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "tvdb artwork serialize failed");
+                }
+            }
+            Ok(bundle)
         }
     }
 }
@@ -7133,5 +7339,365 @@ mod tests {
             .unwrap()
             .expect("cache row written");
         assert!(row.1.is_none());
+    }
+
+    // ---- F-003: TMDB credits ETag round-trip (Session 032) -----------
+    //
+    // Session 032 expands the Session-031 pattern to three more
+    // PRD §F-003 ETag-supporting per-resource sites. The first is
+    // TMDB `/credits`, exercised here end-to-end through
+    // `fetch_tmdb_credits_etag_cached`.
+
+    fn tmdb_credits_body() -> serde_json::Value {
+        serde_json::json!({
+            "cast": [
+                { "name": "Keanu Reeves", "character": "Neo" },
+                { "name": "Laurence Fishburne", "character": "Morpheus" }
+            ]
+        })
+    }
+
+    #[tokio::test]
+    async fn fetch_tmdb_credits_etag_first_call_persists_etag_in_response_cache() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/3/movie/603/credits"))
+            .and(wm_query_param("api_key", "test-key"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ETag", "\"cast-v1\"")
+                    .set_body_json(tmdb_credits_body()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let db = Db::open_in_memory().await.unwrap();
+        let client =
+            TmdbClient::with_options("test-key", HttpConfig::for_test(), server.uri()).unwrap();
+        let cast = fetch_tmdb_credits_etag_cached(&db, &client, 603, TitleKind::Movie)
+            .await
+            .unwrap();
+        assert_eq!(cast.len(), 2);
+        assert_eq!(cast[0].name, "Keanu Reeves");
+
+        let row = db
+            .cache_get_with_etag("tmdb:credits:603:movie")
+            .await
+            .unwrap()
+            .expect("cache row written");
+        assert_eq!(row.1.as_deref(), Some("\"cast-v1\""));
+    }
+
+    #[tokio::test]
+    async fn fetch_tmdb_credits_etag_second_call_sends_if_none_match_and_consumes_304() {
+        let server = MockServer::start().await;
+        // First request: no If-None-Match, returns 200 + ETag.
+        Mock::given(method("GET"))
+            .and(path("/3/movie/603/credits"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ETag", "\"cast-v1\"")
+                    .set_body_json(tmdb_credits_body()),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        // Second request: must echo If-None-Match, server returns 304.
+        Mock::given(method("GET"))
+            .and(path("/3/movie/603/credits"))
+            .and(wm_header("if-none-match", "\"cast-v1\""))
+            .respond_with(ResponseTemplate::new(304))
+            .expect(1)
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let db = Db::open_in_memory().await.unwrap();
+        let client =
+            TmdbClient::with_options("test-key", HttpConfig::for_test(), server.uri()).unwrap();
+        let first = fetch_tmdb_credits_etag_cached(&db, &client, 603, TitleKind::Movie)
+            .await
+            .unwrap();
+        let second = fetch_tmdb_credits_etag_cached(&db, &client, 603, TitleKind::Movie)
+            .await
+            .unwrap();
+        // 304 path re-uses the cached parse byte-for-byte.
+        assert_eq!(first.len(), second.len());
+        assert_eq!(second[0].name, "Keanu Reeves");
+    }
+
+    // ---- F-003: Trakt title_rating ETag round-trip (Session 032) -----
+
+    #[tokio::test]
+    async fn fetch_trakt_rating_etag_first_call_persists_etag_in_response_cache() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/movies/tt0133093/ratings"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ETag", "\"matrix-rating-v1\"")
+                    .set_body_json(serde_json::json!({ "rating": 8.34, "votes": 123 })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let db = Db::open_in_memory().await.unwrap();
+        let client = kino_metadata::TraktClient::with_options(
+            "test-key",
+            HttpConfig::for_test(),
+            server.uri(),
+        )
+        .unwrap();
+        let rating = fetch_trakt_rating_etag_cached(&db, &client, "tt0133093", TitleKind::Movie)
+            .await
+            .unwrap();
+        assert_eq!(rating, Some(8.34));
+
+        let row = db
+            .cache_get_with_etag("trakt:title_rating:tt0133093:movie")
+            .await
+            .unwrap()
+            .expect("cache row written");
+        assert_eq!(row.1.as_deref(), Some("\"matrix-rating-v1\""));
+    }
+
+    #[tokio::test]
+    async fn fetch_trakt_rating_etag_second_call_sends_if_none_match_and_consumes_304() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/movies/tt0133093/ratings"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ETag", "\"matrix-rating-v1\"")
+                    .set_body_json(serde_json::json!({ "rating": 8.34, "votes": 123 })),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/movies/tt0133093/ratings"))
+            .and(wm_header("if-none-match", "\"matrix-rating-v1\""))
+            .respond_with(ResponseTemplate::new(304))
+            .expect(1)
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let db = Db::open_in_memory().await.unwrap();
+        let client = kino_metadata::TraktClient::with_options(
+            "test-key",
+            HttpConfig::for_test(),
+            server.uri(),
+        )
+        .unwrap();
+        let first = fetch_trakt_rating_etag_cached(&db, &client, "tt0133093", TitleKind::Movie)
+            .await
+            .unwrap();
+        let second = fetch_trakt_rating_etag_cached(&db, &client, "tt0133093", TitleKind::Movie)
+            .await
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(second, Some(8.34));
+    }
+
+    #[tokio::test]
+    async fn fetch_trakt_rating_etag_caches_404_absence_so_next_call_short_circuits_or_re_revalidates(
+    ) {
+        // Trakt 404 (unknown title) is mapped to Fresh { rating: None,
+        // etag: None }. The next call has no ETag to send so it re-hits
+        // the network — but the cache row is present (just with NULL etag
+        // and rating=null in the payload). The point of THIS test is that
+        // the negative result round-trips through the cache without
+        // exploding.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/movies/tt9999999/ratings"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let db = Db::open_in_memory().await.unwrap();
+        let client = kino_metadata::TraktClient::with_options(
+            "test-key",
+            HttpConfig::for_test(),
+            server.uri(),
+        )
+        .unwrap();
+        let rating = fetch_trakt_rating_etag_cached(&db, &client, "tt9999999", TitleKind::Movie)
+            .await
+            .unwrap();
+        assert!(rating.is_none());
+
+        // The negative result IS persisted (`rating: null` in the payload)
+        // so a future read with a fresh client surface short-circuits the
+        // network call entirely (handled at the outer `get_title_detail`
+        // 24h cache).
+        let row = db
+            .cache_get_with_etag("trakt:title_rating:tt9999999:movie")
+            .await
+            .unwrap()
+            .expect("cache row written even on 404");
+        assert!(row.1.is_none()); // no ETag on 404
+        assert!(
+            row.0.contains("\"rating\":null"),
+            "expected null rating in payload, got: {}",
+            row.0
+        );
+    }
+
+    // ---- F-003: TVDB artwork ETag round-trip (Session 032) -----------
+
+    #[tokio::test]
+    async fn fetch_tvdb_artwork_etag_first_call_persists_etag_in_response_cache() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v4/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status":"success","data":{"token":"tok"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v4/movies/5/extended"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ETag", "\"tvdb-5-v1\"")
+                    .set_body_json(serde_json::json!({
+                        "status":"success",
+                        "data": {
+                            "id": 5,
+                            "artworks": [
+                                {"id":1,"image":"https://tvdb/p.jpg","type":14,"language":"eng"}
+                            ],
+                            "translations": {"overviewTranslations": []}
+                        }
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let db = Db::open_in_memory().await.unwrap();
+        let client = kino_metadata::TvdbClient::with_options(
+            "test-key",
+            HttpConfig::for_test(),
+            server.uri(),
+        )
+        .unwrap();
+        let bundle = fetch_tvdb_artwork_etag_cached(&db, &client, 5, TitleKind::Movie)
+            .await
+            .unwrap()
+            .expect("bundle returned on 200");
+        assert_eq!(bundle.posters.len(), 1);
+
+        let row = db
+            .cache_get_with_etag("tvdb:title:5:movie")
+            .await
+            .unwrap()
+            .expect("cache row written");
+        assert_eq!(row.1.as_deref(), Some("\"tvdb-5-v1\""));
+    }
+
+    #[tokio::test]
+    async fn fetch_tvdb_artwork_etag_second_call_sends_if_none_match_and_consumes_304() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v4/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status":"success","data":{"token":"tok"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v4/series/42/extended"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ETag", "\"tvdb-42-v1\"")
+                    .set_body_json(serde_json::json!({
+                        "status":"success",
+                        "data": {
+                            "id": 42,
+                            "artworks": [
+                                {"id":1,"image":"https://tvdb/sp.jpg","type":2,"language":"eng"}
+                            ],
+                            "translations": {"overviewTranslations": []}
+                        }
+                    })),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v4/series/42/extended"))
+            .and(wm_header("if-none-match", "\"tvdb-42-v1\""))
+            .respond_with(ResponseTemplate::new(304))
+            .expect(1)
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let db = Db::open_in_memory().await.unwrap();
+        let client = kino_metadata::TvdbClient::with_options(
+            "test-key",
+            HttpConfig::for_test(),
+            server.uri(),
+        )
+        .unwrap();
+        let first = fetch_tvdb_artwork_etag_cached(&db, &client, 42, TitleKind::Series)
+            .await
+            .unwrap()
+            .expect("first call returns bundle");
+        let second = fetch_tvdb_artwork_etag_cached(&db, &client, 42, TitleKind::Series)
+            .await
+            .unwrap()
+            .expect("304 path re-uses cached bundle");
+        assert_eq!(first.posters.len(), second.posters.len());
+    }
+
+    #[tokio::test]
+    async fn fetch_tvdb_artwork_etag_caches_404_negative_result() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v4/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status":"success","data":{"token":"tok"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v4/movies/9999/extended"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let db = Db::open_in_memory().await.unwrap();
+        let client = kino_metadata::TvdbClient::with_options(
+            "test-key",
+            HttpConfig::for_test(),
+            server.uri(),
+        )
+        .unwrap();
+        let bundle = fetch_tvdb_artwork_etag_cached(&db, &client, 9999, TitleKind::Movie)
+            .await
+            .unwrap();
+        assert!(bundle.is_none());
+        let row = db
+            .cache_get_with_etag("tvdb:title:9999:movie")
+            .await
+            .unwrap()
+            .expect("cache row written even on 404");
+        assert!(row.1.is_none());
+        // The persisted payload is `Option<ProviderBundle>::None` so the
+        // 304 path round-trips identically — but `Option<T>::serialize`
+        // emits literal `null`, never `{}`.
+        assert_eq!(row.0, "null");
     }
 }

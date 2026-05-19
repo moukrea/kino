@@ -4,11 +4,11 @@
 //! key from `settings.trakt_api_key`) and `trakt-api-version: 2`. OAuth tokens
 //! are not needed for the read-only catalog calls F-004 uses.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
 use crate::trending::ProviderItem;
-use kino_core::http::{fetch_with_retry, HttpConfig};
+use kino_core::http::{fetch_with_etag, fetch_with_retry, FetchOutcome, HttpConfig};
 use kino_core::title::{TitleKind, TitleSummary};
 
 /// Production Trakt v2 base URL.
@@ -16,6 +16,40 @@ pub const TRAKT_BASE_URL: &str = "https://api.trakt.tv";
 
 /// Maximum trending items the F-004 aggregator asks for per provider.
 const TRENDING_LIMIT: usize = 100;
+
+/// Trakt user rating for a single title, wrapping the rating value so the
+/// payload is self-describing on cache reads (PRD §F-010, §F-003).
+///
+/// `rating = None` covers both the "Trakt has no votes" case (HTTP 200 with
+/// `rating: 0`) and the "Trakt doesn't know this title" case (HTTP 404).
+/// Both are cached identically so the next read short-circuits without a
+/// new HTTP attempt until the row's TTL elapses.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TraktTitleRating {
+    pub imdb_id: String,
+    pub kind: TitleKind,
+    /// 0-10 scale; `None` when Trakt has no rating to report.
+    pub rating: Option<f64>,
+}
+
+/// Result of [`TraktClient::title_rating_with_etag`] — either a fresh
+/// rating (with the server's `ETag` header, when present) or the cache-hit
+/// `304 Not Modified` signal that the caller's prior cached
+/// [`TraktTitleRating`] is still current. PRD §F-003 round-trip.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TraktTitleRatingFetch {
+    /// Server confirmed the caller's cached rating is still current. The
+    /// caller re-uses its existing [`TraktTitleRating`] and only refreshes
+    /// the cache row's `expires_at`.
+    NotModified,
+    /// Server returned a fresh body (or a `404` we map to
+    /// `rating: None`). `etag` is the parsed `ETag` header (or `None` if
+    /// the endpoint didn't send one).
+    Fresh {
+        rating: TraktTitleRating,
+        etag: Option<String>,
+    },
+}
 
 /// Trakt v2 application API client.
 #[derive(Debug, Clone)]
@@ -106,31 +140,79 @@ impl TraktClient {
     /// `None` when the title is unknown to Trakt or no ratings have been
     /// recorded.
     pub async fn title_rating(&self, imdb_id: &str, kind: TitleKind) -> Result<Option<f64>, Error> {
+        match self.title_rating_with_etag(imdb_id, kind, None).await? {
+            TraktTitleRatingFetch::Fresh { rating, .. } => Ok(rating.rating),
+            // Unreachable: `prior_etag = None` means the server cannot
+            // legally produce a 304. Treat as decode error in case a
+            // misbehaving mock yields one.
+            TraktTitleRatingFetch::NotModified => Err(Error::Decode(
+                "trakt title_rating: 304 returned without prior etag".to_string(),
+            )),
+        }
+    }
+
+    /// `ETag`-aware variant of [`title_rating`](Self::title_rating) for
+    /// cache revalidation (PRD §F-003). Pass the cache row's stored `ETag`
+    /// as `prior_etag`; on `304 Not Modified` the server confirms the
+    /// cached rating is still current and the caller re-uses it
+    /// (refreshing the row's `expires_at`). On a fresh `2xx`, the parsed
+    /// `ETag` header is returned alongside the new payload for
+    /// persistence. A `404` from Trakt (title unknown) is surfaced as
+    /// `Fresh { rating: None, etag: None }` so the absence is cached for
+    /// the TTL like any other negative result.
+    pub async fn title_rating_with_etag(
+        &self,
+        imdb_id: &str,
+        kind: TitleKind,
+        prior_etag: Option<&str>,
+    ) -> Result<TraktTitleRatingFetch, Error> {
         let segment = match kind {
             TitleKind::Movie => "movies",
             TitleKind::Series => "shows",
         };
         let url = format!("{}/{segment}/{imdb_id}/ratings", self.base_url);
-        let response = match fetch_with_retry(
+        let outcome = match fetch_with_etag(
             || {
                 self.client
                     .get(&url)
                     .header("trakt-api-version", "2")
                     .header("trakt-api-key", self.key.as_str())
             },
+            prior_etag,
             &self.config,
         )
         .await
         {
-            Ok(r) => r,
-            Err(kino_core::http::HttpError::Http { status: 404, .. }) => return Ok(None),
+            Ok(o) => o,
+            Err(kino_core::http::HttpError::Http { status: 404, .. }) => {
+                return Ok(TraktTitleRatingFetch::Fresh {
+                    rating: TraktTitleRating {
+                        imdb_id: imdb_id.to_string(),
+                        kind,
+                        rating: None,
+                    },
+                    etag: None,
+                });
+            }
             Err(e) => return Err(e.into()),
+        };
+        let (response, etag) = match outcome {
+            FetchOutcome::NotModified => return Ok(TraktTitleRatingFetch::NotModified),
+            FetchOutcome::Fresh { response, etag } => (response, etag),
         };
         let body: TraktRatings = response
             .json()
             .await
             .map_err(|e| Error::Decode(format!("trakt {segment} ratings: {e}")))?;
-        Ok(body.rating.filter(|n| *n > 0.0))
+        let rating = body.rating.filter(|n| *n > 0.0);
+        Ok(TraktTitleRatingFetch::Fresh {
+            rating: TraktTitleRating {
+                imdb_id: imdb_id.to_string(),
+                kind,
+                rating,
+            },
+            etag,
+        })
     }
 
     /// Search Trakt movies AND shows for the F-011 search aggregation.
@@ -477,6 +559,111 @@ mod tests {
             .await
             .unwrap();
         assert!(rating.is_none());
+    }
+
+    #[tokio::test]
+    async fn title_rating_with_etag_no_prior_returns_fresh_with_server_etag() {
+        // PRD §F-003 round-trip on `/ratings`: first fetch yields the
+        // rating value AND the server's ETag.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/movies/tt0133093/ratings"))
+            .and(header("trakt-api-version", "2"))
+            .and(header("trakt-api-key", "test-key"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ETag", "\"matrix-rating-v1\"")
+                    .set_body_json(json!({ "rating": 8.34, "votes": 123 })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TraktClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let fetch = client
+            .title_rating_with_etag("tt0133093", TitleKind::Movie, None)
+            .await
+            .unwrap();
+        match fetch {
+            TraktTitleRatingFetch::Fresh { rating, etag } => {
+                assert_eq!(etag.as_deref(), Some("\"matrix-rating-v1\""));
+                assert_eq!(rating.imdb_id, "tt0133093");
+                assert_eq!(rating.kind, TitleKind::Movie);
+                assert_eq!(rating.rating, Some(8.34));
+            }
+            TraktTitleRatingFetch::NotModified => panic!("expected Fresh on first fetch"),
+        }
+    }
+
+    #[tokio::test]
+    async fn title_rating_with_etag_prior_sends_if_none_match_and_304_yields_not_modified() {
+        // PRD §F-003 304 cache-hit path on `/ratings`.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/shows/tt0944947/ratings"))
+            .and(header("if-none-match", "\"got-rating-v2\""))
+            .respond_with(ResponseTemplate::new(304))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TraktClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let fetch = client
+            .title_rating_with_etag("tt0944947", TitleKind::Series, Some("\"got-rating-v2\""))
+            .await
+            .unwrap();
+        assert!(matches!(fetch, TraktTitleRatingFetch::NotModified));
+    }
+
+    #[tokio::test]
+    async fn title_rating_with_etag_404_yields_fresh_none_so_absence_is_cacheable() {
+        // Trakt returns 404 for titles it doesn't know. The ETag-aware
+        // variant maps that to a Fresh result with `rating = None` and
+        // `etag = None` so the caller can cache the absence for the TTL.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/movies/tt9999999/ratings"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TraktClient::with_options("test-key", HttpConfig::for_test(), server.uri()).unwrap();
+        let fetch = client
+            .title_rating_with_etag("tt9999999", TitleKind::Movie, None)
+            .await
+            .unwrap();
+        match fetch {
+            TraktTitleRatingFetch::Fresh { rating, etag } => {
+                assert!(rating.rating.is_none());
+                assert!(etag.is_none());
+            }
+            TraktTitleRatingFetch::NotModified => panic!("expected Fresh(None) on 404"),
+        }
+    }
+
+    #[tokio::test]
+    async fn title_rating_back_compat_unchanged_when_server_sends_etag() {
+        // Sanity: the back-compat `title_rating` wrapper still returns
+        // the bare `Option<f64>` even when the server sends an ETag.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/movies/tt0133093/ratings"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ETag", "\"matrix-rating-v1\"")
+                    .set_body_json(json!({ "rating": 8.34, "votes": 123 })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TraktClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let rating = client
+            .title_rating("tt0133093", TitleKind::Movie)
+            .await
+            .unwrap();
+        assert_eq!(rating, Some(8.34));
     }
 
     #[tokio::test]
