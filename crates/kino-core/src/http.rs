@@ -14,7 +14,7 @@
 
 use std::time::Duration;
 
-use reqwest::{Client, RequestBuilder, Response, StatusCode};
+use reqwest::{header, Client, RequestBuilder, Response, StatusCode};
 use tracing::debug;
 
 use crate::constants::{HTTP_RETRY_BACKOFF_S, HTTP_TIMEOUT_S};
@@ -129,15 +129,87 @@ impl HttpConfig {
 /// The closure is called once per attempt so the [`RequestBuilder`] doesn't
 /// have to be `Clone` — callers can freely use `query` / `json` / `header`
 /// methods that consume the builder.
+///
+/// Callers that want to round-trip an `ETag` / `If-None-Match` for cache
+/// revalidation (PRD §F-003) should use [`fetch_with_etag`] instead.
 pub async fn fetch_with_retry<F>(build: F, config: &HttpConfig) -> Result<Response, HttpError>
+where
+    F: Fn() -> RequestBuilder,
+{
+    match fetch_with_etag(build, None, config).await? {
+        FetchOutcome::Fresh { response, .. } => Ok(response),
+        // `prior_etag = None` means the server cannot legally produce a 304
+        // (no `If-None-Match` is sent). Treat it as defensive: surface as an
+        // `Http { status: 304, ... }` so callers don't silently lose the
+        // response.
+        FetchOutcome::NotModified => Err(HttpError::Http {
+            status: 304,
+            body: "unexpected 304 without prior etag".to_string(),
+        }),
+    }
+}
+
+/// Outcome of a successful cache-aware fetch ([`fetch_with_etag`]).
+///
+/// PRD §F-003 locks "`ETag` handled where the provider supports it; stored
+/// in `response_cache.etag`". A caller that has a prior cached row passes
+/// its stored `ETag` as `prior_etag`; the server may reply with `304 Not
+/// Modified`
+/// (which surfaces as [`FetchOutcome::NotModified`]) and the caller re-uses
+/// the cached payload while refreshing its expiry. A fresh `2xx` response
+/// surfaces as [`FetchOutcome::Fresh`] with the optional `ETag` header
+/// parsed out for the next write to `response_cache.etag`.
+pub enum FetchOutcome {
+    /// Server confirmed the cached payload is still current. The caller
+    /// should re-use its existing cache row and refresh `expires_at`.
+    NotModified,
+    /// Server returned a fresh body. The caller should consume `response`
+    /// (e.g. `.json()`, `.text()`) and persist `etag` alongside the new
+    /// payload.
+    Fresh {
+        response: Response,
+        etag: Option<String>,
+    },
+}
+
+/// Send a request with optional `If-None-Match` revalidation, retrying on
+/// 5xx / 429 / transient transport errors. PRD §F-003 `ETag` round-trip.
+///
+/// Behavior:
+/// - When `prior_etag` is `Some`, an `If-None-Match: <etag>` header is added
+///   to every attempt's request.
+/// - A `2xx` response yields [`FetchOutcome::Fresh`] with the parsed `ETag`
+///   header (if the server sent one).
+/// - A `304 Not Modified` response yields [`FetchOutcome::NotModified`] and
+///   does NOT trigger retry — it is the cache-hit success path.
+/// - `5xx`, `429`, and transient transport errors retry per `config.backoff`
+///   exactly as [`fetch_with_retry`] does.
+///
+/// The closure is called once per attempt so the [`RequestBuilder`] doesn't
+/// have to be `Clone`.
+pub async fn fetch_with_etag<F>(
+    build: F,
+    prior_etag: Option<&str>,
+    config: &HttpConfig,
+) -> Result<FetchOutcome, HttpError>
 where
     F: Fn() -> RequestBuilder,
 {
     let mut backoff_iter = config.backoff.iter().copied();
     loop {
-        let send_result = build().send().await;
+        let request = match prior_etag {
+            Some(etag) => build().header(header::IF_NONE_MATCH, etag),
+            None => build(),
+        };
+        let send_result = request.send().await;
         let pending = match send_result {
-            Ok(r) if r.status().is_success() => return Ok(r),
+            Ok(r) if r.status() == StatusCode::NOT_MODIFIED => {
+                return Ok(FetchOutcome::NotModified);
+            }
+            Ok(r) if r.status().is_success() => {
+                let etag = extract_etag(&r);
+                return Ok(FetchOutcome::Fresh { response: r, etag });
+            }
             Ok(r) if should_retry_status(r.status()) => PendingRetry::Status(r),
             Ok(r) => return Err(http_error(r).await),
             Err(e) if is_transient_error(&e) => PendingRetry::Network(e),
@@ -161,6 +233,19 @@ where
     }
 }
 
+/// Parse the `ETag` response header into an owned string. Returns `None` if
+/// the header is absent or contains bytes that aren't valid UTF-8. The value
+/// is returned verbatim — including any surrounding quotes or `W/` weak
+/// prefix — because RFC 7232 requires the next `If-None-Match` to echo it
+/// byte-for-byte.
+fn extract_etag(response: &Response) -> Option<String> {
+    response
+        .headers()
+        .get(header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
 /// Outcome of a single attempt that needs to wait out a backoff before
 /// retrying. Holds onto the request artifact so the final error (after the
 /// backoff is exhausted) carries the real status / network detail.
@@ -181,4 +266,208 @@ async fn http_error(r: Response) -> HttpError {
     let status = r.status();
     let body = r.text().await.unwrap_or_default();
     HttpError::http_status(status, body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{header, header_exists, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn config_zero_backoff() -> HttpConfig {
+        HttpConfig::for_test()
+    }
+
+    #[tokio::test]
+    async fn fetch_with_etag_no_prior_sends_no_if_none_match_and_returns_etag() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ETag", "\"abc123\"")
+                    .set_body_string("hello"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Assert no If-None-Match header reaches the server when prior is None.
+        Mock::given(method("GET"))
+            .and(path("/x"))
+            .and(header_exists("if-none-match"))
+            .respond_with(ResponseTemplate::new(599))
+            .expect(0)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let url = format!("{}/x", server.uri());
+        let outcome = fetch_with_etag(|| client.get(&url), None, &config_zero_backoff())
+            .await
+            .expect("fetch ok");
+        match outcome {
+            FetchOutcome::Fresh { response, etag } => {
+                assert_eq!(etag.as_deref(), Some("\"abc123\""));
+                let body = response.text().await.unwrap();
+                assert_eq!(body, "hello");
+            }
+            FetchOutcome::NotModified => panic!("expected Fresh"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_with_etag_prior_etag_sends_if_none_match_and_304_yields_not_modified() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/x"))
+            .and(header("if-none-match", "\"abc123\""))
+            .respond_with(ResponseTemplate::new(304))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let url = format!("{}/x", server.uri());
+        let outcome = fetch_with_etag(
+            || client.get(&url),
+            Some("\"abc123\""),
+            &config_zero_backoff(),
+        )
+        .await
+        .expect("fetch ok");
+        assert!(matches!(outcome, FetchOutcome::NotModified));
+    }
+
+    #[tokio::test]
+    async fn fetch_with_etag_prior_etag_with_changed_resource_yields_fresh_with_new_etag() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/x"))
+            .and(header("if-none-match", "\"old\""))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ETag", "\"new\"")
+                    .set_body_string("updated"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let url = format!("{}/x", server.uri());
+        let outcome = fetch_with_etag(|| client.get(&url), Some("\"old\""), &config_zero_backoff())
+            .await
+            .expect("fetch ok");
+        match outcome {
+            FetchOutcome::Fresh { response, etag } => {
+                assert_eq!(etag.as_deref(), Some("\"new\""));
+                let body = response.text().await.unwrap();
+                assert_eq!(body, "updated");
+            }
+            FetchOutcome::NotModified => panic!("expected Fresh"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_with_etag_does_not_retry_on_304() {
+        // PRD §F-003: 304 is the cache-hit success path, not a transient
+        // failure. The wiremock `expect(1)` enforces no retry.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/x"))
+            .respond_with(ResponseTemplate::new(304))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let url = format!("{}/x", server.uri());
+        let outcome = fetch_with_etag(|| client.get(&url), Some("\"abc\""), &config_zero_backoff())
+            .await
+            .expect("fetch ok");
+        assert!(matches!(outcome, FetchOutcome::NotModified));
+    }
+
+    #[tokio::test]
+    async fn fetch_with_etag_retries_on_500_then_returns_fresh() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/x"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(2)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/x"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ETag", "\"v1\"")
+                    .set_body_string("ok"),
+            )
+            .expect(1)
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let url = format!("{}/x", server.uri());
+        let outcome = fetch_with_etag(|| client.get(&url), Some("\"v0\""), &config_zero_backoff())
+            .await
+            .expect("fetch ok");
+        match outcome {
+            FetchOutcome::Fresh { etag, .. } => assert_eq!(etag.as_deref(), Some("\"v1\"")),
+            FetchOutcome::NotModified => panic!("expected Fresh"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_with_etag_missing_response_etag_yields_none() {
+        // Fanart.tv and similar providers may not send an ETag header on
+        // every endpoint. The infrastructure tolerates absence (PRD §F-003:
+        // "ETag handled where the provider supports it" — providers that
+        // don't simply leave the column NULL).
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/x"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("body"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let url = format!("{}/x", server.uri());
+        let outcome = fetch_with_etag(|| client.get(&url), None, &config_zero_backoff())
+            .await
+            .expect("fetch ok");
+        match outcome {
+            FetchOutcome::Fresh { etag, .. } => assert!(etag.is_none()),
+            FetchOutcome::NotModified => panic!("expected Fresh"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_with_retry_back_compat_treats_304_without_prior_as_http_error() {
+        // Defensive: the back-compat wrapper sends no If-None-Match, so a
+        // server that nonetheless replies 304 is surfaced as an HTTP error
+        // (not silently lost). Real providers do not do this.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/x"))
+            .respond_with(ResponseTemplate::new(304))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let url = format!("{}/x", server.uri());
+        let err = fetch_with_retry(|| client.get(&url), &config_zero_backoff())
+            .await
+            .unwrap_err();
+        match err {
+            HttpError::Http { status, .. } => assert_eq!(status, 304),
+            HttpError::Network(_) => panic!("expected HttpError::Http(304)"),
+        }
+    }
 }

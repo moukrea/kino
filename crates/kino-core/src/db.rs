@@ -353,46 +353,97 @@ impl Db {
     // F-004 stores its day-long aggregated-trending payloads here; later
     // features (F-005 artwork, F-006 stream availability via its own table,
     // F-007 addon catalogs) extend the same surface.
+    //
+    // PRD §F-003 locks ETag round-trip for providers that support it; rows
+    // populated by a per-resource HTTP fetch carry the provider's `ETag`
+    // header in the `etag` column, so the next read can issue
+    // `If-None-Match` (see `kino_core::http::fetch_with_etag`) and the
+    // `cache_refresh_expiry` helper on a `304 Not Modified` reply.
+    // Aggregated cache rows (e.g. F-004 daily trending output) don't map
+    // 1:1 with a single HTTP response and pass `None` for the etag.
 
     /// Return the cached payload for `key` if present and not yet expired.
     /// Expired rows are NOT deleted on read — periodic cleanup is a future
     /// background task; reads simply ignore stale entries.
+    ///
+    /// Etag-aware callers wanting cache revalidation should use
+    /// [`cache_get_with_etag`](Self::cache_get_with_etag) so the stored
+    /// `If-None-Match` candidate can be sent on the next outbound fetch.
     pub async fn cache_get(&self, key: &str) -> Result<Option<String>, DbError> {
+        Ok(self.cache_get_with_etag(key).await?.map(|(p, _)| p))
+    }
+
+    /// Return the cached payload AND its stored `ETag` for `key` if
+    /// present and not yet expired. The `ETag` is what PRD §F-003 calls
+    /// "the value last received from the provider"; pass it as
+    /// `prior_etag` to
+    /// [`kino_core::http::fetch_with_etag`](crate::http::fetch_with_etag).
+    ///
+    /// Rows persisted with `etag = None` (e.g. F-004's aggregated daily
+    /// trending output) return `(payload, None)`. Providers that simply
+    /// don't send an `ETag` header (e.g. Fanart.tv) likewise yield `None`.
+    pub async fn cache_get_with_etag(
+        &self,
+        key: &str,
+    ) -> Result<Option<(String, Option<String>)>, DbError> {
         let now = now_unix();
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT payload_json FROM response_cache \
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT payload_json, etag FROM response_cache \
              WHERE key = ? AND expires_at > ?",
         )
         .bind(key)
         .bind(now)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(p,)| p))
+        Ok(row)
     }
 
     /// Upsert a cache row. `expires_at` is an absolute Unix timestamp in
-    /// seconds. Callers compute it from a TTL (e.g. `now + TRENDING_TTL_S`)
-    /// or from a boundary like "next UTC midnight" (F-004's daily output
-    /// cache).
+    /// seconds; `etag` is the verbatim `ETag` header from the originating
+    /// HTTP response when present (RFC 7232 requires byte-for-byte echo on
+    /// the next `If-None-Match`). Callers compute `expires_at` from a TTL
+    /// (e.g. `now + TRENDING_TTL_S`) or from a boundary like "next UTC
+    /// midnight" (F-004's daily output cache).
+    ///
+    /// Pass `etag = None` for cache rows that aren't a 1:1 HTTP response
+    /// (aggregated or post-processed payloads) or for providers that don't
+    /// support `ETag`.
     pub async fn cache_set(
         &self,
         key: &str,
         payload_json: &str,
+        etag: Option<&str>,
         expires_at: i64,
     ) -> Result<(), DbError> {
         sqlx::query(
             "INSERT INTO response_cache (key, payload_json, etag, expires_at) \
-             VALUES (?, ?, NULL, ?) \
+             VALUES (?, ?, ?, ?) \
              ON CONFLICT(key) DO UPDATE SET \
                payload_json = excluded.payload_json, \
-               etag = NULL, \
+               etag = excluded.etag, \
                expires_at = excluded.expires_at",
         )
         .bind(key)
         .bind(payload_json)
+        .bind(etag)
         .bind(expires_at)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// Refresh the `expires_at` of an existing cache row without rewriting
+    /// the payload or the `ETag`. This is the `304 Not Modified` happy path
+    /// (PRD §F-003): the server confirmed the cached body is current, so we
+    /// only need to defer the next revalidation. A no-op if the row is
+    /// absent or already expired (in which case the next caller will fetch
+    /// fresh anyway).
+    pub async fn cache_refresh_expiry(&self, key: &str, expires_at: i64) -> Result<(), DbError> {
+        sqlx::query("UPDATE response_cache SET expires_at = ? WHERE key = ?")
+            .bind(expires_at)
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -954,7 +1005,7 @@ mod tests {
     async fn cache_set_then_get_returns_fresh_payload() {
         let db = Db::open_in_memory().await.unwrap();
         let future = now_unix() + 600;
-        db.cache_set("k", "{\"v\":1}", future).await.unwrap();
+        db.cache_set("k", "{\"v\":1}", None, future).await.unwrap();
         let got = db.cache_get("k").await.unwrap();
         assert_eq!(got.as_deref(), Some("{\"v\":1}"));
     }
@@ -963,7 +1014,7 @@ mod tests {
     async fn cache_get_ignores_expired_row() {
         let db = Db::open_in_memory().await.unwrap();
         let past = now_unix() - 10;
-        db.cache_set("k", "stale", past).await.unwrap();
+        db.cache_set("k", "stale", None, past).await.unwrap();
         assert!(db.cache_get("k").await.unwrap().is_none());
     }
 
@@ -971,10 +1022,109 @@ mod tests {
     async fn cache_set_overwrites_existing_row() {
         let db = Db::open_in_memory().await.unwrap();
         let t = now_unix() + 600;
-        db.cache_set("k", "first", t).await.unwrap();
-        db.cache_set("k", "second", t).await.unwrap();
+        db.cache_set("k", "first", None, t).await.unwrap();
+        db.cache_set("k", "second", None, t).await.unwrap();
         let got = db.cache_get("k").await.unwrap();
         assert_eq!(got.as_deref(), Some("second"));
+    }
+
+    #[tokio::test]
+    async fn cache_set_persists_etag_and_get_with_etag_returns_it() {
+        let db = Db::open_in_memory().await.unwrap();
+        let future = now_unix() + 600;
+        db.cache_set("k", "{\"v\":1}", Some("\"abc\""), future)
+            .await
+            .unwrap();
+        let got = db.cache_get_with_etag("k").await.unwrap();
+        assert_eq!(
+            got,
+            Some(("{\"v\":1}".to_string(), Some("\"abc\"".to_string())))
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_set_overwrites_etag_with_new_value() {
+        let db = Db::open_in_memory().await.unwrap();
+        let future = now_unix() + 600;
+        db.cache_set("k", "first", Some("\"old\""), future)
+            .await
+            .unwrap();
+        db.cache_set("k", "second", Some("\"new\""), future)
+            .await
+            .unwrap();
+        let got = db.cache_get_with_etag("k").await.unwrap();
+        assert_eq!(
+            got,
+            Some(("second".to_string(), Some("\"new\"".to_string())))
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_set_overwrites_etag_with_none_clears_column() {
+        // Provider that previously sent ETag stops sending one (or a
+        // post-processed cache row replaces a per-resource one).
+        let db = Db::open_in_memory().await.unwrap();
+        let future = now_unix() + 600;
+        db.cache_set("k", "first", Some("\"abc\""), future)
+            .await
+            .unwrap();
+        db.cache_set("k", "second", None, future).await.unwrap();
+        let got = db.cache_get_with_etag("k").await.unwrap();
+        assert_eq!(got, Some(("second".to_string(), None)));
+    }
+
+    #[tokio::test]
+    async fn cache_refresh_expiry_extends_existing_row_without_changing_payload_or_etag() {
+        let db = Db::open_in_memory().await.unwrap();
+        let initial = now_unix() + 60;
+        db.cache_set("k", "body", Some("\"v1\""), initial)
+            .await
+            .unwrap();
+        let extended = now_unix() + 7_200;
+        db.cache_refresh_expiry("k", extended).await.unwrap();
+        // Row still readable post-refresh AND etag preserved.
+        let got = db.cache_get_with_etag("k").await.unwrap();
+        assert_eq!(got, Some(("body".to_string(), Some("\"v1\"".to_string()))));
+    }
+
+    #[tokio::test]
+    async fn cache_refresh_expiry_revives_expired_row_without_payload_rewrite() {
+        // A row whose `expires_at` is in the past is not visible to
+        // `cache_get`; refreshing its expiry should make it visible again
+        // with the original payload + etag intact.
+        let db = Db::open_in_memory().await.unwrap();
+        let past = now_unix() - 10;
+        db.cache_set("k", "body", Some("\"v1\""), past)
+            .await
+            .unwrap();
+        assert!(db.cache_get("k").await.unwrap().is_none());
+        let future = now_unix() + 600;
+        db.cache_refresh_expiry("k", future).await.unwrap();
+        let got = db.cache_get_with_etag("k").await.unwrap();
+        assert_eq!(got, Some(("body".to_string(), Some("\"v1\"".to_string()))));
+    }
+
+    #[tokio::test]
+    async fn cache_refresh_expiry_on_missing_key_is_a_noop() {
+        let db = Db::open_in_memory().await.unwrap();
+        db.cache_refresh_expiry("absent", now_unix() + 600)
+            .await
+            .unwrap();
+        assert!(db.cache_get("absent").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn cache_get_back_compat_strips_etag_from_with_etag_helper() {
+        // Both the new `cache_get_with_etag` and the back-compat `cache_get`
+        // see the same row; the latter just drops the etag tuple element.
+        let db = Db::open_in_memory().await.unwrap();
+        let future = now_unix() + 600;
+        db.cache_set("k", "body", Some("\"e\""), future)
+            .await
+            .unwrap();
+        assert_eq!(db.cache_get("k").await.unwrap().as_deref(), Some("body"));
+        let with = db.cache_get_with_etag("k").await.unwrap();
+        assert_eq!(with, Some(("body".to_string(), Some("\"e\"".to_string()))));
     }
 
     fn avail_row(title: &str, source: &str, has_streams: bool, t: i64) -> AvailabilityRow {

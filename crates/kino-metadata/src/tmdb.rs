@@ -8,12 +8,12 @@
 //! Authentication: the v3 `api_key` is passed as a query parameter on every
 //! request. Stored in `settings.tmdb_api_key` (see [`crate::TMDB_API_KEY`]).
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::artwork::{LocalizedAsset, ProviderBundle};
 use crate::error::Error;
 use crate::trending::ProviderItem;
-use kino_core::http::{fetch_with_retry, HttpConfig};
+use kino_core::http::{fetch_with_etag, fetch_with_retry, FetchOutcome, HttpConfig};
 use kino_core::title::{TitleKind, TitleSummary};
 
 /// Production TMDB base URL.
@@ -36,7 +36,11 @@ pub struct TitleIds {
 /// Detail attributes for the PRD §F-010 title-detail view. Sourced from
 /// TMDB `/3/{movie,tv}/{id}` with `append_to_response=release_dates`
 /// (movie) / `content_ratings` (tv).
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Serialize` / `Deserialize` are derived so the value can be persisted
+/// in `response_cache` for the per-resource `ETag` round-trip (PRD §F-003;
+/// Session 031).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TmdbTitleDetails {
     pub tmdb_id: u64,
     pub kind: TitleKind,
@@ -57,6 +61,26 @@ pub struct TmdbTitleDetails {
     /// TMDB user rating (`vote_average` on the 0-10 scale). `None` when
     /// TMDB has no votes.
     pub rating: Option<f64>,
+}
+
+/// Result of [`TmdbClient::title_details_with_etag`] — either a fresh
+/// payload (with the server's `ETag` header, when present) or the cache-hit
+/// `304 Not Modified` signal that the caller's prior cached
+/// [`TmdbTitleDetails`] is still current. PRD §F-003 round-trip.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TmdbTitleDetailsFetch {
+    /// Server confirmed the caller's cached payload is still current. The
+    /// caller re-uses its existing [`TmdbTitleDetails`] and only refreshes
+    /// the cache row's `expires_at` (see
+    /// [`kino_core::Db::cache_refresh_expiry`]).
+    NotModified,
+    /// Server returned a fresh body. `etag` is the parsed `ETag` header
+    /// (or `None` if the endpoint didn't send one); persist it alongside
+    /// the new payload in `response_cache.etag`.
+    Fresh {
+        details: TmdbTitleDetails,
+        etag: Option<String>,
+    },
 }
 
 /// One cast member, top-level for the PRD §F-010 cast row.
@@ -282,6 +306,33 @@ impl TmdbClient {
         kind: TitleKind,
         language: &str,
     ) -> Result<TmdbTitleDetails, Error> {
+        match self
+            .title_details_with_etag(tmdb_id, kind, language, None)
+            .await?
+        {
+            TmdbTitleDetailsFetch::Fresh { details, .. } => Ok(details),
+            // Unreachable: `prior_etag = None` means the server cannot
+            // legally produce a 304. Treat as decode error in case a
+            // misbehaving mock yields one.
+            TmdbTitleDetailsFetch::NotModified => Err(Error::Decode(
+                "tmdb title_details: 304 returned without prior etag".to_string(),
+            )),
+        }
+    }
+
+    /// `ETag`-aware variant of [`title_details`](Self::title_details) for
+    /// cache revalidation (PRD §F-003). Pass the cache row's stored `ETag`
+    /// as `prior_etag`; on `304 Not Modified` the server confirms the cached
+    /// payload is still current and the caller re-uses it (refreshing the
+    /// row's `expires_at`). On a fresh `2xx`, the parsed `ETag` header is
+    /// returned alongside the new payload for persistence.
+    pub async fn title_details_with_etag(
+        &self,
+        tmdb_id: u64,
+        kind: TitleKind,
+        language: &str,
+        prior_etag: Option<&str>,
+    ) -> Result<TmdbTitleDetailsFetch, Error> {
         let media = match kind {
             TitleKind::Movie => "movie",
             TitleKind::Series => "tv",
@@ -291,7 +342,7 @@ impl TmdbClient {
             TitleKind::Series => "content_ratings",
         };
         let url = format!("{}/3/{media}/{tmdb_id}", self.base_url);
-        let response = fetch_with_retry(
+        let outcome = fetch_with_etag(
             || {
                 self.client.get(&url).query(&[
                     ("api_key", self.key.as_str()),
@@ -299,39 +350,20 @@ impl TmdbClient {
                     ("append_to_response", append),
                 ])
             },
+            prior_etag,
             &self.config,
         )
         .await?;
+        let (response, etag) = match outcome {
+            FetchOutcome::NotModified => return Ok(TmdbTitleDetailsFetch::NotModified),
+            FetchOutcome::Fresh { response, etag } => (response, etag),
+        };
         let body: TitleDetailResponse = response
             .json()
             .await
             .map_err(|e| Error::Decode(format!("tmdb {media} title_details: {e}")))?;
-        let age_rating = match kind {
-            TitleKind::Movie => body
-                .release_dates
-                .and_then(|r| pick_us_certification_movie(&r.results)),
-            TitleKind::Series => body
-                .content_ratings
-                .and_then(|r| pick_us_certification_show(&r.results)),
-        };
-        let runtime_minutes = body
-            .runtime
-            .or_else(|| body.episode_run_time.iter().copied().find(|n| *n > 0));
-        Ok(TmdbTitleDetails {
-            tmdb_id,
-            kind,
-            language: language.to_string(),
-            runtime_minutes,
-            age_rating,
-            genres: body
-                .genres
-                .into_iter()
-                .map(|g| g.name)
-                .filter(|s| !s.is_empty())
-                .collect(),
-            overview: body.overview.filter(|s| !s.is_empty()),
-            rating: body.vote_average.filter(|n| *n > 0.0),
-        })
+        let details = parse_title_details(body, tmdb_id, kind, language);
+        Ok(TmdbTitleDetailsFetch::Fresh { details, etag })
     }
 
     /// Fetch the cast credits for a title (PRD §F-010 cast row).
@@ -698,6 +730,45 @@ fn pick_us_certification_show(entries: &[ContentRatingEntry]) -> Option<String> 
         .map(|e| e.rating.clone())
 }
 
+/// Pure-function projection from the raw `/3/{movie,tv}/{id}` body to the
+/// public [`TmdbTitleDetails`] shape. Factored out so both
+/// [`TmdbClient::title_details`] and
+/// [`TmdbClient::title_details_with_etag`] can share the parser without
+/// duplicating the field-by-field plucking logic.
+fn parse_title_details(
+    body: TitleDetailResponse,
+    tmdb_id: u64,
+    kind: TitleKind,
+    language: &str,
+) -> TmdbTitleDetails {
+    let age_rating = match kind {
+        TitleKind::Movie => body
+            .release_dates
+            .and_then(|r| pick_us_certification_movie(&r.results)),
+        TitleKind::Series => body
+            .content_ratings
+            .and_then(|r| pick_us_certification_show(&r.results)),
+    };
+    let runtime_minutes = body
+        .runtime
+        .or_else(|| body.episode_run_time.iter().copied().find(|n| *n > 0));
+    TmdbTitleDetails {
+        tmdb_id,
+        kind,
+        language: language.to_string(),
+        runtime_minutes,
+        age_rating,
+        genres: body
+            .genres
+            .into_iter()
+            .map(|g| g.name)
+            .filter(|s| !s.is_empty())
+            .collect(),
+        overview: body.overview.filter(|s| !s.is_empty()),
+        rating: body.vote_average.filter(|n| *n > 0.0),
+    }
+}
+
 /// Shape of `/3/search/multi`. TMDB returns the union of movie / tv / person
 /// rows; `media_type` is the discriminator. Person rows lack a `kind` we can
 /// surface so [`SearchMultiResult::into_summary`] drops them.
@@ -782,7 +853,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::time::Duration;
-    use wiremock::matchers::{header_regex, method, path, query_param};
+    use wiremock::matchers::{header, header_regex, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn config_zero_backoff() -> HttpConfig {
@@ -1306,6 +1377,163 @@ mod tests {
         assert!(details.genres.is_empty());
         assert!(details.overview.is_none());
         assert!(details.rating.is_none());
+    }
+
+    #[tokio::test]
+    async fn title_details_with_etag_no_prior_returns_fresh_with_server_etag() {
+        // PRD §F-003: ETag handled where the provider supports it. On the
+        // first fetch (no prior cache row) the caller passes `prior_etag =
+        // None` and gets back the `ETag` header for persistence.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/3/movie/603"))
+            .and(query_param("api_key", "test-key"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ETag", "\"matrix-v1\"")
+                    .set_body_json(json!({
+                        "id": 603,
+                        "title": "The Matrix",
+                        "runtime": 136,
+                        "vote_average": 8.2
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TmdbClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let fetch = client
+            .title_details_with_etag(603, TitleKind::Movie, "en", None)
+            .await
+            .unwrap();
+        match fetch {
+            TmdbTitleDetailsFetch::Fresh { details, etag } => {
+                assert_eq!(etag.as_deref(), Some("\"matrix-v1\""));
+                assert_eq!(details.runtime_minutes, Some(136));
+                assert_eq!(details.rating, Some(8.2));
+            }
+            TmdbTitleDetailsFetch::NotModified => panic!("expected Fresh on first fetch"),
+        }
+    }
+
+    #[tokio::test]
+    async fn title_details_with_etag_prior_sends_if_none_match_and_304_yields_not_modified() {
+        // PRD §F-003 304 path: a server that confirms the cached row is
+        // current returns 304, and we surface NotModified so the caller
+        // refreshes the row's `expires_at` and re-uses its parsed payload.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/3/tv/1399"))
+            .and(query_param("api_key", "test-key"))
+            .and(header("if-none-match", "\"got-v2\""))
+            .respond_with(ResponseTemplate::new(304))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TmdbClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let fetch = client
+            .title_details_with_etag(1399, TitleKind::Series, "en", Some("\"got-v2\""))
+            .await
+            .unwrap();
+        assert!(matches!(fetch, TmdbTitleDetailsFetch::NotModified));
+    }
+
+    #[tokio::test]
+    async fn title_details_with_etag_prior_with_changed_resource_returns_fresh_with_new_etag() {
+        // Server's resource changed since we cached: it ignores our
+        // `If-None-Match` and returns a fresh 200 with a new ETag.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/3/movie/603"))
+            .and(header("if-none-match", "\"matrix-v1\""))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ETag", "\"matrix-v2\"")
+                    .set_body_json(json!({
+                        "id": 603,
+                        "title": "The Matrix",
+                        "runtime": 137,
+                        "vote_average": 8.3
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TmdbClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let fetch = client
+            .title_details_with_etag(603, TitleKind::Movie, "en", Some("\"matrix-v1\""))
+            .await
+            .unwrap();
+        match fetch {
+            TmdbTitleDetailsFetch::Fresh { details, etag } => {
+                assert_eq!(etag.as_deref(), Some("\"matrix-v2\""));
+                assert_eq!(details.runtime_minutes, Some(137));
+            }
+            TmdbTitleDetailsFetch::NotModified => panic!("expected Fresh on changed resource"),
+        }
+    }
+
+    #[tokio::test]
+    async fn title_details_with_etag_tolerates_missing_etag_header() {
+        // PRD §F-003: ETag is "handled where the provider supports it" —
+        // when the server simply doesn't send an ETag (some Fanart-class
+        // endpoints), `etag` is `None` and the caller persists it as such.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/3/movie/603"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": 603,
+                "title": "The Matrix",
+                "runtime": 136,
+                "vote_average": 8.2
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TmdbClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let fetch = client
+            .title_details_with_etag(603, TitleKind::Movie, "en", None)
+            .await
+            .unwrap();
+        match fetch {
+            TmdbTitleDetailsFetch::Fresh { etag, .. } => assert!(etag.is_none()),
+            TmdbTitleDetailsFetch::NotModified => panic!("expected Fresh"),
+        }
+    }
+
+    #[tokio::test]
+    async fn title_details_back_compat_unchanged_when_server_sends_etag() {
+        // Sanity: the back-compat `title_details` wrapper still returns
+        // the bare struct even when the server sends an ETag (the new
+        // metadata is invisible to existing callers).
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/3/movie/603"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ETag", "\"matrix-v1\"")
+                    .set_body_json(json!({
+                        "id": 603,
+                        "title": "The Matrix",
+                        "runtime": 136,
+                        "vote_average": 8.2
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TmdbClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let details = client
+            .title_details(603, TitleKind::Movie, "en")
+            .await
+            .unwrap();
+        assert_eq!(details.runtime_minutes, Some(136));
+        assert_eq!(details.rating, Some(8.2));
     }
 
     #[tokio::test]
