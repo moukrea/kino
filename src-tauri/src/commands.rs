@@ -29,7 +29,8 @@ use kino_metadata::artwork::{cascade, lang_chain_hash, CachedArtwork, ProviderBu
 use kino_metadata::tmdb::TitleIds;
 use kino_metadata::{
     aggregate, FanartClient, ProviderItem, TmdbCastMember, TmdbClient, TmdbTitleDetails,
-    TraktClient, TvdbClient, FANART_API_KEY, TMDB_API_KEY, TRAKT_API_KEY, TVDB_API_KEY,
+    TmdbTitleDetailsFetch, TraktClient, TvdbClient, FANART_API_KEY, TMDB_API_KEY, TRAKT_API_KEY,
+    TVDB_API_KEY,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -343,7 +344,7 @@ pub async fn get_trending(
     let expires_at =
         next_utc_midnight_unix(&today).ok_or_else(|| "internal: invalid UTC date".to_string())?;
     let payload = serde_json::to_string(&merged).map_err(|e| e.to_string())?;
-    if let Err(e) = db.cache_set(&cache_key, &payload, expires_at).await {
+    if let Err(e) = db.cache_set(&cache_key, &payload, None, expires_at).await {
         tracing::warn!(error = %e, "failed to persist trending cache");
     }
 
@@ -494,7 +495,7 @@ pub async fn get_trending_pools(
     let expires_at =
         next_utc_midnight_unix(&today).ok_or_else(|| "internal: invalid UTC date".to_string())?;
     let payload = serde_json::to_string(&pools).map_err(|e| e.to_string())?;
-    if let Err(e) = db.cache_set(&cache_key, &payload, expires_at).await {
+    if let Err(e) = db.cache_set(&cache_key, &payload, None, expires_at).await {
         tracing::warn!(error = %e, "failed to persist trending-pools cache");
     }
 
@@ -544,7 +545,7 @@ pub async fn get_weekly_trending(
     let expires_at =
         next_utc_midnight_unix(&today).ok_or_else(|| "internal: invalid UTC date".to_string())?;
     let payload = serde_json::to_string(&summaries).map_err(|e| e.to_string())?;
-    if let Err(e) = db.cache_set(&cache_key, &payload, expires_at).await {
+    if let Err(e) = db.cache_set(&cache_key, &payload, None, expires_at).await {
         tracing::warn!(error = %e, "failed to persist weekly-trending cache");
     }
 
@@ -649,7 +650,7 @@ pub async fn list_home_catalogs(
 
     let payload = serde_json::to_string(&fetched).map_err(|e| e.to_string())?;
     let expires_at = now_unix().saturating_add(i64::try_from(SEARCH_TTL_S).unwrap_or(i64::MAX));
-    if let Err(e) = db.cache_set(&cache_key, &payload, expires_at).await {
+    if let Err(e) = db.cache_set(&cache_key, &payload, None, expires_at).await {
         tracing::warn!(error = %e, "failed to persist home-catalogs cache");
     }
 
@@ -973,7 +974,7 @@ pub async fn resolve_artwork(
     })
     .map_err(|e| e.to_string())?;
     let expires_at = now_unix().saturating_add(i64::try_from(ARTWORK_TTL_S).unwrap_or(i64::MAX));
-    if let Err(e) = db.cache_set(&cache_key, &payload, expires_at).await {
+    if let Err(e) = db.cache_set(&cache_key, &payload, None, expires_at).await {
         tracing::warn!(error = %e, "failed to persist artwork cache");
     }
     Ok(artwork)
@@ -1798,7 +1799,10 @@ pub async fn get_title_detail(
         let serialized = serde_json::to_string(&fetched).map_err(|e| e.to_string())?;
         let expires_at = now_unix()
             .saturating_add(i64::try_from(kino_core::constants::META_TTL_S).unwrap_or(i64::MAX));
-        if let Err(e) = db.cache_set(&cache_key, &serialized, expires_at).await {
+        if let Err(e) = db
+            .cache_set(&cache_key, &serialized, None, expires_at)
+            .await
+        {
             tracing::warn!(error = %e, "failed to persist title-detail cache");
         }
         fetched
@@ -1943,7 +1947,7 @@ async fn get_title_detail_uncached(
 
     // (2) TMDB overlay.
     if let (Some(client), Some(tmdb_id)) = (tmdb_client.as_ref(), ids.tmdb_id) {
-        match client.title_details(tmdb_id, kind, &primary_lang).await {
+        match fetch_tmdb_title_details_etag_cached(db, client, tmdb_id, kind, &primary_lang).await {
             Ok(details) => apply_tmdb_details(&mut payload, &details),
             Err(e) => tracing::warn!(error = %e, "tmdb title_details failed"),
         }
@@ -1972,6 +1976,89 @@ async fn get_title_detail_uncached(
         }
     }
     Ok(payload)
+}
+
+/// Fetch TMDB title-details with PRD §F-003 `ETag` round-trip via
+/// `response_cache`.
+///
+/// On a hit with a stored `ETag`, sends `If-None-Match`; a `304 Not
+/// Modified` reply re-uses the cached parsed payload and refreshes
+/// `expires_at`. On a fresh `2xx`, persists the new payload + `ETag` with
+/// `META_TTL_S` (24h). On any error (HTTP failure, cache I/O, JSON parse
+/// drift) we bubble the upstream error so the caller
+/// (`get_title_detail_uncached`) can log and continue with the partial
+/// payload, matching the pre-Session-031 contract.
+///
+/// Per-resource cache key: `tmdb:title_details:{tmdb_id}:{kind}:{language}`.
+/// The key encodes language because TMDB returns localized `overview` /
+/// `genres` / `age_rating`, and the row's `ETag` is therefore
+/// language-keyed too.
+async fn fetch_tmdb_title_details_etag_cached(
+    db: &Db,
+    client: &TmdbClient,
+    tmdb_id: u64,
+    kind: TitleKind,
+    language: &str,
+) -> Result<TmdbTitleDetails, String> {
+    let cache_key = format!(
+        "tmdb:title_details:{tmdb_id}:{kind}:{language}",
+        kind = kind.as_str(),
+    );
+
+    let cached = match db.cache_get_with_etag(&cache_key).await {
+        Ok(c) => c,
+        Err(e) => {
+            // Treat a cache I/O failure as a miss: the network fetch still
+            // produces a correct payload, just without a 304 short-circuit.
+            tracing::warn!(error = %e, "tmdb title_details cache_get_with_etag failed");
+            None
+        }
+    };
+    let prior_etag = cached.as_ref().and_then(|(_, etag)| etag.clone());
+    let prior_payload = cached.as_ref().map(|(payload, _)| payload.clone());
+
+    let expires_at = now_unix()
+        .saturating_add(i64::try_from(kino_core::constants::META_TTL_S).unwrap_or(i64::MAX));
+
+    let fetch = client
+        .title_details_with_etag(tmdb_id, kind, language, prior_etag.as_deref())
+        .await
+        .map_err(ipc)?;
+
+    match fetch {
+        TmdbTitleDetailsFetch::NotModified => {
+            // PRD §F-003 304 path: provider confirmed the cached body is
+            // current. Refresh the row's expiry and re-deserialize the
+            // payload we already stored.
+            if let Err(e) = db.cache_refresh_expiry(&cache_key, expires_at).await {
+                tracing::warn!(error = %e, "tmdb title_details cache_refresh_expiry failed");
+            }
+            let payload = prior_payload.ok_or_else(|| {
+                "tmdb title_details: server returned 304 with no prior cache row".to_string()
+            })?;
+            serde_json::from_str::<TmdbTitleDetails>(&payload).map_err(|e| e.to_string())
+        }
+        TmdbTitleDetailsFetch::Fresh { details, etag } => {
+            // PRD §F-003 fresh path: persist the new payload + ETag (when
+            // present) for the next revalidation. A serialization or write
+            // failure is logged but does not prevent us returning the
+            // fresh payload to the caller.
+            match serde_json::to_string(&details) {
+                Ok(serialized) => {
+                    if let Err(e) = db
+                        .cache_set(&cache_key, &serialized, etag.as_deref(), expires_at)
+                        .await
+                    {
+                        tracing::warn!(error = %e, "tmdb title_details cache_set failed");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "tmdb title_details serialize failed");
+                }
+            }
+            Ok(details)
+        }
+    }
 }
 
 /// Fetch a `MetaDetail` for the given `IMDb` id by walking the enabled
@@ -6863,5 +6950,188 @@ mod tests {
         assert!(ids.contains(&"tt_new".to_string()));
         assert!(ids.contains(&"tt_inprog".to_string()));
         assert!(!ids.contains(&"tt_old".to_string()));
+    }
+
+    // ---- F-003: TMDB title_details ETag round-trip (Session 031) ------
+    //
+    // PRD §F-003: "ETag handled where the provider supports it; stored in
+    // `response_cache.etag`". These tests cover the per-resource cache
+    // helper `fetch_tmdb_title_details_etag_cached` end-to-end: the first
+    // call persists the server ETag in `response_cache.etag`, and the
+    // second call sends `If-None-Match` and consumes the 304 cache-hit
+    // path.
+
+    use wiremock::matchers::{header as wm_header, query_param as wm_query_param};
+
+    fn tmdb_movie_body() -> serde_json::Value {
+        serde_json::json!({
+            "id": 603,
+            "title": "The Matrix",
+            "runtime": 136,
+            "vote_average": 8.2,
+            "overview": "A computer hacker learns about reality.",
+            "genres": [{"id": 28, "name": "Action"}, {"id": 878, "name": "Sci-Fi"}]
+        })
+    }
+
+    #[tokio::test]
+    async fn fetch_tmdb_title_details_etag_first_call_persists_etag_in_response_cache() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/3/movie/603"))
+            .and(wm_query_param("api_key", "test-key"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ETag", "\"matrix-v1\"")
+                    .set_body_json(tmdb_movie_body()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let db = Db::open_in_memory().await.unwrap();
+        let client =
+            TmdbClient::with_options("test-key", HttpConfig::for_test(), server.uri()).unwrap();
+        let details =
+            fetch_tmdb_title_details_etag_cached(&db, &client, 603, TitleKind::Movie, "en")
+                .await
+                .unwrap();
+        assert_eq!(details.runtime_minutes, Some(136));
+        assert_eq!(details.rating, Some(8.2));
+
+        // The cache row carries the ETag the server sent — the column
+        // is no longer dead (PRD §F-003 closure).
+        let row = db
+            .cache_get_with_etag("tmdb:title_details:603:movie:en")
+            .await
+            .unwrap()
+            .expect("cache row written");
+        assert_eq!(row.1.as_deref(), Some("\"matrix-v1\""));
+    }
+
+    #[tokio::test]
+    async fn fetch_tmdb_title_details_etag_second_call_sends_if_none_match_and_consumes_304() {
+        let server = MockServer::start().await;
+        // First request: no If-None-Match, returns 200 + ETag.
+        Mock::given(method("GET"))
+            .and(path("/3/movie/603"))
+            .and(wm_query_param("api_key", "test-key"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ETag", "\"matrix-v1\"")
+                    .set_body_json(tmdb_movie_body()),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        // Second request: must echo If-None-Match, server returns 304.
+        Mock::given(method("GET"))
+            .and(path("/3/movie/603"))
+            .and(wm_header("if-none-match", "\"matrix-v1\""))
+            .respond_with(ResponseTemplate::new(304))
+            .expect(1)
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let db = Db::open_in_memory().await.unwrap();
+        let client =
+            TmdbClient::with_options("test-key", HttpConfig::for_test(), server.uri()).unwrap();
+        let first = fetch_tmdb_title_details_etag_cached(&db, &client, 603, TitleKind::Movie, "en")
+            .await
+            .unwrap();
+        let second =
+            fetch_tmdb_title_details_etag_cached(&db, &client, 603, TitleKind::Movie, "en")
+                .await
+                .unwrap();
+        // Both calls return the same payload — 304 path re-uses the
+        // cached parse.
+        assert_eq!(first, second);
+        assert_eq!(second.runtime_minutes, Some(136));
+    }
+
+    #[tokio::test]
+    async fn fetch_tmdb_title_details_etag_persists_new_etag_on_changed_resource() {
+        // Provider's resource changed since we cached: it ignores our
+        // `If-None-Match` and returns a fresh 200 with a new ETag. The
+        // helper must overwrite both the payload AND the etag column.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/3/movie/603"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ETag", "\"matrix-v1\"")
+                    .set_body_json(tmdb_movie_body()),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/3/movie/603"))
+            .and(wm_header("if-none-match", "\"matrix-v1\""))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ETag", "\"matrix-v2\"")
+                    .set_body_json(serde_json::json!({
+                        "id": 603,
+                        "title": "The Matrix",
+                        "runtime": 137,
+                        "vote_average": 8.3,
+                        "genres": []
+                    })),
+            )
+            .expect(1)
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let db = Db::open_in_memory().await.unwrap();
+        let client =
+            TmdbClient::with_options("test-key", HttpConfig::for_test(), server.uri()).unwrap();
+        let _ = fetch_tmdb_title_details_etag_cached(&db, &client, 603, TitleKind::Movie, "en")
+            .await
+            .unwrap();
+        let second =
+            fetch_tmdb_title_details_etag_cached(&db, &client, 603, TitleKind::Movie, "en")
+                .await
+                .unwrap();
+        // Second call carries the post-change payload (runtime 137).
+        assert_eq!(second.runtime_minutes, Some(137));
+        // Cache row was overwritten with the new ETag.
+        let row = db
+            .cache_get_with_etag("tmdb:title_details:603:movie:en")
+            .await
+            .unwrap()
+            .expect("cache row still present");
+        assert_eq!(row.1.as_deref(), Some("\"matrix-v2\""));
+    }
+
+    #[tokio::test]
+    async fn fetch_tmdb_title_details_etag_tolerates_provider_without_etag_header() {
+        // Some providers / endpoints don't send ETag (Fanart.tv class).
+        // PRD §F-003 "handled WHERE the provider supports it" — absence
+        // is tolerated and the column stays NULL.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/3/movie/603"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(tmdb_movie_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let db = Db::open_in_memory().await.unwrap();
+        let client =
+            TmdbClient::with_options("test-key", HttpConfig::for_test(), server.uri()).unwrap();
+        let _ = fetch_tmdb_title_details_etag_cached(&db, &client, 603, TitleKind::Movie, "en")
+            .await
+            .unwrap();
+        let row = db
+            .cache_get_with_etag("tmdb:title_details:603:movie:en")
+            .await
+            .unwrap()
+            .expect("cache row written");
+        assert!(row.1.is_none());
     }
 }

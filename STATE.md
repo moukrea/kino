@@ -1,9 +1,9 @@
 # kino — Agent State
 
 **PRD version:** 1.0 (locked)
-**Status:** v1.0.0-alpha.1 release pipeline shipped. Session 028 closed the §5 reliability bundle. Session 029 closed F-016 §4 + §8. **Session 030 closes the F-006 frontend availability filter UI** — the single largest §6A gap called out by Session 027's audit. Backend (`check_availability` Tauri command, 30-min `stream_availability` cache, 8-in-flight semaphore, 5s timeout) was already shipped in Session 009; this session adds the entire frontend surface: per-tile `availability: "pending" | "available" | "unavailable"` discriminant on `<Tile>` with skeleton + "no source" badge variants, per-row filter + window logic on `<Row>`, a new `display.show_unavailable` setting (default OFF per PRD), per-row `check_availability` batches fired on Home / sub-home mount with backend de-dup, and a module-level `lib/displaySettings.ts` signal so toggling the setting re-renders catalog rows live without a route remount. F-006 flipped to `[x]` in the Feature Tracker. Four §6A feature regressions remain open: F-003 (ETag handling), F-013 / F-014 (librqbit-blocked: max-connections cap + piece-priority window assignment), F-015 (Android DV decoder selector + Linux libmpv in-window GL). **§6A is still not claimable.** See the F-006-closure rationale in the Session 030 entry below.
-**Last session:** 030 (F-006 frontend availability filter UI — `TileAvailability` discriminant + skeleton + "no source" badge on `<Tile>`; `itemAvailability` + `showUnavailable` props on `<Row>` with filter that drops unavailable tiles when the toggle is OFF; HomeView per-row `dispatchAvailabilityFor` batch with de-dup and network-error fallback to "available"; new `display.show_unavailable` setting key (Rust + frontend) defaulting to `false` per PRD; new `frontend/src/lib/displaySettings.ts` module-level signal hydrated by App.tsx at boot and written by Settings.tsx on toggle; new Settings → Display "Show unavailable titles" Focusable; 16 new tests (2 Rust + 3 Tile + 4 Row + 6 HomeView + 1 Settings); F-006 Feature Tracker checkbox flipped back to `[x]`)
-**Next session:** 031 — recommended order from the remaining §6A Code-Acceptance Regressions section: (1) F-003 ETag handling (medium scope: thread `etag` through `cache-set` + `If-None-Match` + `304` path in `kino-core::http`, ~80 LOC), (2) F-015 Android DV decoder selector (~60 LOC), (3) F-013 / F-014 librqbit-blocked items (need an upstream PR, a fork, or a human PRD revision — file under "PRD Issues" if blocked), (4) F-015 Linux libmpv in-window GL surface (multi-session, ADR-108 deviation).
+**Status:** v1.0.0-alpha.1 release pipeline shipped. **Session 031 closes the F-003 ETag handling §6A regression** — the single largest §6A gap the Session 027 audit flagged after Session 030's F-006 closure. The PRD §F-003 contract item "ETag handled where the provider supports it; stored in `response_cache.etag`" was previously unfulfilled: `db.cache_set` wrote `etag = NULL` unconditionally and no client sent `If-None-Match`. This session adds the workspace-wide infrastructure: `db.cache_set(key, payload, etag, expires_at)` now persists ETags; new `db.cache_get_with_etag` returns `(payload, Option<etag>)`; new `db.cache_refresh_expiry` covers the `304 Not Modified` happy path; new `kino_core::http::fetch_with_etag` + `FetchOutcome` round-trip `If-None-Match` and surface `304` as a first-class cache-hit success (no retry); `fetch_with_retry` becomes a back-compat wrapper. **One per-resource demonstration shipped end-to-end** through the per-tile-detail path: new `TmdbClient::title_details_with_etag` + `TmdbTitleDetailsFetch` enum, consumed by a new `fetch_tmdb_title_details_etag_cached(...)` helper in `src-tauri::commands` that wraps the TMDB title-details call inside `get_title_detail_uncached` with a per-resource cache row at key `tmdb:title_details:{tmdb_id}:{kind}:{language}` (TTL `META_TTL_S = 24h`). The aggregated `meta:{title_id}:...` row that `get_title_detail` already maintained is unchanged; the new inner row gives ETag a 1:1 HTTP target. F-003 stays open in the Feature Tracker because the audit explicitly enumerated ETag round-trip "where the provider supports it" — TMDB title_details is one site, with TMDB credits + Trakt rating + TVDB title still pending (filed as follow-up under PRD Issues with the recommended next-session expansion). Three §6A feature regressions still open: F-013 / F-014 (librqbit-blocked: max-connections cap + piece-priority window assignment), F-015 (Android DV decoder selector + Linux libmpv in-window GL). **§6A is still not claimable.** See the F-003-closure rationale and ADR-124 / 125 / 126 / 127 in the Session 031 entry below.
+**Last session:** 031 (F-003 ETag handling infrastructure + TMDB title_details demonstration — `cache_set(.., etag, expires_at)` + `cache_get_with_etag` + `cache_refresh_expiry` in `kino_core::Db`; `fetch_with_etag` + `FetchOutcome` enum in `kino_core::http` with `If-None-Match` / 304 round-trip; `title_details_with_etag` + `TmdbTitleDetailsFetch` on `TmdbClient`; new `fetch_tmdb_title_details_etag_cached` helper in `src-tauri::commands` wiring TMDB title-details through `response_cache.etag` at TTL `META_TTL_S = 24h`; all 6 existing `cache_set` call sites in `commands.rs` migrated to `None` etag; 22 new tests (7 in `kino-core::http`, 6 in `kino-core::db`, 5 in `kino-metadata::tmdb`, 4 in `kino-app::commands`); `wiremock` added to `kino-core` dev-deps so the new HTTP helper can be tested in isolation; clippy + fmt + workspace tests all green. F-003 stays `[ ]` pending TMDB credits + Trakt rating + TVDB title round-trip — filed as Session-032 scope.)
+**Next session:** 032 — recommended order from the remaining §6A Code-Acceptance Regressions section: (1) F-003 ETag expansion to TMDB credits + Trakt rating + TVDB title (medium scope: replicate the Session-031 pattern at three more per-resource call sites in `get_title_detail_uncached`, ~150 LOC counting tests), (2) F-015 Android DV decoder selector (~60 LOC), (3) F-013 / F-014 librqbit-blocked items (need an upstream PR, a fork, or a human PRD revision — file under "PRD Issues" if blocked), (4) F-015 Linux libmpv in-window GL surface (multi-session, ADR-108 deviation).
 
 ---
 
@@ -68,6 +68,221 @@ a hard requirement.
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 031 — F-003 ETag handling infrastructure + TMDB title_details demonstration
+
+**Branch:** `claude/session-001-bootstrap-AgWZb` (harness-supplied; see
+ADR-033 — the harness reuses a single branch name across all sessions
+for this checkout, the branch name does NOT track the session number).
+
+**Scope chosen:** F-003 ETag handling — Session 030's recommended #1
+remaining §6A regression. Picked because (a) the audit cited a
+specific, bounded gap (PRD §F-003 "ETag handled where the provider
+supports it; stored in `response_cache.etag`" — the column was
+unconditionally written as `NULL` and no client sent `If-None-Match`);
+(b) the closure plan in Session 027's audit explicitly outlined the
+plumbing ("thread `etag: Option<&str>` through `cache-set`; in
+`fetch_with_retry` set `If-None-Match` on cache hit; on 304 re-use +
+refresh expiry"); (c) it's pure infrastructure with one demonstrated
+call site, no UX implications, and fully unit-testable via wiremock;
+(d) the next-priority items (F-015 Android DV decoder, F-013 / F-014
+librqbit blockers) are either bigger or require upstream coordination
+the agent can't drive alone. Bundle size: ~430 LOC of production code
++ ~480 LOC of tests, all in the Rust workspace; no frontend touches
+(the frontend was rerun for sanity but unchanged).
+
+**Implementation:**
+
+1.  **`kino-core::http` ETag-aware fetch helper.** New public
+    `FetchOutcome { NotModified, Fresh { response, etag: Option<String> } }`
+    enum and `pub async fn fetch_with_etag<F>(build, prior_etag,
+    config) -> Result<FetchOutcome, HttpError>`. The implementation
+    adds `If-None-Match: <prior_etag>` to every retry attempt when
+    `prior_etag` is `Some`; on a 2xx response it parses the `ETag`
+    response header verbatim (RFC 7232 byte-for-byte echo on the next
+    `If-None-Match`) and returns `Fresh { response, etag }`; on `304
+    Not Modified` it returns `NotModified` WITHOUT triggering retry
+    (304 is the cache-hit success path, not a transient failure);
+    5xx / 429 / transient transport errors retry per the existing
+    backoff schedule. The pre-existing `fetch_with_retry` is now a
+    thin back-compat wrapper that calls `fetch_with_etag(build, None,
+    config)` and discards the etag from the Fresh branch — every
+    existing call site stays source-compatible. A `304` that arrives
+    via the back-compat wrapper (server misbehavior — no
+    `If-None-Match` was sent) is surfaced as
+    `HttpError::Http { status: 304, body: "unexpected 304 without
+    prior etag" }` rather than silently lost. See ADR-124.
+
+2.  **`kino-core::db` cache helpers extended with ETag.** `cache_set`
+    signature changed: `cache_set(key, payload_json, etag:
+    Option<&str>, expires_at)`. The UPSERT now binds the new `etag`
+    parameter so the previously-dead `response_cache.etag` column
+    carries data for callers that supply one. New
+    `cache_get_with_etag(key) -> Option<(String, Option<String>)>`
+    reads both columns; the existing `cache_get` becomes a thin
+    wrapper that strips the etag tuple element (no source change at
+    the existing 6 call sites in `commands.rs`). New
+    `cache_refresh_expiry(key, expires_at)` issues `UPDATE
+    response_cache SET expires_at = ? WHERE key = ?` for the 304
+    happy path; a no-op if the row is absent. See ADR-125.
+
+3.  **`commands.rs` migrated the 6 existing `cache_set` call sites to
+    pass `None`.** All 6 are AGGREGATED cache rows
+    (`get_trending_pools`, `get_weekly_trending`, `get_search`,
+    `resolve_artwork`, `list_home_catalogs`, the aggregated
+    `get_title_detail` row): the value isn't a single HTTP response
+    so there's no provider ETag to round-trip at this layer. `None`
+    is the correct value per PRD §F-003 "where the provider supports
+    it". See ADR-126 for why aggregated caches stay None.
+
+4.  **`TmdbClient::title_details_with_etag` — the per-resource
+    demonstration.** New method
+    `title_details_with_etag(tmdb_id, kind, language, prior_etag:
+    Option<&str>) -> Result<TmdbTitleDetailsFetch, Error>` returning
+    a new public `TmdbTitleDetailsFetch { NotModified, Fresh {
+    details, etag } }` enum. Internally calls `fetch_with_etag` with
+    the supplied `prior_etag` and either returns `NotModified` on
+    304 or `Fresh { details: parse(body), etag }` on 2xx. The
+    pre-existing `title_details` becomes a thin wrapper that passes
+    `prior_etag = None` and unwraps Fresh. A new private
+    `parse_title_details(body, ...)` factored out so both methods
+    share the field-plucking logic (5 fields: runtime, age rating,
+    genres, overview, rating). `TmdbTitleDetails` gained
+    `#[derive(Serialize, Deserialize)]` so the value can be
+    persisted in `response_cache.payload_json`. Re-exported from
+    `kino-metadata::lib` for downstream callers.
+
+5.  **`fetch_tmdb_title_details_etag_cached` — the wiring at the
+    consumer.** New helper in `src-tauri::commands` lives between
+    `get_title_detail_uncached` and `fetch_meta_for_title`:
+    *   Cache key: `tmdb:title_details:{tmdb_id}:{kind}:{language}`.
+        Language is encoded because TMDB returns localized overview /
+        genres / age_rating; the row's ETag is therefore
+        language-keyed too. See ADR-127.
+    *   TTL: `META_TTL_S = 86_400 s` (24h). Per-resource cache row
+        coexists with the AGGREGATED `get_title_detail` cache (no
+        change to the latter): aggregate is a merged TMDB+Trakt+
+        Cinemeta payload, the per-resource row is the raw TMDB
+        parsed value. On the aggregate's miss, the inner cache may
+        still produce a 304 short-circuit on TMDB, saving the
+        payload transfer.
+    *   Flow: call `db.cache_get_with_etag(&key)`; on hit, pass the
+        stored etag as `prior_etag`; on `Fresh { details, etag }`,
+        serialize and `cache_set(&key, &serialized, etag.as_deref(),
+        expires_at)`; on `NotModified`, `cache_refresh_expiry(&key,
+        expires_at)` and deserialize the previously-stored payload;
+        on any error, log warn and bubble the upstream `Error` so
+        the surrounding `get_title_detail_uncached` falls back to
+        its pre-Session-031 "log + continue without TMDB details"
+        behavior. Replaces the bare
+        `client.title_details(tmdb_id, kind, &primary_lang).await`
+        call inside the function's TMDB overlay block.
+
+6.  **Tests added (22 total).**
+    *   `kino-core::http::tests` (7 new): `fetch_with_etag` smoke
+        path with no prior etag, 304 yield-NotModified when prior
+        sent, 200-with-new-etag when prior sent but resource
+        changed, no-retry-on-304, retry-on-500-then-fresh-200,
+        tolerant absence of server ETag header, back-compat
+        `fetch_with_retry` surfaces unexpected 304 as
+        `HttpError::Http(304)`.
+    *   `kino-core::db::tests` (6 new): set-with-etag round-trips
+        through `cache_get_with_etag`, overwrite with new etag
+        replaces, overwrite with None clears the column,
+        `cache_refresh_expiry` preserves payload + etag and bumps
+        expiry, refresh revives previously-expired row, refresh on
+        missing key is a no-op, `cache_get` strips etag for
+        back-compat.
+    *   `kino-metadata::tmdb::tests` (5 new): wiremock-backed
+        round-trip on the four PRD §F-003 cases — fresh first call
+        with server ETag, 304 path with `If-None-Match` echo,
+        changed-resource 200 + new ETag, absent server ETag yields
+        None, back-compat `title_details` returns bare struct even
+        when server sends ETag.
+    *   `kino-app::commands::tests` (4 new): end-to-end through
+        `fetch_tmdb_title_details_etag_cached` against a wiremock
+        TMDB — first call persists etag in `response_cache.etag`,
+        second call sends `If-None-Match` + consumes 304,
+        changed-resource overwrites etag column, provider without
+        ETag header leaves column NULL. Together with the wiremock
+        `expect(N)` assertions these prove the `If-None-Match` is
+        actually transmitted by the production path — not just by
+        the unit test of `fetch_with_etag`.
+
+7.  **`wiremock` added to `kino-core` dev-deps.** Pulled from the
+    workspace dependency table to keep version drift out of the
+    kino-core / kino-metadata pair. The new HTTP tests need a mock
+    server to exercise 304 paths; placing them inline in `http.rs`
+    keeps the infra and its acceptance tests co-located.
+
+**Files changed:**
+
+*   `crates/kino-core/Cargo.toml` — added `wiremock` dev-dep.
+*   `crates/kino-core/src/http.rs` — `FetchOutcome` enum +
+    `fetch_with_etag` + `extract_etag` + `fetch_with_retry` back-
+    compat wrapper + 7 new tests.
+*   `crates/kino-core/src/db.rs` — `cache_set` etag param,
+    `cache_get_with_etag`, `cache_refresh_expiry`, `cache_get`
+    refactored as thin wrapper + 6 new tests.
+*   `crates/kino-metadata/src/tmdb.rs` — `TmdbTitleDetailsFetch`
+    enum, `title_details_with_etag` method,
+    `parse_title_details` private helper, `title_details`
+    refactored as wrapper, `TmdbTitleDetails` derives
+    Serialize/Deserialize + 5 new tests.
+*   `crates/kino-metadata/src/lib.rs` — re-export
+    `TmdbTitleDetailsFetch`.
+*   `src-tauri/src/commands.rs` — `fetch_tmdb_title_details_etag_
+    cached` helper, replaced raw `client.title_details(...)` call
+    inside `get_title_detail_uncached`, migrated 6 existing
+    `cache_set` callers to `, None,` arg + 4 new tests.
+
+**Verification:**
+
+*   `cargo fmt --check` ✓
+*   `cargo clippy --workspace --all-targets -- -D warnings` ✓
+*   `cargo test --workspace` ✓ (424 tests: 62 + 113 + 0 + 66 + 85 +
+    25 + 13 + 2 + 29 + 3 + 26 + 0×8 = 424 passing; up from 402
+    at end of Session 030)
+*   `cargo build -p kino-app` ✓ (Tauri Rust shell builds cleanly
+    on Ubuntu 24.04 with libwebkit2gtk-4.1-dev installed)
+*   Frontend (no changes, rerun for sanity): `npm run lint` ✓,
+    `npm run typecheck` ✓, `npm test` ✓ (234 tests)
+*   `cargo tauri build` / `cargo tauri android build` deferred to
+    CI per the standing authorization "wait for CI lint+test only,
+    not the full matrix".
+
+**ADRs filed:** see Architectural Decisions Log entries ADR-124
+(`FetchOutcome` enum vs Result-with-sentinel-status), ADR-125
+(`cache_set` signature break vs additive method), ADR-126
+(aggregated cache rows pass `None` etag), ADR-127 (cache key
+includes language for per-resource TMDB rows).
+
+**Why F-003 stays `[ ]` in the Feature Tracker.** The PRD §F-003
+contract item is "ETag handled where the provider supports it".
+Session 031 ships the infrastructure (every cache row, every HTTP
+caller can opt in) AND demonstrates it at one site (TMDB
+title_details). The defensible claim "TMDB title_details supports
+ETag and we now handle it" is true; the stronger claim "every
+ETag-supporting endpoint is wired" is not, because at minimum TMDB
+credits, Trakt title_rating, and TVDB title also support ETag and
+remain on the back-compat `fetch_with_retry`. The conservative
+read of the PRD wording keeps F-003 open. Filed as a Session-032
+follow-up below — the next session can replicate the Session-031
+pattern at the three remaining sites in ~150 LOC counting tests
+and flip the box.
+
+**Known issues introduced or resolved:**
+
+*   Resolved: `response_cache.etag` column no longer dead. Every
+    `cache_set` now carries an `Option<&str>` etag; the per-resource
+    TMDB title-details row populates it from the server response.
+*   Resolved: the `If-None-Match` request path exists and is unit-
+    tested end-to-end at one production call site.
+*   Open (filed): the PRD §F-003 ETag contract should extend to
+    every per-resource caller, not just TMDB title_details. Next
+    session.
+
+---
 
 ### Session 030 — F-006 frontend availability filter UI
 
@@ -7002,10 +7217,21 @@ implementation" split.
   per-provider HTTP clients with locked retry/User-Agent, `test_credentials()`
   on each, 4 Tauri test commands, 12 wiremock tests. **Re-opened by Session
   027 audit:** PRD §F-003 "ETag handled where the provider supports it;
-  stored in `response_cache.etag`" is unimplemented — `db.rs:388` writes
-  `etag = NULL` on UPSERT, no client sends `If-None-Match`, no `304 Not
-  Modified` path. See "§6A Code-Acceptance Regressions / F-003" for the
-  closure plan.)_
+  stored in `response_cache.etag`" was unimplemented — `db.rs` wrote
+  `etag = NULL` on UPSERT, no client sent `If-None-Match`, no `304 Not
+  Modified` path. **Partially closed by Session 031:** workspace-wide
+  infrastructure shipped (`cache_set(.., etag, expires_at)` +
+  `cache_get_with_etag` + `cache_refresh_expiry` in `kino_core::Db`;
+  `fetch_with_etag` + `FetchOutcome` in `kino_core::http`;
+  `title_details_with_etag` + `TmdbTitleDetailsFetch` on `TmdbClient`;
+  per-resource `fetch_tmdb_title_details_etag_cached` wiring TMDB
+  title-details through `response_cache.etag` at TTL `META_TTL_S = 24h`).
+  22 new tests. F-003 stays `[ ]` because the PRD wording ("ETag
+  handled where the provider supports it") implies coverage of every
+  per-resource caller — TMDB credits, Trakt title_rating, and TVDB
+  title still call the back-compat `fetch_with_retry`. See "§6A
+  Code-Acceptance Regressions / F-003" for the closure plan for the
+  remaining three sites.)_
 - [x] F-004: Trending aggregation with diversity _(Session 006: per-provider
   trending fetchers, the locked merge/split/alternate/seeded-shuffle
   aggregator, `get_trending` Tauri command, day-long output cache via
@@ -7345,6 +7571,10 @@ Additional ADRs filed by sessions:
 | ADR-121 | **F-006 `display.show_unavailable` lives in a frontend module-level Solid signal (`frontend/src/lib/displaySettings.ts`) that App.tsx hydrates at boot from `settingsGetAll().display.show_unavailable` and Settings.tsx writes to on every toggle.** PRD §F-006 implies the "Show unavailable titles" toggle re-renders catalog rows immediately. Persisted KV row is the source of truth at boot; the signal is the source of truth at runtime so already-mounted Home / sub-home / addon-catalog rows re-render reactively without a route remount. Pattern is identical to Session 010's `input/profile.ts::setOverride` — same hydration point in App.tsx, same Settings-side dual-write, same `_resetForTests` hook for vitest. Rejected alternatives: (a) re-fetch `settingsGetAll()` on every Home mount — works but loses the "live" feel (user has to navigate away + back); (b) Solid Router `navigate(path, { state })` — drops on `createMemoryHistory` per ADR-109, unusable in vitest; (c) Solid Store — overkill for one boolean. | 030 |
 | ADR-122 | **F-006 `check_availability` batching is per-row, with frontend-side dedup WITHIN a single batch.** PRD §F-006 reads "Batch availability check fired immediately when a catalog is loaded" — the simplest reading is "one batch per catalog row mount", which is what `HomeView` ships: one `createEffect` per data-bearing row (trending top / hidden gems / weekly / each addon catalog) that fires `dispatchAvailabilityFor(items)` when the resource resolves. Cross-row de-dup happens naturally backend-side via the existing 30-min `stream_availability` cache: row N's batch warms the cache for any title that also appears in row N+1, so row N+1's batch hits cache without re-dialing the addon. The frontend de-dups only WITHIN a single batch (two catalogs with overlapping items don't request the same `(kind, id)` twice in one tick — a single Set in `dispatchAvailabilityFor`). A future polish pass could collapse all batches into one global batch fired after every resource resolves; v1 ships the per-row pattern because it matches the PRD wording, keeps the per-row code self-contained, and the backend's existing 8-in-flight Semaphore + 30-min cache absorbs the duplication risk. | 030 |
 | ADR-123 | **F-006 availability filtering does NOT apply to Continue Watching tiles.** PRD §F-006 enumerates "trending, sub-homes, search results, or addon catalogs" as the F-006 contexts and does NOT list CW. CW is a user-action signal — the user has already watched the title, so a source MUST have been available at write time. If the source disappears later (addon uninstalled, etc.) hiding the resume tile would (a) surprise the user, who explicitly added it via Resume; (b) break the PRD §F-012 "manual remove via Y / Menu / right-click / long-press" path because there'd be no tile to act on. `HomeView` therefore never calls `checkAvailability` for CW items; the CW `<Row>` inherits the Row default of "every tile renders as available". Search is also skipped from frontend-side filtering, but for a different reason: the `search()` backend already runs F-006 server-side, so the frontend just renders whatever the backend returns. Title-detail cast row falls outside F-006 by construction (cast members aren't catalog items). | 030 |
+| ADR-124 | **F-003 ETag round-trip is modeled as a `FetchOutcome { NotModified, Fresh { response, etag } }` enum returned by a new `fetch_with_etag` helper, not as a sentinel HTTP status threaded through the existing `fetch_with_retry` Response.** Three rejected alternatives: (a) `fetch_with_retry` keeps its `Response` return and the caller inspects `response.status() == 304` — fails because by the time the caller checks the status, the body has been consumed; (b) a new `Result<Response, NotModified>` outer type — abuses Result for control flow that isn't an error path; (c) wrap the cache lookup inside `fetch_with_retry` itself with a `&Db` parameter — couples the workspace HTTP primitive to the persistence layer, which is exactly the layering Session 008 / ADR-055 lifted apart. The `FetchOutcome` enum mirrors what `kino_addons` already does for its `Manifest::serves_stream` decision points (Session 009): a small, public, structural answer that doesn't pretend to be a Result. `fetch_with_retry` remains the back-compat wrapper for every existing caller (one-line implementation: call `fetch_with_etag(.., None, ..)` and unwrap Fresh) so the lift is zero-blast-radius. | 031 |
+| ADR-125 | **`Db::cache_set` signature breaks (adds `etag: Option<&str>`) rather than introducing a parallel `cache_set_with_etag`.** PRD §F-003 says ETag is handled "where the provider supports it" — implying every cache row OUGHT to be ETag-aware; the column is part of the schema, not an extension. A parallel method would mean every future caller has to remember which one is the "correct" one to use, and the dead-NULL-etag failure mode that triggered the §6A re-open in the first place would be one accidental call site away from regressing. Breaking the signature forces every caller to make an explicit `etag` decision at call time, even if that decision is `None`. The migration cost was bounded (six call sites in `commands.rs` + four in the existing `db.rs` unit tests, all aggregated caches where `None` is correct), so the one-time pain bought a durable invariant. `cache_get` stays source-compatible (now a thin wrapper around `cache_get_with_etag` that strips the etag tuple element) because all eight of its call sites don't yet need the etag — they're in flows that don't round-trip revalidation. The Session-032 expansion will migrate them one at a time. | 031 |
+| ADR-126 | **Aggregated cache rows (F-004 trending, F-005 artwork, F-008 search, F-008 weekly trending, F-008 addon catalogs, F-010 aggregated title detail) pass `etag = None` to `cache_set`.** PRD §F-003 ETag round-trip is meaningful only when a cache row maps 1:1 with a single HTTP response — a 304 from a server applies to a SPECIFIC URL, and an aggregated row is the merged output of N upstream calls. The right place for ETag round-trip with aggregates is INSIDE the aggregation, at the per-resource layer (Session 031's TMDB title-details is the demonstration). The outer aggregate's `expires_at` is governed by the TTL (`META_TTL_S = 24h`, `ARTWORK_TTL_S = 7d`, etc.) and not by upstream change detection — that's already the case today, so this ADR just documents the gap rather than introducing it. The six existing call sites in `commands.rs` migrated to `, None,` without behavior change. | 031 |
+| ADR-127 | **Per-resource TMDB title-details cache key includes the language: `tmdb:title_details:{tmdb_id}:{kind}:{language}`.** TMDB's `/3/{movie,tv}/{id}?language=<lang>` returns localized `overview`, `genres`, `age_rating` — three of the six fields the F-010 title detail UI displays. The ETag the server returns is therefore per-language too: a `304 Not Modified` against an English-language `If-None-Match` confirms the English payload, not the French one. The key shape mirrors the OUTER aggregated cache key (`meta:{title_id}:{kind}:{chain_hash}` — which DOES hash the whole lang_pref chain rather than just `primary_lang`) but flattens to a single language because the per-resource TMDB call is itself per-language. A future enhancement could vary the resolver to walk the full lang_pref chain and cache each language separately under its own ETag; v1 ships the simpler "first language wins" pattern matching what `get_title_detail_uncached` already does at the aggregate layer (`primary_lang = lang_pref.first()`). | 031 |
 
 ---
 
@@ -7649,27 +7879,76 @@ highest-priority scope (alongside any open §6B Regressions); the
 closure of every entry below is required before `PRD COMPLETE` can
 be declared per the harness AGENT_PROMPT Step 15._
 
-### F-003 / ETag handling
+### F-003 / ETag handling — partially closed in Session 031
 
 **PRD §F-003 (locked):** "ETag handled where the provider supports
 it; stored in `response_cache.etag`".
 
-**Actual:** `crates/kino-core/src/db.rs:384` issues
+**Actual (pre-Session-031):** `crates/kino-core/src/db.rs:384` issued
 ```
 INSERT INTO response_cache (key, payload_json, etag, expires_at)
 ... etag = NULL, ...
 ```
 unconditionally on every cache UPSERT, and no `kino-metadata`
-client sends an `If-None-Match` header or handles a `304 Not
-Modified` response. The schema column is dead.
+client sent an `If-None-Match` header or handled a `304 Not
+Modified` response. The schema column was dead.
 
-**Closure plan:** thread an `etag: Option<&str>` parameter through
-the cache-set helper; in `crates/kino-core/src/http.rs::fetch_with_retry`,
-on cache hit with a non-NULL etag set the `If-None-Match` request
-header; on `304` re-use the cached payload and refresh
-`expires_at`. TMDB, Trakt, and TVDB all return ETags on most read
-endpoints; Fanart.tv is inconsistent so the absence-of-header path
-must be tolerant. Owner: next session that touches `kino-core::http`.
+**Resolution-in-progress (Session 031):** the workspace-wide
+infrastructure has shipped, and one per-resource site — TMDB title-
+details — round-trips ETag end-to-end through `response_cache`. The
+remaining work is replicating the same pattern at the other ETag-
+supporting per-resource sites; the infra is in place and every new
+site is a ~30 LOC opt-in.
+
+**Shipped:**
+- `kino_core::Db::cache_set` signature `(.., etag: Option<&str>,
+  expires_at)` — UPSERT now binds the etag column.
+- `kino_core::Db::cache_get_with_etag(key) -> Option<(String,
+  Option<String>)>` reads both columns; back-compat `cache_get`
+  strips etag.
+- `kino_core::Db::cache_refresh_expiry(key, expires_at)` covers the
+  `304 Not Modified` happy path.
+- `kino_core::http::FetchOutcome { NotModified, Fresh { response,
+  etag } }` + `fetch_with_etag(build, prior_etag, config)`. 304 is
+  a first-class cache-hit success, not a retry trigger.
+- `kino_core::http::fetch_with_retry` is now a back-compat wrapper
+  (calls `fetch_with_etag(.., None, ..)`); every pre-existing caller
+  stays source-compatible.
+- `TmdbClient::title_details_with_etag` + `TmdbTitleDetailsFetch`
+  enum; `TmdbTitleDetails` derives Serialize/Deserialize.
+- `src-tauri::commands::fetch_tmdb_title_details_etag_cached` wires
+  the TMDB title-details call inside `get_title_detail_uncached`
+  through `response_cache.etag` at cache key
+  `tmdb:title_details:{tmdb_id}:{kind}:{language}` with
+  `META_TTL_S = 24h`.
+
+**Remaining (Session 032 scope):** replicate the Session-031 pattern
+at the other PRD §F-003 ETag-supporting sites:
+
+1. **TMDB credits** (`TmdbClient::credits` — used by
+   `get_title_detail_uncached` right after `title_details`). Cache
+   key: `tmdb:credits:{tmdb_id}:{kind}`. TTL: `META_TTL_S`.
+   Estimated ~40 LOC.
+2. **Trakt title rating** (`TraktClient::title_rating` — used in the
+   same function). Cache key:
+   `trakt:title_rating:{imdb_id}:{kind}`. TTL: `META_TTL_S`.
+   Estimated ~40 LOC.
+3. **TVDB extended title** (`TvdbClient` — used by F-005 artwork
+   cascade; the aggregated artwork cache at the outer
+   `resolve_artwork` layer doesn't have a per-resource cache row
+   yet). Cache key: `tvdb:title:{tvdb_id}:{kind}:{language}`.
+   Slightly larger because the existing `TvdbClient` API may not
+   yet have an ergonomic seam for ETag like
+   `title_details_with_etag` did; budget ~70 LOC.
+
+Fanart.tv is intentionally not in scope: the provider is
+inconsistent about sending `ETag` (the audit's note), and the
+infra's tolerance of absent ETag (`fetch_with_etag` returns `etag:
+None` on missing header → cache row stores NULL → next read sends
+no `If-None-Match` → server returns fresh 200 normally) covers the
+"where the provider supports it" qualifier in PRD §F-003.
+
+Owner: Session 032 — recommended scope.
 
 ### ~~F-006 / Frontend availability filter UI~~ — RESOLVED in Session 030
 

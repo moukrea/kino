@@ -38,3 +38,8 @@ reqwest = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# Session 031 (F-003 ETag handling): the new `fetch_with_etag` / ETag
+# round-trip tests in `http.rs` exercise the 304 path against a mock
+# server. Sharing the workspace wiremock pin keeps version drift out
+# of the kino-core / kino-metadata pair.
+wiremock = { workspace = true }
