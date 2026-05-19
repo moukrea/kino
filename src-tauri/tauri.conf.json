@@ -42,7 +42,10 @@
     "longDescription": "kino is a multiplatform streaming client (Android, Android TV, Linux) that consumes the Stremio addon ecosystem, embeds librqbit with adaptive piece-deadline buffering, and ships a native player per platform (ExoPlayer on Android, libmpv on Linux). See PRD.md for full details.",
     "linux": {
       "deb": {
-        "depends": []
+        "depends": [
+          "libmpv2",
+          "libepoxy0"
+        ]
       },
       "appimage": {
         "bundleMediaFramework": true,
