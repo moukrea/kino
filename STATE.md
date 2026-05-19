@@ -1,9 +1,9 @@
 # kino — Agent State
 
 **PRD version:** 1.0 (locked)
-**Status:** v1.0.0-alpha.1 release pipeline shipped. Session 028 closed the §5 reliability bundle. **Session 029 closes the F-016 §4 directory picker AND F-016 §8 LICENSE-text accessor** in one tight bundle (~150 LOC counting the new `tauri-plugin-dialog` wiring + vite fs.allow widening), flipping **F-016** back to `[x]` in the Feature Tracker. Five §6A feature regressions remain open: F-003 (ETag handling), F-006 (frontend availability filter — single largest gap), F-013 / F-014 (librqbit-blocked: max-connections cap + piece-priority window assignment), F-015 (Android DV decoder selector + Linux libmpv in-window GL). **§6A is still not claimable.** See the F-016-closure rationale in the Session 029 entry below.
-**Last session:** 029 (F-016 §4 + §8 closure — `tauri-plugin-dialog` plugin wired on both Rust + frontend sides; "Browse…" Focusable button next to the cache-path TextField; Vite `?raw` LICENSE inline + in-app scrollable LICENSE modal; `dialog:allow-open` permission added to the default capability; `server.fs.allow: ['..']` in `vite.config.ts` so the cross-boundary import resolves under vitest; F-016 Feature Tracker checkbox flipped back to `[x]`)
-**Next session:** 030 — recommended order from the remaining §6A Code-Acceptance Regressions section: (1) F-006 frontend availability filter (entire UI surface missing — single largest gap remaining), (2) F-003 ETag handling (medium scope: thread `etag` through `cache-set` + `If-None-Match` + `304` path in `kino-core::http`), (3) F-015 Android DV decoder selector (~60 LOC), (4) F-013 / F-014 librqbit-blocked items (need an upstream PR, a fork, or a human PRD revision — file under "PRD Issues" if blocked), (5) F-015 Linux libmpv in-window GL surface (multi-session, ADR-108 deviation).
+**Status:** v1.0.0-alpha.1 release pipeline shipped. Session 028 closed the §5 reliability bundle. Session 029 closed F-016 §4 + §8. **Session 030 closes the F-006 frontend availability filter UI** — the single largest §6A gap called out by Session 027's audit. Backend (`check_availability` Tauri command, 30-min `stream_availability` cache, 8-in-flight semaphore, 5s timeout) was already shipped in Session 009; this session adds the entire frontend surface: per-tile `availability: "pending" | "available" | "unavailable"` discriminant on `<Tile>` with skeleton + "no source" badge variants, per-row filter + window logic on `<Row>`, a new `display.show_unavailable` setting (default OFF per PRD), per-row `check_availability` batches fired on Home / sub-home mount with backend de-dup, and a module-level `lib/displaySettings.ts` signal so toggling the setting re-renders catalog rows live without a route remount. F-006 flipped to `[x]` in the Feature Tracker. Four §6A feature regressions remain open: F-003 (ETag handling), F-013 / F-014 (librqbit-blocked: max-connections cap + piece-priority window assignment), F-015 (Android DV decoder selector + Linux libmpv in-window GL). **§6A is still not claimable.** See the F-006-closure rationale in the Session 030 entry below.
+**Last session:** 030 (F-006 frontend availability filter UI — `TileAvailability` discriminant + skeleton + "no source" badge on `<Tile>`; `itemAvailability` + `showUnavailable` props on `<Row>` with filter that drops unavailable tiles when the toggle is OFF; HomeView per-row `dispatchAvailabilityFor` batch with de-dup and network-error fallback to "available"; new `display.show_unavailable` setting key (Rust + frontend) defaulting to `false` per PRD; new `frontend/src/lib/displaySettings.ts` module-level signal hydrated by App.tsx at boot and written by Settings.tsx on toggle; new Settings → Display "Show unavailable titles" Focusable; 16 new tests (2 Rust + 3 Tile + 4 Row + 6 HomeView + 1 Settings); F-006 Feature Tracker checkbox flipped back to `[x]`)
+**Next session:** 031 — recommended order from the remaining §6A Code-Acceptance Regressions section: (1) F-003 ETag handling (medium scope: thread `etag` through `cache-set` + `If-None-Match` + `304` path in `kino-core::http`, ~80 LOC), (2) F-015 Android DV decoder selector (~60 LOC), (3) F-013 / F-014 librqbit-blocked items (need an upstream PR, a fork, or a human PRD revision — file under "PRD Issues" if blocked), (4) F-015 Linux libmpv in-window GL surface (multi-session, ADR-108 deviation).
 
 ---
 
@@ -68,6 +68,329 @@ a hard requirement.
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 030 — F-006 frontend availability filter UI
+
+**Branch:** `claude/kino-prd-compliance-oDjTL` (harness-supplied; see
+ADR-033 — the harness reuses a single branch name across all sessions
+for this checkout, the branch name does NOT track the session number).
+
+**Scope chosen:** F-006 frontend availability filter — Session 028's
+recommended #1 remaining §6A regression, and Session 029's recommended
+#1 remaining likewise. Picked because (a) the F-006 backend has been
+ready since Session 009 (`check_availability` Tauri command, 30-min
+`stream_availability` cache, 8-in-flight semaphore, 5s timeout, 22
+tests), so closing the frontend is pure UI plumbing with zero
+backend-design risk; (b) the PRD §F-006 acceptance criteria explicitly
+enumerate three tile states (Loading skeleton / Available / Unavailable
+hidden-by-default) and a Settings → Display toggle, all of which are
+testable structurally with the existing vitest + jsdom harness; (c) it
+is the single largest §6A regression by audit LOC count and clears the
+most user-visible PRD divergence remaining (every catalog row currently
+renders every tile unconditionally regardless of whether any addon can
+actually serve a stream). Bundle size: ~835 LOC total counting tests,
+or ~330 LOC of production code, sitting between the ~150-LOC F-016
+bundle (Session 029) and the multi-session F-015 Linux libmpv work.
+
+**Implementation:**
+
+1. **Backend setting (`src-tauri/src/settings.rs`).** New
+   `DISPLAY_SHOW_UNAVAILABLE_KEY = "display.show_unavailable"` constant
+   with PRD §F-006 doc-comment ("hidden by default"). Added to
+   `KNOWN_SETTINGS_KEYS` so `settings_reset_defaults` zeroes it. New
+   `show_unavailable: bool` field on `DisplayView` (default `false` via
+   `read_bool` in `load_view`). Validator branch in
+   `validate_setting` reuses the existing canonical-boolean
+   normalization. No live side-effect handler in `settings_set`
+   needed: the frontend reads the value via the existing
+   `settings_get_all` channel and the new `lib/displaySettings.ts`
+   signal (see #4 below) handles live propagation.
+
+2. **Frontend typed bindings (`frontend/src/lib/tauri.ts`).** Added
+   `show_unavailable: boolean` to the `DisplayView` type; added
+   `displayShowUnavailable: "display.show_unavailable"` to
+   `SETTING_KEYS`. New F-006 section:
+   `AvailabilityRequest = { title_id, type: TitleKind }`,
+   `AvailabilityResult = { title_id, type, available, source_count }`
+   (`type` is wire-serialized as the backend's `#[serde(rename = "type")]`
+   form). New `checkAvailability(items): Promise<AvailabilityResult[]>`
+   thin wrapper around `invoke("check_availability", { items })`.
+
+3. **New module `frontend/src/lib/displaySettings.ts`.** Module-level
+   `showUnavailable: Accessor<boolean>` signal initialized to `false`
+   (the PRD-locked default) with `setShowUnavailable(value)` writer and
+   `_resetForTests()` hook. Mirrors the established pattern from
+   `input/profile.ts` (`setOverride` / `_resetForTests`) and follows
+   the Cross-Session Convention "test-only `_resetForTests` exports".
+   This signal is the single source of truth at runtime; the persisted
+   `display.show_unavailable` KV row is the source of truth at boot.
+   See ADR-121 below.
+
+4. **`<Tile>` (`frontend/src/components/Tile.tsx`).** New exported
+   `TileAvailability = "pending" | "available" | "unavailable"` type
+   discriminant. New optional `availability` prop on `TileProps`
+   (omitted on rows that don't participate in F-006: CW, search
+   results which are server-filtered, future title-detail cast row).
+   When `availability === "pending"`: the `<img>` is replaced by an
+   `animate-pulse bg-neutral-700` skeleton block in the poster well,
+   the caption / info overlay are suppressed, and the button carries
+   `aria-busy="true"`. When `availability === "unavailable"`: the
+   poster still renders behind a muted `opacity-60` overlay AND a
+   top-left "no source" badge (`data-testid="tile-no-source-badge"`,
+   localized via `t("home.tileNoSource")`). When unset or
+   `"available"`: behavior is unchanged. `data-availability` attribute
+   is always set so consumer tests can structurally inspect tile state
+   without relying on visual rendering.
+
+5. **`<Row>` (`frontend/src/components/Row.tsx`).** Two new optional
+   props: `itemAvailability?: (s: TitleSummary) => TileAvailability`
+   (per-tile lookup keyed by the parent's availability map) and
+   `showUnavailable?: boolean` (PRD §F-006 user toggle). New
+   `filteredItems` memo drops `"unavailable"` tiles when the toggle is
+   OFF (the PRD-locked default); `"pending"` tiles are always kept
+   because they're the "availability unknown" state the row reserves
+   space for. The window-growth logic now ceilings on
+   `filteredItems().length` so a row that hid every unavailable tile
+   doesn't bloom past its rendered surface. The empty-fallback
+   predicate uses `filteredItems().length > 0` so an all-unavailable
+   row collapses to its empty placeholder (which the consumer can pass
+   `emptyFallback={null}` to hide entirely, matching the existing
+   CW-row pattern).
+
+6. **`HomeView` (`frontend/src/routes/Home.tsx`).** New per-mount
+   availability machinery: `availability` signal carrying a
+   `Map<string, TileAvailability>` keyed by `${kind}:${id}` (key
+   shape includes kind because the same `tmdb:603` can be a movie OR
+   a series under different addons). `tileAvailability(s)` accessor
+   passed to every `<Row>` as `itemAvailability`. `dispatchAvailability
+   For(items)` async function that de-dups `(kind, id)` pairs across
+   the call, batches the survivor list into one `checkAvailability`
+   request, and folds the result into the availability map; on
+   network error it falls back to "available" for the requested ids
+   so a transient backend hiccup doesn't strand the row in "pending"
+   indefinitely. Four `createEffect`s — one per data-bearing row that
+   F-006 lists (trending pools top, hidden gems, weekly, addon
+   catalogs) — fire `dispatchAvailabilityFor` when the corresponding
+   resource resolves. Continue Watching is intentionally NOT wired:
+   PRD §F-006 enumerates trending / sub-homes / search / addon
+   catalogs as the F-006 contexts, and hiding CW tiles when a source
+   briefly disappears would surprise the user. Search is also
+   skipped (the `search()` backend already runs F-006 server-side
+   per its existing test coverage). Each `<Row>` now receives both
+   `itemAvailability={tileAvailability}` and `showUnavailable={
+   showUnavailable()}` so the rendered set updates reactively the
+   moment the user toggles the Display setting.
+
+7. **App.tsx boot hydration.** Added one line in the existing
+   `settingsGetAll().then(...)` block: `setShowUnavailable(view.
+   display.show_unavailable)`. This mirrors the established
+   `setLocale(view.language.ui)` and `setInputOverride(view.display.
+   input_override)` lines, so all three persisted display-level
+   choices propagate at the same boot point.
+
+8. **Settings.tsx.** Imported `setShowUnavailable` from the new
+   module. Added one Toggle in `DisplaySection` (id
+   `settings-section-display-showunavailable`,
+   `labelKey="settings.display.showUnavailable"`) wired to the new
+   `props.view().display.show_unavailable` accessor; the `onChange`
+   first calls `setShowUnavailable(v)` so already-mounted Home /
+   sub-home routes re-render immediately, then `await
+   props.persist(SETTING_KEYS.displayShowUnavailable, boolStr(v))`
+   for durability. Settings.tsx's `DEFAULT_VIEW` fallback gained a
+   `show_unavailable: false` field to satisfy the typecheck.
+
+9. **Locales (`en.json` + `fr.json`).** Three new keys per locale:
+   `home.tileNoSource` ("no source" / "aucune source"),
+   `settings.display.showUnavailable` ("Show unavailable titles" /
+   "Afficher les titres sans source"), `settings.display.
+   showUnavailableHint` (longer explanation citing PRD §F-006, used
+   as a future-friendly i18n entry — the Toggle widget itself doesn't
+   currently render a hint sub-line, so this key is staged for a
+   future Settings polish pass).
+
+**Files changed:**
+
+- `src-tauri/src/settings.rs` — `DISPLAY_SHOW_UNAVAILABLE_KEY` const +
+  `KNOWN_SETTINGS_KEYS` entry + `DisplayView.show_unavailable` field +
+  `load_view` default-`false` read + `validate_setting` boolean
+  branch + 2 new tests (`load_view_reads_persisted_show_unavailable`,
+  `validate_setting_normalizes_show_unavailable`) + 1-line addition to
+  the existing default-view test.
+- `frontend/src/lib/tauri.ts` — `show_unavailable: boolean` on
+  `DisplayView`, `displayShowUnavailable` in `SETTING_KEYS`, new
+  `// ---- F-006: Source availability filter ---` section with
+  `AvailabilityRequest`, `AvailabilityResult`, and
+  `checkAvailability(items)`.
+- `frontend/src/lib/displaySettings.ts` — new module: `showUnavailable`
+  signal accessor, `setShowUnavailable` writer, `_resetForTests` hook.
+- `frontend/src/components/Tile.tsx` — `TileAvailability` type export,
+  optional `availability` prop, skeleton + "no source" badge variants,
+  `data-availability` attribute, `aria-busy` on pending, opacity
+  dimming on unavailable, t-key import.
+- `frontend/src/components/Row.tsx` — `TileAvailability` re-import,
+  `itemAvailability` + `showUnavailable` props, `filteredItems` memo,
+  window-growth ceiling adjustment, empty-fallback predicate fix,
+  per-Tile `availability` prop forwarding.
+- `frontend/src/routes/Home.tsx` — `createEffect` import,
+  `TileAvailability` import, `checkAvailability` import,
+  `showUnavailable` signal import, `availabilityKey` helper,
+  per-HomeView availability signal + `tileAvailability` accessor +
+  `dispatchAvailabilityFor` async batch dispatcher, four
+  `createEffect`s wiring per-row dispatch, four `<Row>` instances
+  receiving the two new props (CW row intentionally not wired).
+- `frontend/src/App.tsx` — `setShowUnavailable` import + one-line
+  hydration call in the existing `settingsGetAll` boot block.
+- `frontend/src/routes/Settings.tsx` — `setShowUnavailable` import,
+  `show_unavailable: false` on the `DEFAULT_VIEW` fallback, new
+  Toggle in `DisplaySection` with live-signal + persist on change.
+- `frontend/src/locales/en.json` — 3 new keys
+  (`home.tileNoSource`, `settings.display.showUnavailable`,
+  `settings.display.showUnavailableHint`).
+- `frontend/src/locales/fr.json` — French translations of the same
+  3 keys.
+- `frontend/src/components/Tile.test.tsx` — 3 new tests: pending →
+  skeleton + aria-busy + no `<img>`; unavailable → badge + opacity
+  + poster still visible; default (no `availability` prop) →
+  available behavior + no skeleton + no badge.
+- `frontend/src/components/Row.test.tsx` — 4 new tests: hide
+  unavailable by default; show unavailable with badge when toggle
+  is ON; pending tiles always rendered; all-unavailable row
+  collapses to the empty fallback.
+- `frontend/src/routes/HomeView.test.tsx` — 6 new tests in a new
+  `describe("HomeView availability filter (F-006)", …)` block:
+  batched per-row dispatch with both items in one call; hide
+  unavailable tiles by default; show with badge when signal is ON;
+  pending skeleton while batch is in flight; CW tiles are NOT
+  availability-filtered AND the CW request is never sent to
+  `check_availability`; network error fallback to "available".
+  `checkAvailability` mock added to all three existing describe
+  blocks' `beforeEach`, plus `displaySettings._resetForTests()`
+  added to keep the signal isolated across tests.
+- `frontend/src/routes/Settings.test.tsx` — `show_unavailable: false`
+  added to the `defaultView()` factory; new D-pad coverage id
+  `settings-section-display-showunavailable` in the assertion list;
+  one new test "PRD §F-006: persists the show-unavailable toggle AND
+  updates the live signal" exercising both the `settingsSet` write
+  AND the `displaySettings.showUnavailable()` reactive update.
+- `frontend/src/routes/TitleDetail.test.tsx` — `checkAvailability`
+  stub added to the existing `vi.mock("../lib/tauri", …)` block so
+  the Home-transit test in the file doesn't emit a `check_availability
+  failed` console.warn from the unmocked `invoke` call.
+
+**ADRs filed:**
+
+- **ADR-121: F-006 show_unavailable live propagation via a module-
+  level Solid signal.** The PRD-locked behavior is that toggling
+  "Show unavailable titles" in Settings re-renders catalog rows
+  immediately. The persisted KV value is the source of truth at
+  boot; at runtime we keep the value in a `frontend/src/lib/
+  displaySettings.ts` `createSignal` so Solid's reactivity can
+  push the change into every mounted `<Row>` without a route
+  remount. App.tsx seeds the signal from `settingsGetAll().display.
+  show_unavailable`; Settings.tsx writes to it on every toggle
+  alongside the `settingsSet` persistence call. Alternatives
+  considered: (a) re-fetch `settingsGetAll` on every Home mount —
+  works but loses the "live" feel because the user has to navigate
+  away and back; (b) Solid Router state — drops on
+  `createMemoryHistory` (the vitest jsdom path), unusable; (c)
+  global Solid Store — overkill for one boolean. The module-level
+  signal pattern is identical to `input/profile.ts::setOverride`
+  established in Session 010 and already documented in the
+  Cross-Session Conventions block.
+
+- **ADR-122: F-006 batch dispatch is per-row, with frontend-side
+  de-dup.** PRD §F-006 says "Batch availability check fired
+  immediately when a catalog is loaded". The simplest reading is
+  "one batch per row mount", which is what we ship: each of the
+  four data-bearing HomeView rows fires its own
+  `dispatchAvailabilityFor(items)` via a `createEffect` keyed on
+  the relevant resource. Cross-row de-dup happens naturally
+  backend-side via the 30-min `stream_availability` cache: row 2's
+  batch warms the cache for any title that also appears in row 3,
+  so row 3's batch hits cache without re-dialing the addon. The
+  frontend side de-dups WITHIN a single batch (so two catalogs
+  with overlapping items don't request the same `(kind, id)`
+  twice in one tick). A future polish pass could collapse all
+  four batches into one global batch fired after every resource
+  resolves; v1 ships the per-row pattern because it matches the
+  PRD wording, keeps the per-row code self-contained, and the
+  backend's existing 8-in-flight Semaphore + cache absorbs the
+  duplication risk.
+
+- **ADR-123: F-006 CW row is exempt from availability filtering.**
+  PRD §F-006 enumerates "trending, sub-homes, search results, or
+  addon catalogs" as the F-006 contexts and does NOT list
+  Continue Watching. CW is a user-action signal — the user has
+  already watched the title, so the source MUST have been
+  available at write time. If the source disappears later
+  (addon uninstalled, etc.), hiding the resume tile would
+  surprise the user and break the locked PRD §F-012 "manual
+  remove via Y / Menu / right-click / long-press" path because
+  there'd be no tile to act on. Session 030's `HomeView` therefore
+  never calls `checkAvailability` for CW items; the CW `<Row>`
+  inherits the Row default of "every tile renders as available".
+  Acceptance test
+  `HomeView.test.tsx` > "PRD §F-006: Continue Watching tiles are
+  NOT availability-filtered" structurally asserts both the
+  visibility AND the no-network-call invariant.
+
+**Features advanced:** **F-006 toggled `[ ] → [x]`** in the Feature
+Tracker. PRD §F-006 code-acceptance items now structurally satisfied:
+"catalog of 50 items renders only available tiles" → `<Row>`'s
+`filteredItems` memo + `dispatchAvailabilityFor`; "toggling 'show
+all' reveals unavailable tiles with a badge" → the new Display
+toggle + Tile's `unavailable` branch + ADR-121's live signal;
+"`stream_availability` table populated correctly" → already shipped
+in Session 009's backend; "unit tests cover concurrency cap,
+timeout, cache hit, cache miss" → already shipped in Session 009.
+
+**Tests added (16 new):**
+
+- Rust (2): `settings::tests::load_view_reads_persisted_show_unavailable`,
+  `settings::tests::validate_setting_normalizes_show_unavailable`.
+- Tile (3): pending skeleton + aria-busy; unavailable badge + opacity;
+  default no-prop → available.
+- Row (4): hide unavailable by default; show with badge when
+  `showUnavailable` ON; pending always visible; all-unavailable →
+  empty fallback.
+- HomeView (6): batched per-row dispatch; hide unavailable by default;
+  show with badge when signal ON; pending skeleton while batch is
+  in flight; CW tiles not filtered AND never requested; network
+  error fallback to "available".
+- Settings (1): new toggle persists + updates live signal.
+
+Plus a stub-update in TitleDetail.test.tsx to silence the now-firing
+`check_availability` call from the file's Home-transit test (no new
+test, just a mock entry in the existing `vi.mock` block).
+
+Total: 234 frontend tests pass (was 217 pre-session), 401 Rust
+tests pass (was 399 pre-session). `cargo fmt --check` clean,
+`cargo clippy --workspace --all-targets -- -D warnings` clean,
+`npm run typecheck` clean, `npm run lint` clean.
+
+**Known issues introduced or resolved:**
+
+- **RESOLVED:** F-006 frontend availability filter UI (Session 027
+  audit finding, single largest §6A regression). The Known Issues
+  entry and the §6A Code-Acceptance Regressions entry are both
+  marked RESOLVED in Session 030 below.
+
+- **Not introduced** but worth noting for future-session attention:
+  the `home.tileNoSource` localized string is currently rendered
+  in a fixed top-left position on the tile. Visual-polish-pass
+  candidates: dynamic positioning based on focus / poster aspect
+  ratio, color customization via the high-contrast theme toggle,
+  and a tooltip on hover explaining "no enabled addon currently
+  serves this title". None are blocking for §6A.
+
+**Next session priorities:** F-003 ETag handling (~80 LOC, medium
+scope — see "§6A Code-Acceptance Regressions / F-003" below for the
+closure plan). After F-003: F-015 Android DV decoder selector
+(~60 LOC, small scope, see "§6A / F-015 Android DV decoder forcing").
+F-013 / F-014 / F-015 Linux libmpv remain blocked on librqbit-API
+limitations OR Wayland surface negotiation work and need a human
+decision (PRD revision, upstream PR, fork) before another session
+can productively close them.
 
 ### Session 029 — F-016 §4 directory picker + F-016 §8 LICENSE-text accessor
 
@@ -6692,21 +7015,29 @@ implementation" split.
   `resolve_artwork` Tauri command, 7-day cache via `response_cache`
   keyed by `(title_id, kind, lang_chain_hash)`, cross-provider id
   resolution via TMDB `/find` + `/external_ids`, 27 tests)_
-- [ ] F-006: Source availability filter _(Session 009 shipped the
-  BACKEND only: `check_availability(items)` Tauri command with
+- [x] F-006: Source availability filter _(Session 009 shipped the
+  BACKEND: `check_availability(items)` Tauri command with
   Semaphore-bounded 8-in-flight concurrency, 5s per-request timeout
   (reqwest-native), 30-min `stream_availability` cache, per-addon
   stream-resource + kind manifest filter; `Manifest::serves_stream`
   helper in kino-addons; three new `Db` methods
   (`availability_get_fresh` / `availability_list_fresh` /
-  `availability_upsert_many`); 22 tests. **Re-opened by Session 027
-  audit:** the FRONTEND surface required by PRD §F-006 is missing —
-  catalog rows never call `check_availability`, there's no tile
-  loading-skeleton state, no "no source" badge, and the "Show
-  unavailable titles" toggle does not exist in Settings (the
-  default-OFF behavior PRD locks). All catalog rows render every
-  tile unconditionally. See "§6A Code-Acceptance Regressions /
-  F-006" for the closure plan.)_
+  `availability_upsert_many`); 22 tests. Re-opened by Session 027
+  audit; **closed again by Session 030:** entire frontend surface
+  shipped per PRD §F-006 — `TileAvailability = "pending" |
+  "available" | "unavailable"` discriminant on `<Tile>` with
+  skeleton + "no source" badge variants, `itemAvailability` +
+  `showUnavailable` props on `<Row>` with filter + window logic,
+  HomeView per-row `dispatchAvailabilityFor` batches fired on
+  resource resolution with frontend-side de-dup + network-error
+  fallback to "available", new `display.show_unavailable` Settings
+  toggle (default OFF per PRD), new `lib/displaySettings.ts`
+  module-level signal hydrated by App.tsx at boot + written by
+  Settings.tsx on every toggle so live propagation works without a
+  route remount (ADR-121); 14 new frontend tests + 2 new Rust
+  tests. CW row intentionally exempt per ADR-123. The §6A
+  Code-Acceptance Regressions entry is flipped to **RESOLVED**
+  below.)_
 - [x] F-007: Stremio addon protocol client _(Session 008: `AddonClient`
   covering all seven Stremio protocol endpoints, manifest validation,
   `stremio://` URL normalization, `install_addon` / `uninstall_addon`
@@ -7011,6 +7342,9 @@ Additional ADRs filed by sessions:
 | ADR-118 | **§6A condition 2 is interpreted strictly: an ADR that defers a PRD-locked code-acceptance criterion does NOT entitle the owning `F-XXX` to remain `[x]`.** PRD §6A.2 reads "Every code-acceptance criterion within each F-XXX is verifiably satisfied by code on `main`" — without an "or documented as deferred via ADR" escape clause. Prior sessions filed ADR-095 (directory picker as text input), ADR-103 (no `max_connections_per_torrent`), ADR-106 (no piece-priority window assignment), and ADR-108 (Linux mpv subprocess instead of in-window GL) framing each as "acceptable v1 polish gap"; the audit re-classifies all four as §6A regressions and flips their owning checkboxes (F-016, F-013, F-014, F-015) back to `[ ]`. Resolution options when an ADR-blocked criterion is genuinely unreachable inside the workspace's current dependency surface: (a) upstream PR + version bump, (b) fork the dependency, (c) swap the dependency, (d) file under "PRD Issues" with a concrete revision proposal so the human can amend the PRD. Picking (a)-(c) closes the regression; picking (d) only closes it once the human-edited PRD lands. This ADR does not retroactively invalidate any other ADR — ADRs 095 / 103 / 106 / 108 remain valid records of what shipped — but it does establish that "shipped behind an ADR" is NOT a substitute for the PRD-locked acceptance criterion at the §6A door. | 027 |
 | ADR-119 | **Runtime-reloadable `tracing` filter via `tracing_subscriber::reload::Layer` + type-erased applier closure stored under `commands::LogFilterHandle`.** PRD §5 Logging locks "INFO default, DEBUG when 'advanced logging' toggle is on in settings"; satisfying this without a process restart requires the filter layer to be mutable at runtime. `tracing_subscriber::reload::Layer::new(filter)` returns a `(layer, handle)` pair where `handle.modify(\|f\| *f = new_filter)` swaps the filter live. The handle's type carries the surrounding subscriber stack (`reload::Handle<L, S>`), which makes direct storage in Tauri-managed state cumbersome — `install_subscriber()` builds two different stacks depending on whether the rolling-file appender installs successfully. Solution: erase the type behind a `LogFilterApplier = Box<dyn Fn(&str) -> Result<(), String> + Send + Sync>` closure that captures the reload handle by move and accepts an `EnvFilter` directive string. Tauri-managed state stores the same applier type in both subscriber-stack branches, and the side-effect lives entirely on the Rust side: `settings_set` watches the `display.advanced_logging` key and flips the filter to `debug` / `info` after the KV write succeeds — no second IPC round-trip needed. Rejected alternatives: (a) a separate `set_log_level` Tauri command + frontend-driven dual-write, which doubles the IPC cost and risks the live filter drifting from persisted state on partial failure; (b) an `Arc<RwLock<EnvFilter>>` shared with a custom `Filter` impl, which would require re-implementing what `reload::Layer` already provides. Boot-time path reads `display.advanced_logging` from the KV table directly after `Db::open` and applies the persisted level once; `settings_reset_defaults` resets the live filter to `info` after wiping the KV row so the live process matches the just-reset on-disk state by construction. | 028 |
 | ADR-120 | **The Rust panic hook is installed at the top of `run()`, BEFORE `tauri::Builder::default()`, rather than inside the `setup()` closure that hosts `install_subscriber()`.** PRD §5 Reliability locks "Panic hook installed in Rust; panics logged with backtrace before exit". Installing inside `setup()` was the obvious place but loses any panic that happens during Tauri builder construction (window-init crashes, plugin-init failures). Installing at the top of `run()` means: (a) the chained default hook is always available, so even a panic with no tracing subscriber yet still prints to stderr with a backtrace; (b) once `install_subscriber()` runs inside `setup()`, the same hook also writes to the rolling daily log file the user can ship via Export Logs; (c) the hook captures `std::backtrace::Backtrace::force_capture()` regardless of `RUST_BACKTRACE` env so a §6B field crash always lands with a backtrace artifact. Payload decoding tries `&'static str` → `String` → `"Box<dyn Any>"` fallback so library panics with custom payload types still log something useful. | 028 |
+| ADR-121 | **F-006 `display.show_unavailable` lives in a frontend module-level Solid signal (`frontend/src/lib/displaySettings.ts`) that App.tsx hydrates at boot from `settingsGetAll().display.show_unavailable` and Settings.tsx writes to on every toggle.** PRD §F-006 implies the "Show unavailable titles" toggle re-renders catalog rows immediately. Persisted KV row is the source of truth at boot; the signal is the source of truth at runtime so already-mounted Home / sub-home / addon-catalog rows re-render reactively without a route remount. Pattern is identical to Session 010's `input/profile.ts::setOverride` — same hydration point in App.tsx, same Settings-side dual-write, same `_resetForTests` hook for vitest. Rejected alternatives: (a) re-fetch `settingsGetAll()` on every Home mount — works but loses the "live" feel (user has to navigate away + back); (b) Solid Router `navigate(path, { state })` — drops on `createMemoryHistory` per ADR-109, unusable in vitest; (c) Solid Store — overkill for one boolean. | 030 |
+| ADR-122 | **F-006 `check_availability` batching is per-row, with frontend-side dedup WITHIN a single batch.** PRD §F-006 reads "Batch availability check fired immediately when a catalog is loaded" — the simplest reading is "one batch per catalog row mount", which is what `HomeView` ships: one `createEffect` per data-bearing row (trending top / hidden gems / weekly / each addon catalog) that fires `dispatchAvailabilityFor(items)` when the resource resolves. Cross-row de-dup happens naturally backend-side via the existing 30-min `stream_availability` cache: row N's batch warms the cache for any title that also appears in row N+1, so row N+1's batch hits cache without re-dialing the addon. The frontend de-dups only WITHIN a single batch (two catalogs with overlapping items don't request the same `(kind, id)` twice in one tick — a single Set in `dispatchAvailabilityFor`). A future polish pass could collapse all batches into one global batch fired after every resource resolves; v1 ships the per-row pattern because it matches the PRD wording, keeps the per-row code self-contained, and the backend's existing 8-in-flight Semaphore + 30-min cache absorbs the duplication risk. | 030 |
+| ADR-123 | **F-006 availability filtering does NOT apply to Continue Watching tiles.** PRD §F-006 enumerates "trending, sub-homes, search results, or addon catalogs" as the F-006 contexts and does NOT list CW. CW is a user-action signal — the user has already watched the title, so a source MUST have been available at write time. If the source disappears later (addon uninstalled, etc.) hiding the resume tile would (a) surprise the user, who explicitly added it via Resume; (b) break the PRD §F-012 "manual remove via Y / Menu / right-click / long-press" path because there'd be no tile to act on. `HomeView` therefore never calls `checkAvailability` for CW items; the CW `<Row>` inherits the Row default of "every tile renders as available". Search is also skipped from frontend-side filtering, but for a different reason: the `search()` backend already runs F-006 server-side, so the frontend just renders whatever the backend returns. Title-detail cast row falls outside F-006 by construction (cast members aren't catalog items). | 030 |
 
 ---
 
@@ -7130,21 +7464,20 @@ Additional ADRs filed by sessions:
   all return ETags on most read endpoints; Fanart.tv is
   inconsistent so the absence-of-header path must be tolerant.
   ~80 LOC including the wiremock test.
-- **F-006 frontend availability filter UI missing entirely
-  (Session 027 audit finding).** Backend ready since Session 009.
-  Frontend never invokes `check_availability` and has no
-  skeleton / hidden / badged tile states. Closure plan: extend
-  the existing `<Row>` / `<Tile>` API so each tile carries an
-  `availability: "pending" | "available" | "unavailable"` field
-  derived from a per-row `check_availability` batch call fired
-  on row mount (debounced behind the virtualization window so
-  pages of 1000 tiles don't all dispatch at once); render
-  `pending` as a skeleton (already exists for the empty-state
-  placeholder), `unavailable` as either hidden OR a badged tile
-  depending on the new `display.show_unavailable` Display
-  setting (default OFF per PRD §F-006); add the toggle to
-  Settings → Display following the existing dual-writer
-  pattern. ~120 LOC including the Settings widget and tests.
+- ~~**F-006 frontend availability filter UI missing entirely
+  (Session 027 audit finding).**~~ **RESOLVED in Session 030** —
+  `<Tile>` gained an optional `availability` discriminant
+  rendering skeleton (`pending`) / "no source" badge
+  (`unavailable`) / default (`available`); `<Row>` gained
+  `itemAvailability` + `showUnavailable` props with a filter that
+  drops unavailable tiles when the toggle is OFF; `HomeView` fires
+  per-row `dispatchAvailabilityFor` batches with frontend-side
+  de-dup; new `display.show_unavailable` setting (default OFF) +
+  Settings → Display Toggle; new `lib/displaySettings.ts`
+  module-level signal hydrated at boot and written on every toggle
+  so live propagation works without a route remount (ADR-121).
+  CW row exempt per ADR-123. See the §6A Code-Acceptance
+  Regressions entry for the full resolution details.
 - **F-016 §4 directory picker is a text input, NOT a picker
   (Session 027 audit finding).** ADR-095 documented the
   shortcut; the audit re-classifies as §6A regression. Closure
@@ -7338,7 +7671,7 @@ header; on `304` re-use the cached payload and refresh
 endpoints; Fanart.tv is inconsistent so the absence-of-header path
 must be tolerant. Owner: next session that touches `kino-core::http`.
 
-### F-006 / Frontend availability filter UI
+### ~~F-006 / Frontend availability filter UI~~ — RESOLVED in Session 030
 
 **PRD §F-006 (locked):**
 > - Tile rendering states: **Loading** (skeleton): default while
@@ -7348,20 +7681,65 @@ must be tolerant. Owner: next session that touches `kino-core::http`.
 > - Setting "Show unavailable titles" (default OFF) toggles
 >   unavailable tiles to render with a "no source" badge
 
-**Actual:** zero references to `check_availability` /
-`stream_availability` exist in `frontend/src/` (verified by grep).
-`Home.tsx:310-354` renders every tile unconditionally. There is no
-"Show unavailable titles" toggle in `Settings.tsx`. The skeleton
-state is only used as a top-level loading placeholder, not as a
-per-tile pending-availability indicator.
+**Resolution (Session 030):** the entire frontend surface for F-006
+ships in one session.
 
-**Closure plan:** see the Known Issues entry above for the
-~120-LOC sketch. Wire one batched `check_availability` call per
-row mount (debounced behind the F-008 virtualization window),
-extend the `<Tile>` props with an `availability: "pending" |
-"available" | "unavailable"` discriminant, gate hidden-vs-badged
-rendering on a new `display.show_unavailable` boolean setting
-(default OFF per PRD), and add the toggle to Settings → Display.
+- **Tile rendering states.** `<Tile>` now carries an optional
+  `availability: "pending" | "available" | "unavailable"` prop
+  (`TileAvailability` exported from `Tile.tsx`). `"pending"`
+  swaps the poster `<img>` for an `animate-pulse` skeleton block
+  (`data-testid="tile-skeleton"`) AND sets `aria-busy="true"`;
+  `"available"` (the default when the prop is omitted) is the
+  pre-Session-030 behavior unchanged; `"unavailable"` overlays a
+  static top-left "no source" badge
+  (`data-testid="tile-no-source-badge"`, localized via
+  `t("home.tileNoSource")`) on top of the poster and dims the
+  tile via `opacity-60`. The `data-availability` attribute on the
+  rendered `<button>` exposes the state for structural assertions.
+- **Hidden-by-default policy.** `<Row>` gained two props:
+  `itemAvailability?: (s: TitleSummary) => TileAvailability` and
+  `showUnavailable?: boolean`. The Row's `filteredItems` memo
+  drops `"unavailable"` tiles from the rendered set when
+  `showUnavailable === false` (the PRD-locked default);
+  `"pending"` tiles stay rendered so the row reserves space for
+  the eventual result. Window-growth ceiling adjusted to
+  `filteredItems().length` so a row whose every odd tile is
+  unavailable doesn't bloom past its rendered surface.
+- **"Show unavailable titles" Settings toggle.** New
+  `DISPLAY_SHOW_UNAVAILABLE_KEY = "display.show_unavailable"`
+  backend constant (default `false`), validator branch,
+  `KNOWN_SETTINGS_KEYS` entry, and `DisplayView.show_unavailable`
+  field. New Toggle in `DisplaySection`
+  (`settings-section-display-showunavailable`) added to the D-pad
+  coverage assertion list.
+- **Live propagation.** New `frontend/src/lib/displaySettings.ts`
+  module-level signal seeded at boot from
+  `settingsGetAll().display.show_unavailable` (App.tsx) and
+  written by Settings.tsx on every toggle so already-mounted Home
+  / sub-home rows re-render without a route remount (ADR-121).
+- **Per-row batched dispatch.** `HomeView` fires one
+  `dispatchAvailabilityFor(items)` per row via a `createEffect`
+  keyed on the relevant resource (PRD §F-006: "Batch availability
+  check fired immediately when a catalog is loaded"). The async
+  function de-dups `(kind, id)` pairs within the batch, posts the
+  survivor list to the existing Session-009
+  `check_availability` Tauri command, and folds the result into
+  a shared `Map<string, TileAvailability>` consulted by every
+  row's `itemAvailability` accessor. On network error the
+  function falls back to "available" so the row doesn't strand
+  in "pending" indefinitely. CW row exempt per ADR-123.
+
+PRD code-acceptance items now all satisfied: "catalog of 50 items
+renders only available tiles" → Row filter + per-row dispatch;
+"toggling 'show all' reveals unavailable tiles with a badge" →
+toggle + signal + Tile's unavailable branch; "`stream_availability`
+table populated correctly post-check" → Session 009's existing
+backend; "unit tests cover concurrency cap, timeout, cache hit,
+cache miss" → Session 009's existing 22 backend tests + 14 new
+frontend tests on the UI surface.
+
+See Session 030 entry above for full file list, ADR-121 / 122 /
+123 rationales, and test coverage.
 
 ### F-013 / Max connections per torrent
 
@@ -7813,3 +8191,40 @@ Populated as conventions are established:
   alternative — `createMemoryHistory` (vitest jsdom) drops it
   silently, killing test seedability. The reading route reads
   ONCE on mount and clears on teardown.
+- **Live-toggle display settings via module-level signals**
+  (ADR-121, Session 030). When a Settings → Display toggle
+  influences live rendering on already-mounted catalog rows
+  (PRD §F-006 `display.show_unavailable` is the founding
+  example), declare a module under
+  `frontend/src/lib/<feature>Settings.ts` with a private
+  `createSignal` defaulted to the PRD-locked default, exposed via
+  a reactive `<setting>()` accessor + `set<Setting>(value)` writer
+  + `_resetForTests()` hook. App.tsx hydrates the signal at boot
+  from `settingsGetAll().<view-path>`; Settings.tsx calls the
+  setter on every persist alongside the `settingsSet` call so the
+  signal is reactive across route boundaries. Consumer routes
+  import the accessor and pass it through Solid's reactive system
+  (typically via a component prop on `<Row>` / `<Tile>` /
+  whatever surface renders the affected state). Pattern is
+  parallel to ADR-109's `<feature>Session.ts` cross-route handoff
+  but distinguished by `Settings.ts` (long-lived, KV-backed) vs
+  `Session.ts` (per-navigation, transient).
+- **F-006 per-tile availability discriminant on `<Tile>` +
+  `<Row>`** (Session 030). The `<Tile>` `availability` prop
+  carries `"pending" | "available" | "unavailable"` per tile;
+  `<Row>` accepts an `itemAvailability` accessor + a
+  `showUnavailable` boolean and applies the PRD-locked hide-by-
+  default policy via the `filteredItems` memo. Future surfaces
+  rendering catalog tiles (e.g. a "more like this" detail row, a
+  per-addon catalog browser, a future genre-filtered surface)
+  SHOULD plumb both props from the parent route's availability
+  map + the `showUnavailable()` signal from
+  `lib/displaySettings.ts`. Surfaces that DO NOT participate in
+  F-006 (Continue Watching per ADR-123, server-filtered search
+  results, the title-detail cast row) leave both props unset and
+  the Row treats every tile as `"available"`. The Tile
+  `data-availability` attribute IS the canonical structural
+  assertion target for tests (see `Tile.test.tsx` /
+  `Row.test.tsx` / `HomeView.test.tsx` F-006 sections); avoid
+  asserting on the visual classes directly, those are tuning
+  knobs that may evolve.

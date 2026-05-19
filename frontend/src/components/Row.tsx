@@ -39,7 +39,7 @@ import {
 } from "solid-js";
 
 import { focusedId } from "../input/focus";
-import { Tile } from "./Tile";
+import { Tile, type TileAvailability } from "./Tile";
 import type { TitleSummary } from "../lib/tauri";
 
 /**
@@ -98,6 +98,24 @@ export type RowProps = {
    */
   itemBadge?: (summary: TitleSummary) => string | null;
   /**
+   * PRD §F-006 per-tile availability accessor. Catalog rows (trending,
+   * weekly, addon) wire this from the backend `check_availability`
+   * batch result so each tile renders skeleton / available / "no
+   * source" badge per the PRD-locked policy. Rows that opt out (CW,
+   * search — server-filtered) leave it unset; the Row treats every
+   * tile as `"available"` in that case.
+   */
+  itemAvailability?: (summary: TitleSummary) => TileAvailability;
+  /**
+   * PRD §F-006 "Show unavailable titles" toggle. When `false` (PRD
+   * default) the Row drops tiles whose [`itemAvailability`] returned
+   * `"unavailable"` from the rendered set entirely. When `true`,
+   * unavailable tiles render with the Tile's "no source" badge.
+   * `"pending"` tiles are always rendered regardless — the skeleton
+   * IS the "availability unknown" state per the PRD.
+   */
+  showUnavailable?: boolean;
+  /**
    * Optional rendering override for empty rows. Default is a single-
    * line muted placeholder; callers like the home screen can pass
    * `null` to render nothing (useful for the CW row whose empty state
@@ -115,17 +133,34 @@ export const Row: Component<RowProps> = (props) => {
   // it never shrinks, so user navigation stays smooth across the row.
   const [windowSize, setWindowSize] = createSignal(INITIAL_WINDOW);
 
-  const visibleItems = createMemo(() =>
-    props.items.slice(0, Math.min(props.items.length, windowSize())),
-  );
+  const availabilityFor = (s: TitleSummary): TileAvailability =>
+    props.itemAvailability?.(s) ?? "available";
+
+  // PRD §F-006: drop "unavailable" tiles when the user toggle is OFF
+  // (the PRD default). "pending" tiles are kept so the row reserves
+  // visual real estate via the skeleton stand-in; flipping them to
+  // "available" or "unavailable" later just re-renders in place.
+  const filteredItems = createMemo(() => {
+    if (props.showUnavailable) return props.items;
+    if (!props.itemAvailability) return props.items;
+    return props.items.filter((s) => availabilityFor(s) !== "unavailable");
+  });
+
+  const visibleItems = createMemo(() => {
+    const items = filteredItems();
+    return items.slice(0, Math.min(items.length, windowSize()));
+  });
 
   // Grow the window when focus is near the tail of the current window.
-  // Subscribe to `focusedId` so each focus change re-checks.
+  // Subscribe to `focusedId` so each focus change re-checks. The growth
+  // ceiling is the FILTERED-items length so a row that hid every
+  // unavailable tile doesn't bloom past its rendered surface.
   const grow = () => {
     const fid = focusedId();
     if (fid === null) return;
     const items = visibleItems();
-    if (items.length >= props.items.length) return;
+    const filtered = filteredItems();
+    if (items.length >= filtered.length) return;
     const tailIndex = items.length - 1;
     const tailItem = items[tailIndex];
     if (!tailItem) return;
@@ -138,7 +173,7 @@ export const Row: Component<RowProps> = (props) => {
     if (idx < 0) return;
     if (idx >= items.length - TAIL_TRIGGER) {
       setWindowSize((current) =>
-        Math.min(current + WINDOW_STEP, props.items.length),
+        Math.min(current + WINDOW_STEP, filtered.length),
       );
     }
   };
@@ -191,7 +226,7 @@ export const Row: Component<RowProps> = (props) => {
         {props.label}
       </h2>
       <Show
-        when={props.items.length > 0}
+        when={filteredItems().length > 0}
         fallback={
           props.emptyFallback === undefined ? (
             <div
@@ -220,6 +255,7 @@ export const Row: Component<RowProps> = (props) => {
                   focusId={`${props.focusIdPrefix}-${item.id}`}
                   summary={item}
                   badge={props.itemBadge?.(item) ?? null}
+                  availability={availabilityFor(item)}
                   onActivate={() => props.onActivate?.(item)}
                   onContext={
                     props.onContext ? () => props.onContext?.(item) : undefined

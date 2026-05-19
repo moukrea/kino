@@ -50,6 +50,17 @@ vi.mock("../lib/tauri", async (importOriginal) => {
     })),
     getWeeklyTrending: vi.fn(async () => []),
     listHomeCatalogs: vi.fn(async () => []),
+    // PRD §F-006: HomeView fires `check_availability` per row on mount;
+    // the title-detail tests transit through Home for one navigation
+    // case, so stub the call to keep the warn-log clean.
+    checkAvailability: vi.fn(async (items: { title_id: string; type: "movie" | "series" }[]) =>
+      items.map((i) => ({
+        title_id: i.title_id,
+        type: i.type,
+        available: true,
+        source_count: 1,
+      })),
+    ),
   };
 });
 

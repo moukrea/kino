@@ -112,6 +112,7 @@ function defaultView(): SettingsView {
       input_override: "auto",
       high_contrast: false,
       advanced_logging: false,
+      show_unavailable: false,
     },
   };
 }
@@ -574,6 +575,45 @@ describe("Settings route (F-016)", () => {
     expect(mockedSet).toHaveBeenCalledWith("display.advanced_logging", "true");
   });
 
+  it("PRD §F-006: persists the show-unavailable toggle AND updates the live signal", async () => {
+    // PRD §F-006: "Setting 'Show unavailable titles' (default OFF)".
+    // The Display section's toggle must (a) persist the new key via
+    // settingsSet so the value survives restarts, AND (b) update the
+    // shared `displaySettings.setShowUnavailable` signal so already-
+    // mounted catalog rows re-render without a route remount.
+    const { setShowUnavailable, _resetForTests, showUnavailable } =
+      await import("../lib/displaySettings");
+    _resetForTests();
+    expect(showUnavailable()).toBe(false);
+
+    const { host, dispose } = mount();
+    activeHost = host;
+    activeDispose = dispose;
+    await flushAsync();
+    await waitFor(
+      () =>
+        !!host.querySelector(
+          '[data-testid="settings-section-display-showunavailable"]',
+        ),
+    );
+
+    host
+      .querySelector<HTMLButtonElement>(
+        '[data-testid="settings-section-display-showunavailable"]',
+      )!
+      .click();
+    await flushAsync();
+    expect(mockedSet).toHaveBeenCalledWith(
+      "display.show_unavailable",
+      "true",
+    );
+    expect(showUnavailable()).toBe(true);
+
+    // Defensive: keep the suppression we restored above by re-zeroing
+    // the signal for the next test in this file.
+    setShowUnavailable(false);
+  });
+
   it("propagates the tile-size dropdown change", async () => {
     const { host, dispose } = mount();
     activeHost = host;
@@ -749,6 +789,7 @@ describe("Settings route (F-016)", () => {
       "settings-section-display-tile-select",
       "settings-section-display-nsfw",
       "settings-section-display-input-select",
+      "settings-section-display-showunavailable",
       "settings-about-license-view",
       "settings-about-export-input",
       "settings-about-export-submit",
