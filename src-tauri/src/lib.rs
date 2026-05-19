@@ -183,6 +183,24 @@ pub fn run() {
             // can hold cheap clones without contesting the Tauri state
             // lock.
             app.manage(Arc::new(PlayerRuntime::default()));
+
+            // PRD §F-015 / ADR-133 Route B (Session 036 spike): if
+            // `KINO_LIBMPV_SURFACE_SPIKE=1` is set, perform the GTK
+            // widget-tree surgery that wraps the Tauri webview in a
+            // GtkOverlay sibling of a GtkGLArea. The default build
+            // (and CI) does NOT invoke the surgery — the env-var
+            // gate keeps the Session-020 subprocess driver's runtime
+            // behavior unchanged. A human can opt-in by running
+            // `KINO_LIBMPV_SURFACE_SPIKE=1 cargo tauri dev` locally
+            // and watching for the structural log line. Session 037
+            // replaces this env-var gate with the `libmpv-inprocess`
+            // Cargo feature flag once the libmpv driver actually
+            // drives the GL area.
+            #[cfg(target_os = "linux")]
+            if std::env::var("KINO_LIBMPV_SURFACE_SPIKE").as_deref() == Ok("1") {
+                run_libmpv_surface_spike(app);
+            }
+
             tracing::info!("kino host started (PRD §F-002 persistence ready)");
             Ok(())
         })
@@ -245,6 +263,47 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("kino: error while running tauri application");
+}
+
+/// Run the F-015 Linux libmpv in-window GL surface spike (ADR-133
+/// Route B, Session 036). Reads the main webview window from the app
+/// handle, posts a `with_webview` closure to the GTK main thread, and
+/// inside that closure performs the [`kino_player::inject_overlay`]
+/// surgery on the underlying `webkit2gtk::WebView`. Result is logged at
+/// `info` (success) or `error` (failure); a failed surgery is non-fatal
+/// — the app continues with the unmodified widget tree.
+///
+/// Invoked from `setup()` iff `KINO_LIBMPV_SURFACE_SPIKE=1`; default
+/// builds do NOT run this code path. The runtime opt-in lets a human
+/// verify the surgery on real hardware without changing CI behavior.
+#[cfg(target_os = "linux")]
+fn run_libmpv_surface_spike<R: tauri::Runtime>(app: &tauri::App<R>) {
+    let Some(window) = app.get_webview_window("main") else {
+        tracing::warn!("libmpv-surface-spike: no 'main' webview window found");
+        return;
+    };
+    let result = window.with_webview(|platform_webview| {
+        let webview = platform_webview.inner();
+        match kino_player::inject_overlay(&webview) {
+            Ok(_surgery) => {
+                tracing::info!(
+                    "libmpv-surface-spike: GtkOverlay injected; webview reparented above GtkGLArea (Route B Session 036 spike OK)"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "libmpv-surface-spike: surgery failed (Route B Session 036 spike FAILED)"
+                );
+            }
+        }
+    });
+    if let Err(e) = result {
+        tracing::warn!(
+            error = %e,
+            "libmpv-surface-spike: with_webview dispatch failed; surgery not attempted"
+        );
+    }
 }
 
 /// Install the global `tracing` subscriber. When the per-platform config

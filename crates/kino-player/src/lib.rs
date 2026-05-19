@@ -48,6 +48,12 @@ pub mod tracks;
 #[cfg(target_os = "linux")]
 pub mod mpv;
 
+/// GTK widget-tree surgery for F-015 Linux libmpv in-window GL rendering
+/// (Session 036 spike for ADR-133 Route B). See module docs for the
+/// reparenting strategy and spike scope.
+#[cfg(target_os = "linux")]
+pub mod surface;
+
 pub use error::PlayerError;
 pub use event::{PlayerEvent, PositionTick};
 pub use handle::{OpenRequest, PlayerHandle};
@@ -56,3 +62,6 @@ pub use tracks::{AudioTrack, SubtitleTrack, TrackList};
 
 #[cfg(target_os = "linux")]
 pub use mpv::MpvPlayer;
+
+#[cfg(target_os = "linux")]
+pub use surface::{inject_overlay, OverlaySurgery, SurfaceError};
