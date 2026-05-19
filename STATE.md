@@ -1,9 +1,11 @@
 # kino — Agent State
 
 **PRD version:** 1.0 (locked)
-**Status:** v1.0.0-alpha.1 release pipeline shipped. **Session 036 lands the F-015 Linux libmpv in-window GL surface GTK-injection spike** — the Route-B prerequisite that ADR-133 carved off as the Session-036 scope. The spike confirms that **avenue (i)** from ADR-133 (walk + reparent post-window-realisation) is sufficient: Tauri 2.11.2's PUBLIC API surface already exposes every accessor needed, so the two harder fallback avenues (intercepting `tauri::Builder::setup` / `on_window_event` before wry packs the webview; upstreaming a `WebViewExtUnix::gtk_box()` accessor PR to wry) are NOT required. Specifically: (a) [`tauri::WebviewWindow::default_vbox()`](https://docs.rs/tauri/2.11.2/tauri/window/struct.WebviewWindow.html#method.default_vbox) returns the `gtk::Box` the webview is packed into (line 1863 in `tauri-2.11.2/src/webview/webview_window.rs`); (b) [`tauri::WebviewWindow::with_webview()`](https://docs.rs/tauri/2.11.2/tauri/window/struct.WebviewWindow.html#method.with_webview) hands a [`PlatformWebview`](https://docs.rs/tauri/2.11.2/tauri/webview/struct.PlatformWebview.html) to a closure that runs on the GTK main thread; on Linux `PlatformWebview::inner()` returns `webkit2gtk::WebView` (line 173 in `tauri-2.11.2/src/webview/mod.rs`); (c) `webkit2gtk::WebView` `@extends gtk::Container, gtk::Widget` so the standard `gtk::WidgetExt::parent()` + `gtk::ContainerExt::remove()` + `gtk::Box::pack_start()` + `gtk::Overlay::add()` / `add_overlay()` traits compose into the reparenting surgery. Spike artifact: a new ~230-line module `crates/kino-player/src/surface.rs` exposing `inject_overlay(&webkit2gtk::WebView) -> Result<OverlaySurgery, SurfaceError>` (~80 LOC of surgery code + module documentation + two unit tests covering the error variants' `Display` impls); plus a 30-line opt-in trigger in `src-tauri/src/lib.rs::run_libmpv_surface_spike` invoked from `setup()` iff `KINO_LIBMPV_SURFACE_SPIKE=1`. Default builds (and CI) do NOT invoke the surgery — the env-var gate keeps the Session-020 subprocess driver's runtime behavior unchanged so the spike's landing is zero-blast-radius on `main`. ADR-134 locks the avenue choice (avenue (i) succeeds, avenues (ii) and (iii) are unnecessary), the env-var-gated rollout for the spike, and the Session-037 hand-off shape (the `inject_overlay` API is what 037's `crates/kino-player/src/libmpv.rs` consumes via app-managed state). Three new linux-only direct deps on `gtk = "0.18"` / `gdk = "0.18"` / `webkit2gtk = { version = "2.0", features = ["v2_8"] }` — all already in the workspace's transitive closure via wry, so resolver unification leaves the compile cost unchanged. **§6A F-015 / Linux libmpv in-window GL surface still OPEN** — the spike proves the API surface is reachable, but the §6A "satisfied by code on `main`" gate stays gated on Session 037 landing the actual libmpv driver (and Session 038's CI matrix + bundle integration). See ADR-134 in the Session 036 entry below.
-**Last session:** 036 (F-015 Linux libmpv in-window GL surface — Route B GTK-injection spike. Landed `crates/kino-player/src/surface.rs` with `inject_overlay(&webkit2gtk::WebView) -> Result<OverlaySurgery, SurfaceError>` performing the walk + reparent surgery (webview's parent gtk::Box → remove webview → construct `GtkOverlay` with `GtkGLArea` (z=0) + webview (z=1) → repack overlay into the vbox + set webview background transparent via `set_background_color(RGBA(0,0,0,0))`). Verified that ADR-133 avenue (i) is sufficient — Tauri 2.11.2's public `WebviewWindow::default_vbox()` + `with_webview()` + `PlatformWebview::inner()` API surface reaches every accessor the surgery needs; the wry-internal accessor avenue (iii) and the builder-hook avenue (ii) are NOT required. Added the spike trigger in `src-tauri/src/lib.rs::run_libmpv_surface_spike` invoked from `setup()` iff `KINO_LIBMPV_SURFACE_SPIKE=1` (default off — zero runtime change for default builds + CI). Three new linux-only direct deps on `gtk = "0.18"` / `gdk = "0.18"` / `webkit2gtk = { version = "2.0", features = ["v2_8"] }` in `crates/kino-player/Cargo.toml`. ADR-134 locks in: avenue (i) chosen; env-var rollout for the spike; Session-037 handoff shape. Two new unit tests in `surface.rs` for the `SurfaceError` Display impl (the surgery body itself is not unit-testable without a display). Updated the §6A F-015 / Linux libmpv in-window GL surface entry with a "Spike result (Session 036)" subsection. F-015 stays `[ ]` in the Feature Tracker; the §6A entry stays OPEN until Sessions 037 + 038 land.)
-**Next session:** 037 — F-015 Linux libmpv in-window GL driver implementation. Per ADR-133's multi-session split (and confirmed by Session 036's successful avenue-(i) spike): add `crates/kino-player/src/libmpv.rs` as a peer `PlayerHandle` driver behind a `libmpv-inprocess` Cargo feature flag. Driver responsibilities: (a) link against `libmpv2 = "3"` (or equivalent Rust binding crate), (b) initialise the libmpv render context against the `gtk::GLArea` exposed by Session 036's `OverlaySurgery` handle, (c) implement the `PlayerHandle` trait surface (`open` / `close` / `set_paused` / `seek` / `select_audio_track` / `select_subtitle_track` / `snapshot` / `subscribe` / `tracks`) by translating commands to libmpv property sets + observing libmpv events for `PlayerEvent` emission, (d) read the shipped mpv config from `crates/kino-server/assets/mpv.conf` (PRD §F-015 Linux block) by translating its directives into libmpv `set_property` calls at boot, (e) store `OverlaySurgery` in app-managed state so the driver instance can resolve the GL area for its render context. Host-side change: replace the env-var gate (Session 036) with a `#[cfg(feature = "libmpv-inprocess")]` gate on the surface-injection call AND on the `spawn_platform_player` Linux branch (subprocess driver stays the non-feature default until Session 038's `§6B-1` re-verification flips the default). Session 038 then adds `libmpv2-dev` to the CI workflow's apt-install list across `lint` / `test` / `build-linux` and the `tauri.conf.json::bundle.linux.deb.depends` block. F-013 / F-014 §6A closure stays parked on the human PRD-revision ratification per Session 034 / ADR-132; the agent's Session 037 work is independent of that ratification.
+**Status:** v1.0.0-alpha.1 release pipeline shipped. **Session 037 lands the F-015 Linux libmpv in-process driver** — the Route-B implementation that ADR-133 split as the post-spike session. The driver lives in a new ~700-line module `crates/kino-player/src/libmpv.rs` gated by a `libmpv-inprocess` Cargo feature flag (default OFF through Session 037). When the feature is ON: (a) Session 036's `inject_overlay` runs at `setup()` time to wrap the Tauri webview in a `GtkOverlay` sibling of a fresh `GtkGLArea`; (b) a new `LibmpvPlayer` is constructed via `LibmpvPlayer::new_attached(OverlaySurgery)`, which creates a libmpv handle through the [`libmpv2 = "6"`](https://crates.io/crates/libmpv2/6.0.0) Rust binding, applies every PRD §F-015 / `crates/kino-server/assets/mpv.conf` directive via `set_property` calls (`vo=libmpv` + `hwdec=auto-safe` + `keep-open=yes` + `cache=yes` + `demuxer-max-bytes=200 MiB` + `demuxer-readahead-secs=20` + `audio-spdif=ac3,dts,eac3,truehd,dts-hd` + `sub-auto=fuzzy` + `sub-ass=yes` + `idle=yes`), applies the `high-quality` profile via `apply-profile`, builds an OpenGL `RenderContext` bound to the freshly-injected `GLArea` (proc address resolved via `libc::dlsym(RTLD_DEFAULT, ...)` for cross-backend GL symbol lookup), wires the `GLArea::render` signal to call `RenderContext::render(0, w, h, true)`, and bridges the libmpv update callback to a `glib::MainContext::default().spawn_local` future that calls `GLArea::queue_render` via an `async_channel` (the `!Send` GLArea lives only on the GTK main thread); (c) a single OS thread `kino-libmpv-events` polls `mpv.wait_event(0.25)` and translates libmpv's `time-pos` / `duration` / `pause` / `paused-for-cache` / `eof-reached` / `track-list/count` property changes + `EndFile` / `FileLoaded` events into the same `PlayerEvent` vocabulary the subprocess driver already emits, with `track-list` re-fetched as a JSON string and parsed through the existing `TrackList::from_mpv_tracks` helper; (d) the constructed `Arc<dyn PlayerHandle>` is `app.manage`d under a `LibmpvPlayerHandle` newtype so the `commands::spawn_platform_player` Linux branch can vend the SAME process-lifetime driver instance on every `player_open` (the libmpv handle survives across sessions via `idle=yes` + `loadfile`/`stop` cycling — distinct from the subprocess driver's spawn-per-session pattern). When the feature is OFF (default through Session 037): the host's `setup()` block doesn't run any libmpv path; `spawn_platform_player` falls through to the subprocess `MpvPlayer::spawn()`; nothing requires `libmpv2-dev` at link time so CI builds unchanged. Session 036's env-var gate (`KINO_LIBMPV_SURFACE_SPIKE=1`) is REMOVED — the feature flag is the single rollout knob now per ADR-133. New ADR-135 carves out the kino-player crate's `unsafe_code` lint from `forbid` → `deny` so the libmpv module can `#[allow(unsafe_code)]` for the one `libc::dlsym` FFI call (every other module in the crate stays unsafe-free under the relaxed lint). Six new linux-only optional deps under the feature flag: `libmpv2 = "6"` + `async-channel = "2"` + `libc = "0.2"` (the latter three are `optional = true`; default builds don't see them). Local verification: `cargo clippy --workspace --all-targets [--features kino-app/libmpv-inprocess] -- -D warnings` clean in both feature configs; `cargo test --workspace --all-targets [--features kino-app/libmpv-inprocess]` 30 player tests pass (3 new — `dlsym_proc_address_returns_null_for_garbage_name`, `map_libmpv_err_wraps_in_spawn_variant`, `backend_err_wraps_in_backend_variant`); `cargo fmt --all --check` clean; `cargo build --workspace [--features ...]` succeeds in both configs (verified locally against `libmpv-dev 0.37.0` + `libwebkit2gtk-4.1-dev` + `libgtk-3-dev` on Ubuntu 24.04). **§6A F-015 / Linux libmpv in-window GL surface — code path EXISTS on main; remaining §6A blocker is Session 038's CI matrix + bundle integration + default-flip after §6B-1 hardware verification.** F-015 stays `[ ]` in the Feature Tracker until Session 038 flips the feature on by default. See ADR-135 in the Session 037 entry below.
+
+**(Prior session context preserved for reference)** **Session 036 lands the F-015 Linux libmpv in-window GL surface GTK-injection spike** — the Route-B prerequisite that ADR-133 carved off as the Session-036 scope. The spike confirms that **avenue (i)** from ADR-133 (walk + reparent post-window-realisation) is sufficient: Tauri 2.11.2's PUBLIC API surface already exposes every accessor needed, so the two harder fallback avenues (intercepting `tauri::Builder::setup` / `on_window_event` before wry packs the webview; upstreaming a `WebViewExtUnix::gtk_box()` accessor PR to wry) are NOT required. Specifically: (a) [`tauri::WebviewWindow::default_vbox()`](https://docs.rs/tauri/2.11.2/tauri/window/struct.WebviewWindow.html#method.default_vbox) returns the `gtk::Box` the webview is packed into (line 1863 in `tauri-2.11.2/src/webview/webview_window.rs`); (b) [`tauri::WebviewWindow::with_webview()`](https://docs.rs/tauri/2.11.2/tauri/window/struct.WebviewWindow.html#method.with_webview) hands a [`PlatformWebview`](https://docs.rs/tauri/2.11.2/tauri/webview/struct.PlatformWebview.html) to a closure that runs on the GTK main thread; on Linux `PlatformWebview::inner()` returns `webkit2gtk::WebView` (line 173 in `tauri-2.11.2/src/webview/mod.rs`); (c) `webkit2gtk::WebView` `@extends gtk::Container, gtk::Widget` so the standard `gtk::WidgetExt::parent()` + `gtk::ContainerExt::remove()` + `gtk::Box::pack_start()` + `gtk::Overlay::add()` / `add_overlay()` traits compose into the reparenting surgery. Spike artifact: a new ~230-line module `crates/kino-player/src/surface.rs` exposing `inject_overlay(&webkit2gtk::WebView) -> Result<OverlaySurgery, SurfaceError>` (~80 LOC of surgery code + module documentation + two unit tests covering the error variants' `Display` impls); plus a 30-line opt-in trigger in `src-tauri/src/lib.rs::run_libmpv_surface_spike` invoked from `setup()` iff `KINO_LIBMPV_SURFACE_SPIKE=1`. Default builds (and CI) do NOT invoke the surgery — the env-var gate keeps the Session-020 subprocess driver's runtime behavior unchanged so the spike's landing is zero-blast-radius on `main`. ADR-134 locks the avenue choice (avenue (i) succeeds, avenues (ii) and (iii) are unnecessary), the env-var-gated rollout for the spike, and the Session-037 hand-off shape (the `inject_overlay` API is what 037's `crates/kino-player/src/libmpv.rs` consumes via app-managed state). Three new linux-only direct deps on `gtk = "0.18"` / `gdk = "0.18"` / `webkit2gtk = { version = "2.0", features = ["v2_8"] }` — all already in the workspace's transitive closure via wry, so resolver unification leaves the compile cost unchanged. **§6A F-015 / Linux libmpv in-window GL surface still OPEN** — the spike proves the API surface is reachable, but the §6A "satisfied by code on `main`" gate stays gated on Session 037 landing the actual libmpv driver (and Session 038's CI matrix + bundle integration). See ADR-134 in the Session 036 entry below.
+**Last session:** 037 (F-015 Linux libmpv in-process driver — ADR-133 Route B Session-037 driver landing. Added `crates/kino-player/src/libmpv.rs` (~700 LOC) implementing `LibmpvPlayer` as a `PlayerHandle` peer driver behind a `libmpv-inprocess` Cargo feature flag — gated OFF by default through Session 037 so CI builds DO NOT require `libmpv2-dev` at link time. Driver capabilities: (a) Mpv handle constructed via `libmpv2 = "6"` with every PRD §F-015 / `mpv.conf` directive applied as `init.set_property` calls + `apply-profile high-quality` post-init; (b) OpenGL `RenderContext` bound to the `gtk::GLArea` exposed by Session 036's `OverlaySurgery` handle (proc address resolved via `libc::dlsym(RTLD_DEFAULT, ...)` — every GL symbol pulled in transitively by libwebkit2gtk's libepoxy linkage is resolvable through the process-wide symbol lookup); (c) `GLArea::connect_render` signal wired to call `RenderContext::render(0, w*scale, h*scale, true)`; (d) libmpv update callback bridged to a `glib::MainContext::default().spawn_local` future via `async_channel` so `GLArea::queue_render` always runs on the GTK main thread (the `!Send` GLArea lives in the local future, the `Send + Sync` channel sender lives in the libmpv callback); (e) single OS thread `kino-libmpv-events` polls `mpv.wait_event(0.25)` and translates libmpv property changes + `EndFile` / `FileLoaded` events into the same `PlayerEvent` vocabulary the subprocess driver already emits, with `track-list` re-fetched as a JSON string and parsed through the existing `TrackList::from_mpv_tracks` helper; (f) `Arc<dyn PlayerHandle>` `app.manage`d under a `LibmpvPlayerHandle` newtype in `src-tauri/src/lib.rs`. Host-side wiring: `src-tauri/src/lib.rs::setup_libmpv_inprocess` replaces the Session-036 env-var-gated `run_libmpv_surface_spike` — under `#[cfg(all(target_os = "linux", feature = "libmpv-inprocess"))]` it runs the surface surgery + builds the LibmpvPlayer + manages it; under the default config the function doesn't exist and nothing libmpv-related runs at startup. `src-tauri/src/commands.rs::spawn_platform_player` Linux branch now tries `try_state::<LibmpvPlayerHandle>` first when the feature is on, falling through to `MpvPlayer::spawn()` when the state isn't populated (e.g. surgery failed) so the app stays operational. New ADR-135 carves out the kino-player crate's `unsafe_code` lint from `forbid` → `deny` for ONE `libc::dlsym` FFI call (the libmpv module is the single scoped `#[allow(unsafe_code)]`). Six lines of new feature-gated linux-only optional deps: `libmpv2 = "6" optional = true` + `async-channel = "2" optional = true` + `libc = "0.2" optional = true`. Three new unit tests in `libmpv::tests` (clippy-passing under both feature configs). Local verification: `cargo clippy --workspace --all-targets [--features kino-app/libmpv-inprocess] -- -D warnings` clean in both feature configs; `cargo test --workspace --all-targets [--features ...]` ALL tests pass (30 player + frontend 234); `cargo fmt --all --check` clean; `cargo build --workspace [--features ...]` succeeds in both configs (verified against `libmpv-dev 0.37.0` + `libwebkit2gtk-4.1-dev` + `libgtk-3-dev` on Ubuntu 24.04). F-015 stays `[ ]` in the Feature Tracker; the §6A entry now reads "code path EXISTS on main, blocker is Session 038 CI matrix + default-flip + §6B-1 re-verification".)
+**Next session:** 038 — F-015 Linux libmpv in-process driver CI matrix + bundle integration + default-flip. Per ADR-133's multi-session split (and Session 037's successful landing of the driver behind the feature flag): (a) add `libmpv-dev` + `libgtk-3-dev` to `.github/workflows/ci.yml`'s `lint` / `test` / `build-linux` apt-install lists (the test + lint jobs only need to BUILD with the feature so they need the dev headers; the runtime exercise is §6B-1); (b) add `libmpv2 (>= 2.0)` (or whatever the Ubuntu 24.04 package name resolves to — `libmpv2` per `apt-cache show libmpv-dev`) and `libepoxy0` to `src-tauri/tauri.conf.json::bundle.linux.deb.depends` so the `.deb` artifact's apt resolver pulls in the libmpv runtime; (c) flip the feature flag ON by default in `src-tauri/Cargo.toml::features.default` AFTER local §6B-1 re-verification on Ubuntu 22.04 + 24.04 (the human-side verification gate from STATE.md's §6B checklist); (d) extend the `lint` / `test` matrix to run BOTH feature configs (`cargo clippy --workspace --features kino-app/libmpv-inprocess` + `cargo clippy --workspace`) so future PRs can't regress either path. Optional polish: re-enable the `KINO_LIBMPV_SURFACE_SPIKE=1` dev-only env-var path as a feature-gated debug option so a human developer can toggle between the libmpv driver and the subprocess driver at runtime without rebuilding (rejected for Session 037 scope: adds branching to `spawn_platform_player`, distracts from the closure-path checkpoint). F-013 / F-014 §6A closure stays parked on the human PRD-revision ratification per Session 034 / ADR-132; the agent's Session 038 work is independent of that ratification. Once Session 038 lands AND §6B-1 has been re-verified locally, F-015 flips to `[x]` in the Feature Tracker (the §6A entry already documents the closure path; the Feature Tracker flip is just the bookkeeping confirmation that all four PRD-locked F-015 acceptance gates — Android driver, Linux driver in-window GL surface, both via the same `PlayerHandle` trait, mpv.conf config applied — are now satisfied by code on main).
 
 ---
 
@@ -68,6 +70,467 @@ a hard requirement.
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 037 — F-015 Linux libmpv in-process driver implementation
+
+**Branch:** `claude/kino-prd-compliance-Pv2dL` (harness-supplied; see
+ADR-033 — the harness reuses a single branch name for this checkout,
+the branch name does NOT track the session number).
+
+**Scope chosen:** F-015 Linux libmpv in-process driver — ADR-133 Route
+B Session-037 driver implementation. Picked per the Session 036 entry's
+explicit Next-Session text (the libmpv driver is the second of the
+three Route-B implementation steps; Session 036's GTK-injection spike
+already proved avenue (i) of ADR-133 succeeds via the public Tauri
+API surface). This is the only agent-actionable §6A regression
+remaining — F-013 / F-014 stay parked on the human PRD-revision
+ratification per Session 034 / ADR-132, the F-016 / F-003 / F-006 /
+F-015-Android regressions all closed in Sessions 028 / 029 / 030 /
+031 / 032 / 033. Bundle size: ~700 LOC of new Rust code (`libmpv.rs`
+module body) + ~40 LOC of host-side wiring in `src-tauri/src/lib.rs`
++ `src-tauri/src/commands.rs` + ~15 LOC of Cargo.toml dep + feature
+declarations + ~10 LOC of `crates/kino-player/src/lib.rs` re-export
+gating + ~250 lines of STATE.md text (1 new Sessions Log entry, 1 new
+ADR-135, 1 §6A F-015 entry amendment).
+
+**Pre-implementation verification:**
+
+The Session 037 scope's tractability turned on whether the libmpv2
+crate's API surface composes cleanly with Session 036's
+`OverlaySurgery` handle AND whether the workspace lint policy
+permits the ONE FFI call libmpv's render API requires for GL proc-
+address resolution. Session 037 audited both before writing
+code:
+
+1.  **libmpv2 version on crates.io.** The Session 036 entry's
+    "next session" text referenced `libmpv2 = "3"` but crates.io's
+    current published version is `libmpv2 = "6.0.0"` (with
+    `libmpv2-sys = "4.0.1"` underneath). The libmpv2 6.0.0 crate
+    declares `MPV_CLIENT_API_MAJOR = 2 MINOR = 2`, matching the
+    mpv 0.37.0 / libmpv 2.2.0 client API shipped by Ubuntu 24.04's
+    `libmpv-dev`. Session 037 lands `libmpv2 = "6"` (not `"3"`); the
+    Session 036 next-session text's parenthetical "or equivalent
+    Rust binding crate" carve-out covers the version bump.
+
+2.  **Public API survey:** `Mpv::with_initializer(|init| { ... })`
+    + `MpvInitializer::set_property` + `Mpv::create_render_context`
+    + `RenderContext::set_update_callback` + `RenderContext::render`
+    + `Mpv::observe_property` + `Mpv::wait_event` + `Mpv::command`
+    + `Mpv::set_property` + `Mpv::get_property` — the full surface
+    every PRD §F-015 acceptance bullet ("position events on the 5 s
+    cadence" / "seek + pause + audio + sub track selection" /
+    "deterministic exit-with-final-position" / "track-list refresh")
+    reaches through these calls. Each call site in `libmpv.rs` has
+    a 1:1 counterpart in the subprocess driver (`crates/kino-player/
+    src/mpv.rs`) so the PRD-locked behavior is structurally
+    identical between drivers; the operational signal surface
+    (`PlayerEvent`, `PlayerState`, `TrackList`) is shared between
+    them by re-exporting from `kino-player::lib`.
+
+3.  **libepoxy symbol survey:** Session 037's first compile pass
+    declared `extern "C" { fn epoxy_get_proc_address(...) -> ...; }`
+    matching the Session 036 entry's "next session" text. The
+    linker failed: `nm -D /usr/lib/x86_64-linux-gnu/libepoxy.so`
+    shows libepoxy 1.5.10 exports `epoxy_eglGetProcAddress` +
+    `epoxy_glXGetProcAddress` (BOTH as function pointers, not
+    functions) but NO generic `epoxy_get_proc_address` symbol.
+    Session 037 pivoted to `libc::dlsym(RTLD_DEFAULT, name)` —
+    process-wide symbol lookup against every shared library
+    already loaded into the process (which on Linux includes
+    libGL + libEGL + libGLES via libwebkit2gtk's transitive
+    GL stack). The pivot also reduced the link-time dep surface:
+    Session 038 no longer needs to add `libepoxy-dev` to CI's
+    apt-install list (libepoxy is already pulled in by
+    `libwebkit2gtk-4.1-dev` which CI installs today).
+
+4.  **Lint policy survey:** kino-player's `[lints.rust]` declared
+    `unsafe_code = "forbid"` per ADR-030. `forbid` CANNOT be
+    overridden by any `#[allow(...)]` attribute (it's the only
+    lint level with this strict-precedence semantics). The
+    `libc::dlsym` call requires an `unsafe { ... }` block (libc
+    declares dlsym as `unsafe extern "C"`). Two options to reach
+    a buildable state: (a) extract the dlsym call into a separate
+    crate with its own `unsafe_code = "deny"`/`"allow"` policy
+    (heavyweight: adds a new workspace member for one function);
+    (b) relax kino-player's lint from `forbid` to `deny` and
+    scope the `#[allow(unsafe_code)]` to the libmpv module only
+    (lightweight: one Cargo.toml line change + one module-level
+    attribute). Session 037 picks (b) and files ADR-135 to lock
+    the convention. Verified that no other module in kino-player
+    uses `unsafe` (`grep -rn '\bunsafe\b' crates/kino-player/src/`
+    surfaces only the libmpv module).
+
+5.  **Cross-thread dispatch survey:** libmpv's render-update
+    callback fires from libmpv's render thread (NOT the GTK main
+    thread). The natural primitive to bounce work onto the GTK
+    main thread is `glib::source::idle_add_once` — but that
+    requires `F: FnOnce() + Send + 'static`, and `gtk::GLArea`
+    is `!Send` (all GTK widgets are thread-local). Capturing a
+    weak `GLArea` reference into the closure trips the Send
+    bound. Session 037 pivoted to `async_channel::unbounded` —
+    the channel sender is `Send + Sync`, captured by the (Send)
+    libmpv callback; the receiver's `recv().await` future runs
+    inside a `glib::MainContext::default().spawn_local` future
+    on the GTK main thread, where the `!Send` GLArea clone
+    lives. spawn_local accepts `!Send` futures because the
+    local main context never moves work between threads. This
+    matches the recommended replacement pattern for the
+    deprecated `glib::MainContext::channel` (deprecated in glib
+    0.18.5; CI's `-D warnings` would block the deprecation
+    warning).
+
+**Implementation summary:**
+
+`crates/kino-player/src/libmpv.rs` (NEW, ~700 LOC including ~250
+LOC of doc-comment + ~50 LOC of unit tests):
+
+1.  Module-level `#![cfg(all(target_os = "linux", feature =
+    "libmpv-inprocess"))]` — the module compiles only when the
+    feature is on AND the target is Linux. Followed by
+    `#![allow(unsafe_code)]` (per ADR-135) so the dlsym FFI is
+    callable.
+
+2.  `dlsym_proc_address(_: &(), name: &str) -> *mut c_void` —
+    the GL proc-address callback handed to libmpv's
+    `OpenGLInitParams`. `CString::new(name)` (returns NULL on
+    embedded-nul names) followed by `libc::dlsym(RTLD_DEFAULT,
+    cstr.as_ptr())`. The `RTLD_DEFAULT` constant is declared
+    inline as `std::ptr::null_mut()` per glibc's `dlfcn.h`
+    semantics (the `libc` crate doesn't expose `RTLD_DEFAULT`
+    for `x86_64-unknown-linux-gnu`; on glibc it's `((void *)0)`).
+
+3.  `LibmpvPlayer { inner: Arc<LibmpvInner> }` — the public
+    driver struct. `LibmpvInner` holds the leaked `&'static
+    Mpv`, the broadcast `Sender<PlayerEvent>`, the
+    `Mutex<PlayerSnapshot>`, the `Mutex<TrackList>`, and an
+    `AtomicBool` shutdown flag.
+
+4.  `LibmpvPlayer::new_attached(surgery: OverlaySurgery) -> Result<Self,
+    PlayerError>` — the constructor. Six numbered steps inline:
+    (1) Create Mpv with PRD §F-015 Linux config applied at init
+    time via `set_property` calls — `vo=libmpv`, `hwdec=auto-safe`,
+    `keep-open=yes`, `cache=yes`, `demuxer-max-bytes=200 MiB`,
+    `demuxer-readahead-secs=20`, `audio-spdif=ac3,dts,eac3,truehd,
+    dts-hd`, `sub-auto=fuzzy`, `sub-ass=yes`, `idle=yes`; (1.5)
+    apply `high-quality` profile via `mpv.command("apply-profile",
+    &["high-quality"])`; (2) leak the Mpv into `'static` via
+    `Box::leak` so the `RenderContext<'static>` it owns can be
+    stashed in the render-signal closure; (3) observe the six
+    properties the driver translates into `PlayerEvent`s
+    (`time-pos`, `duration`, `pause`, `paused-for-cache`,
+    `eof-reached`, `track-list/count`); (4) create the OpenGL
+    `RenderContext` with `ApiType::OpenGl` + `InitParams` using
+    `dlsym_proc_address`; (5) wire the `GLArea::connect_render`
+    signal to a closure that calls `RenderContext::render(0,
+    w*scale, h*scale, true)` (scale-factor multiplied for HiDPI;
+    flip=true because mpv expects positive-Y-up, GTK gives us
+    positive-Y-down); (6) wire libmpv's render update callback
+    to a `glib::MainContext::default().spawn_local` future via
+    `async_channel::unbounded` for the cross-thread GLArea
+    redraw dispatch. After all six, spawn the
+    `kino-libmpv-events` polling OS thread.
+
+5.  `event_loop(inner: Arc<LibmpvInner>)` — the polling
+    thread's main loop. `mpv.wait_event(WAIT_EVENT_TIMEOUT_S =
+    0.25s)` returns events one at a time; the loop dispatches
+    to `handle_mpv_event` and terminates on shutdown flag or
+    `MpvEvent::Shutdown`.
+
+6.  `handle_mpv_event` + `handle_property_change` — translate
+    libmpv events into `PlayerEvent`s. The 5s position-tick
+    rate-limit (PRD §8 `PLAYER_POSITION_INTERVAL_S = 5 s`) is
+    enforced inline via `is_none_or` on `last_tick_at:
+    Option<Instant>`. The `track-list` refresh path
+    (`refresh_track_list`) reads the property as a JSON string
+    via `mpv.get_property::<String>("track-list")` and parses
+    through the existing `TrackList::from_mpv_tracks` helper —
+    keeping the shape compatible with the subprocess driver
+    without code duplication.
+
+7.  `#[async_trait] impl PlayerHandle for LibmpvPlayer` —
+    `open` issues `loadfile <url> replace [<index> "start=<s>"]`
+    on a non-zero resume position (matching the subprocess
+    driver's load-arg shape); `close` issues `stop` (the player
+    stays alive thanks to `idle=yes`); `set_paused` sets the
+    `pause` property; `seek` issues `seek <pos> absolute exact`;
+    `select_audio_track` + `select_subtitle_track` set the
+    `aid` / `sid` property with `"no"` for `None`; `snapshot` +
+    `tracks` are `try_lock`-friendly mutex reads; `subscribe`
+    hands a broadcast::Receiver.
+
+8.  `Drop for LibmpvInner` — sets the shutdown atomic; the
+    polling thread observes it within `WAIT_EVENT_TIMEOUT_S` and
+    exits. The leaked Mpv is NOT freed (intentional: the driver
+    is process-lifetime, recovering the memory would race the
+    GTK main thread's render-signal handler).
+
+`crates/kino-player/src/lib.rs` (updated):
+
+1.  Re-export `pub mod libmpv;` and `pub use libmpv::
+    LibmpvPlayer;` under `#[cfg(all(target_os = "linux", feature =
+    "libmpv-inprocess"))]` — keeps the default build's exported
+    surface unchanged; the new symbol only exists when the
+    feature is on.
+
+`crates/kino-player/Cargo.toml` (updated):
+
+1.  `[lints.rust] unsafe_code = "forbid"` → `"deny"` (the
+    one-line change ADR-135 documents). Carries a comment
+    pointing at the libmpv module as the single scoped
+    `#[allow(unsafe_code)]` carve-out.
+
+2.  Three new linux-only optional deps: `libmpv2 = { version =
+    "6", optional = true }`, `async-channel = { version = "2",
+    optional = true }`, `libc = { version = "0.2", optional =
+    true }`. Plus `glib = "0.18"` as a non-optional direct dep
+    (needed for `MainContext::default().spawn_local` regardless
+    of the feature, since the module declaration uses it — but
+    glib was already in the transitive closure via gtk/gdk).
+
+3.  New `[features]` block: `default = []`, `libmpv-inprocess =
+    ["dep:libmpv2", "dep:async-channel", "dep:libc"]`.
+
+`src-tauri/Cargo.toml` (updated):
+
+1.  New `[features]` block forwarding the feature flag: `default =
+    []`, `libmpv-inprocess = ["kino-player/libmpv-inprocess"]`.
+    Future `cargo tauri build --features libmpv-inprocess`
+    cascades through to the kino-player crate's same-named
+    feature; the workspace resolver unifies on the feature-on
+    build graph.
+
+`src-tauri/src/lib.rs` (updated):
+
+1.  Replaced the env-var-gated `run_libmpv_surface_spike(app)` +
+    `KINO_LIBMPV_SURFACE_SPIKE=1` block (Session 036) with
+    `#[cfg(all(target_os = "linux", feature = "libmpv-inprocess"))]
+    setup_libmpv_inprocess(app);`. The env var is GONE — the
+    feature flag is now the single rollout knob per ADR-133.
+
+2.  New `setup_libmpv_inprocess<R: tauri::Runtime>(app: &tauri::App<R>)`
+    function (feature-gated): reads the `main` webview window
+    from the app handle, posts a `with_webview` closure to the
+    GTK main thread, performs the surgery + builds the
+    LibmpvPlayer + manages it as `LibmpvPlayerHandle` (a
+    newtype around `Arc<dyn PlayerHandle>` so the Tauri state
+    map distinguishes it from other PlayerHandle Arcs that
+    might land later).
+
+3.  New `pub(crate) struct LibmpvPlayerHandle(pub(crate)
+    Arc<dyn kino_player::PlayerHandle>);` newtype declaration
+    (feature-gated). Consumed by `commands::spawn_platform_player`.
+
+`src-tauri/src/commands.rs` (updated):
+
+1.  Linux branch of `spawn_platform_player`: when the feature
+    is on, `try_state::<crate::LibmpvPlayerHandle>` resolves
+    to the managed driver; otherwise (or if the surgery
+    failed at setup time and the state isn't populated)
+    fall through to the subprocess `MpvPlayer::spawn()`.
+    Cargo `[features]` make this a compile-time decision —
+    the `#[cfg(feature = "libmpv-inprocess")]` block guarding
+    the try_state lookup is fully elided in default builds.
+
+**ADRs filed:** ADR-135.
+
+**Test changes:**
+
+-   `libmpv::tests::map_libmpv_err_wraps_in_spawn_variant` (NEW) —
+    asserts that `map_libmpv_err(&libmpv2::Error::Null)` produces a
+    `PlayerError::Spawn(_)` carrying a message that contains the
+    string "libmpv".
+-   `libmpv::tests::backend_err_wraps_in_backend_variant` (NEW) —
+    asserts `backend_err(&libmpv2::Error::Null)` produces a
+    `PlayerError::Backend(s)` where `s.contains("libmpv")`.
+-   `libmpv::tests::dlsym_proc_address_returns_null_for_garbage_name`
+    (NEW) — asserts the proc-address callback returns NULL on a
+    name containing an embedded nul byte (the CString::new fails
+    early). Sanity check for the symbol-resolution path.
+
+Note: the actual Mpv / RenderContext / GLArea wiring is NOT
+unit-testable without a real GL context + GTK main loop. The §6B-1
+hardware-verification line (Linux AppImage launches + libmpv plays
+a stream end-to-end) is the runtime acceptance gate. Structural
+compile-time verification (the module's clippy pass with
+`--features libmpv-inprocess`) is what the §6A closure-path
+checkpoint hinges on.
+
+**Verification commands run locally:**
+
+```
+cargo fmt --all --check                                                  # clean
+cargo clippy --workspace --all-targets -- -D warnings                    # clean (default feature config)
+cargo clippy --workspace --all-targets \
+  --features kino-app/libmpv-inprocess -- -D warnings                    # clean (libmpv-inprocess feature on)
+cargo test --workspace --all-targets                                     # all pass
+cargo test --workspace --all-targets \
+  --features kino-app/libmpv-inprocess                                   # all pass
+cargo build --workspace                                                  # success
+cargo build --workspace --features kino-app/libmpv-inprocess             # success
+cd frontend && npm run lint && npm run typecheck && npm test             # all pass
+```
+
+System deps installed locally to verify the feature-on path: `apt-get
+install -y libmpv-dev libgtk-3-dev libwebkit2gtk-4.1-dev` (`libmpv-dev
+0.37.0-1ubuntu4` resolves `libmpv2 = "6.0.0"`'s `MPV_CLIENT_API_VERSION
+= 2.2` requirement; matches Ubuntu 24.04's apt cache).
+
+**Features advanced:** **F-015 stays `[ ]`** in the Feature Tracker.
+Session 037 delivers the in-process driver IMPLEMENTATION — the §6A
+"satisfied by code on `main`" requirement is met for the
+implementation half of the closure path — but the FEATURE TRACKER
+flip is gated on Session 038 (CI matrix + bundle deps + default
+flip) AND the §6B-1 hardware re-verification. The §6A entry under
+"F-015 / Linux libmpv in-window GL surface" is updated with a "Driver
+landed (Session 037)" subsection citing ADR-135.
+
+The §6A entry's "OPEN" classification carries one remaining residual:
+the feature flag stays OFF by default until Session 038 flips it
+AFTER §6B-1 hardware verification. Per ADR-133's "drop-in peer
+driver" framing, this is intentional — the Session 037 landing is
+zero-blast-radius (CI builds unchanged, runtime behavior unchanged
+in default builds, subprocess driver continues to be the Linux
+player). The §6A code-acceptance gate ("Linux: libmpv plays the
+same test stream end-to-end with controls overlay functional") is
+verifiable ONCE Session 038's CI matrix lands AND a human exercises
+the feature-on build per §6B-1.
+
+**Known issues introduced:** None at the implementation level. The
+"libmpv-inprocess feature exists but is off by default" status quo
+mirrors the Session 036 spike's "surgery exists but is opt-in"
+status quo; both are explicitly multi-session per ADR-133 and the
+§6A entry tracks the multi-session closure path.
+
+**Cross-session conventions established:**
+
+-   **Feature-gated optional deps via dep:NAME syntax in `[features]`
+    blocks.** The `libmpv-inprocess = ["dep:libmpv2", "dep:async-channel",
+    "dep:libc"]` pattern uses Cargo's modern `dep:` namespace
+    (introduced in Cargo 1.60 — well before our 1.94 toolchain
+    floor) which makes the dep "weak" — it's only built when the
+    feature is on. The matching `[target.'cfg(target_os = "linux")'.
+    dependencies]` block declares each as `optional = true`. Net
+    effect: `cargo build` (no feature) sees no libmpv2 / async-
+    channel / libc deps; `cargo build --features libmpv-inprocess`
+    cascades through them. Pattern to reuse when adding a future
+    optional driver behind a feature flag.
+
+-   **Cross-thread dispatch onto the GTK main thread (when the work
+    captures `!Send` widgets) via async_channel + spawn_local.** The
+    libmpv update callback fires off-thread; the GLArea is !Send;
+    therefore neither `glib::idle_add_once` (Send-required) nor
+    `glib::idle_add_local_once` (called from any thread without
+    main-context affinity is UB) work directly. The
+    `async_channel::unbounded` Sender (Send + Sync) bridges the
+    !Send GLArea clone captured by the local main-context spawn_local
+    future. Pattern to reuse when a future driver/callback needs
+    to invoke GTK widget APIs from a non-main thread.
+
+-   **Mpv handle leak-into-static for RenderContext<'static>
+    construction.** The libmpv2 `RenderContext<'a>` borrows from
+    its parent `Mpv`. To stash the RenderContext in a closure
+    that outlives any function-local scope, the Mpv must be
+    leaked via `Box::leak(Box::new(mpv))` to obtain a `'static`
+    reference. Compatible with our process-lifetime driver model;
+    the memory is reclaimed when the process exits.
+
+-   **Scoped `unsafe_code` carve-out via ADR + lint downgrade.**
+    Per ADR-135, kino-player's crate-level lint is now
+    `unsafe_code = "deny"` (not `"forbid"`). Modules that need
+    `unsafe { ... }` opt in via a file-level `#![allow(
+    unsafe_code)]` that's audit-visible in the file's first 10
+    lines. Other modules in the same crate remain unsafe-free
+    under the deny. Pattern to reuse when a future driver needs
+    a narrow FFI call site without relaxing the policy
+    workspace-wide.
+
+**PRD §F-015 code acceptance after this session (Linux block):**
+
+The PRD's locked Linux block:
+
+> ### Linux (locked architecture)
+>
+> Implementation: libmpv via `libmpv-rs` rendered into a GL surface
+> owned by the Tauri window.
+>
+> - The SolidJS frontend reserves a fullscreen container for the
+>   GL surface during playback
+> - mpv renders directly into the surface
+> - Controls (play/pause, seek, audio/sub track selectors, info)
+>   are SolidJS overlay elements composited over the surface by
+>   the browser
+> - mpv events bridged to the frontend via Tauri events
+>
+> mpv config shipped with the app (`crates/kino-server/assets/mpv.conf`):
+>
+> ```
+> profile=high-quality
+> hwdec=auto-safe
+> keep-open=yes
+> cache=yes
+> demuxer-max-bytes=200M
+> demuxer-readahead-secs=20
+> audio-spdif=ac3,dts,eac3,truehd,dts-hd
+> sub-auto=fuzzy
+> sub-ass=yes
+> ```
+
+Status of each PRD-locked constraint after Session 037:
+
+-   **C1: `libmpv-rs` in-process binding.** ✅ Satisfied by code on
+    `main` behind the `libmpv-inprocess` feature. The driver
+    consumes libmpv2 6.0.0 (the active `libmpv-rs` successor —
+    same author lineage, current crates.io publishing).
+
+-   **C2: GL surface owned by the Tauri window.** ✅ Satisfied by
+    Session 036's surface surgery + Session 037's RenderContext
+    bound to the freshly-injected GLArea (which IS a child of
+    Tauri's GtkApplicationWindow per the surgery's widget-tree
+    layout).
+
+-   **C3: Controls composited over the surface by the browser.** ✅
+    Satisfied structurally by Session 036's GtkOverlay layout (z=0
+    GLArea, z=1 transparent webview) and the webview's
+    `set_background_color(RGBA(0,0,0,0))` call. Visual verification
+    is a §6B-1 line.
+
+-   **mpv config from `mpv.conf`.** ✅ Every directive from the
+    asset is applied via `set_property` in `with_initializer`;
+    the `profile=high-quality` line is applied post-init via
+    `apply-profile`. The driver does NOT load the .conf file
+    from disk (that path requires runtime resolution of the
+    Tauri bundle's asset root); ADR-108-style inline application
+    is equivalent for PRD acceptance.
+
+-   **Code-acceptance criteria — "Linux: libmpv plays the same
+    test stream end-to-end with controls overlay functional":**
+    ⚠️ STRUCTURALLY satisfied (the code path EXISTS on `main` —
+    open / close / set_paused / seek / select_audio_track /
+    select_subtitle_track / position event emission / track-list
+    refresh / Exit / Error). Runtime verification is a §6B-1
+    hardware-test line per ADR-118.
+
+-   **Code-acceptance criteria — "Both: seek works without
+    breaking the adaptive buffer scheduler":** ✅ The seek
+    implementation matches the subprocess driver (absolute +
+    exact) and the F-014 buffer monitor consumes the same
+    `PlayerEvent::Position` stream from both drivers (the
+    monitor is driver-agnostic).
+
+-   **Code-acceptance criteria — "Both: player exit always
+    triggers final position save":** ✅ The driver synthesises
+    an `Exit` event on `close()` (before the libmpv stop has a
+    chance to clear the position state) and on the polling
+    thread's `Shutdown` observation; the F-012 CW writer
+    consumes the same Exit event from both drivers.
+
+F-015 status (after Session 037): **in progress → in progress**
+(Linux libmpv in-window GL driver: implementation EXISTS on `main`
+behind the feature flag; Session 038 wires CI matrix + bundle deps
++ default flip; §6B-1 hardware verification gates the Feature
+Tracker `[x]` flip).
+
+---
 
 ### Session 036 — F-015 Linux libmpv in-window GL surface Route B GTK-injection spike
 
@@ -9184,6 +9647,7 @@ Additional ADRs filed by sessions:
 | ADR-132 | **§6A regressions whose closure requires PRD-locked text revision are "human-gated"; the agent's role is to file a documented PRD revision proposal under "PRD Issues" for the human to ratify, then keep the §6A entry OPEN until ratification.** F-013 (Max connections per torrent: 200) and F-014 (piece-priority window mapping) both hit librqbit 8.1.1's public API boundary — the closure paths enumerated by the Session 027 audit are (a) upstream PR to ikatson/rqbit exposing `max_connections_per_torrent` on `SessionOptions` and the `chunk_tracker_*` / `FilePriorities` surfaces, (b) fork librqbit via `[patch.crates-io]` and apply the patches locally, (c) swap the torrent engine, (d) file a PRD revision request relaxing the locked invariants. Sessions 028 / 029 / 030 / 031 / 032 / 033 each closed a different §6A regression by code change; F-013 + F-014 are the first §6A entries where NO code change available within librqbit 8.1.1's public API can satisfy the PRD-locked text. Option (a) requires ikatson/rqbit upstream review which the agent can prepare but not drive to completion in one session. Option (b) requires sustained fork maintenance against librqbit-core / -buffers / -utp transitive ABI changes (substantial multi-session overhead). Option (c) is a high-blast-radius F-013 redo. Option (d) is documentation-only work the agent CAN drive end-to-end and parks the gate behind a single human decision. Session 034 picks (d). The convention this ADR establishes: when a §6A regression cannot be closed by code against the locked PRD text AND the engine constraint is structural (not amenable to a workaround within the same crate ecosystem), the agent files the closure-path proposal under "PRD Issues" with (i) verbatim PRD quotes, (ii) verbatim source-of-truth code citations, (iii) a sketched upstream-PR diff shape for option (a), (iv) cost estimates for options (b) / (c), (v) exact verbatim proposed PRD revision text for option (d). The §6A entry stays OPEN with a "Closure path filed" subsection pointing at the PRD Issues block. The Feature Tracker checkbox stays `[ ]`. A follow-up session — invoked after the human ratifies the PRD revision — flips both the §6A entry to RESOLVED and the Feature Tracker checkbox to `[x]` in one diff. This avoids the agent self-ratifying a PRD-locked text revision (which would violate the harness rule "Never modify PRD.md") while still making maximum progress on §6A clearance per session. The classification also distinguishes "agent-actionable §6A regressions" (closeable by code in this session) from "human-gated §6A regressions" (require ratification first), which informs Session N+1's scope picking: prefer agent-actionable first, file human-gated when no agent-actionable §6A remains. | 034 |
 | ADR-133 | **F-015 Linux libmpv in-window GL surface (§6A regression carried by ADR-108) is closed via Route B (libmpv render-API into a `GtkGLArea` sibling of `WebKitWebView` under a `GtkOverlay`); the implementation is split scout → spike → driver → CI across four sessions.** PRD §F-015 §"Linux (locked architecture)" pins three constraints: C1 `libmpv-rs` in-process binding, C2 GL surface owned by the Tauri window, C3 controls composited over the surface by the browser. The Session 035 scout enumerated five routes (A: X11 `--wid` child-window embed; B: libmpv render-API + `GtkGLArea` + `GtkOverlay`; C: Wayland `wl_subsurface`; D: status quo subprocess + own window per ADR-108; E: frameless peer window with geometry-tracking) and scored each on C1 / C2 / C3 + X11/Wayland feasibility + dependency cost + implementation cost. Only Route B satisfies all three constraints; Routes A / C / E variably fail C2 / C3 / Wayland-feasibility / WM-stability; Route D is the regression itself. The scout therefore PICKS Route B as the primary path, with Route A (in-process `libmpv-rs` + `mpv.set_property("wid", xid)`) as the documented FALLBACK paired with a §F-015 C3 PRD-revision proposal under "PRD Issues" per the Session 034 / ADR-132 human-gated §6A framework. The implementation arc: **Session 036** runs a focused GTK-injection spike — can wry's internal `WebKitWebView` widget tree be augmented to host a `GtkGLArea` sibling under a `GtkOverlay`? — attempting three avenues in priority order (walk + reparent the existing widget tree post-`gtk_window()` resolution; intercept window construction via Tauri's `setup` / `on_window_event` hooks before wry packs the webview; upstream a `WebViewExtUnix::gtk_box()` accessor PR to wry and pin via `[patch.crates-io]`). Output: ADR-134 picking the successful avenue, or, if all three fail on the spike, triggering the documented fallback (Route A + PRD revision). **Session 037** lands `crates/kino-player/src/libmpv.rs` as a peer driver behind a `libmpv-inprocess` Cargo feature flag; the `PlayerHandle` trait abstraction means `kino-app`'s `spawn_platform_player` branch is the only host-side change, gated by `#[cfg(feature = "libmpv-inprocess")]`. **Session 038** updates `.github/workflows/ci.yml` to install `libmpv2-dev` in the `lint` / `test` / `build-linux` apt-install lists; declares `libmpv2 (>= 2.1)` in `tauri.conf.json::bundle.linux.deb.depends`; verifies the AppImage bundler picks up libmpv (or documents a runtime dep); flips the feature flag on by default once §6B-1 has been re-verified locally on Ubuntu 22.04 + 24.04. **Session 039 (contingent)** files the §F-015 C3 PRD-revision proposal if 036's spike fails on all three avenues. Rejected alternatives: ship Route A immediately without trying Route B (concedes C3 unnecessarily); fork wry and maintain locally (substantial overhead, fork-rebase churn); swap the webview engine (catastrophic blast radius — PRD §1 implicitly locks Tauri 2). The convention this ADR establishes for §6A regressions whose closure crosses multiple architectural seams: split as scout (this session) → spike (prove the architecturally hard step is feasible) → implementation (the new code) → integration (CI + bundling + default flip). Each step is one session; the scout's ADR locks in the route ranking so future sessions don't re-litigate the choice. | 035 |
 | ADR-134 | **F-015 Linux libmpv Route B GTK-injection spike (Session 036): avenue (i) "walk + reparent post-window-realisation" succeeds via the PUBLIC Tauri 2.11.2 API surface; avenues (ii) "intercept window construction via builder hooks" and (iii) "upstream a wry accessor PR" from ADR-133 are NOT required.** Three orthogonal Tauri 2.11.2 public APIs compose into the surgery: (a) `WebviewWindow::with_webview(closure)` posts `closure: FnOnce(PlatformWebview)` onto the GTK main thread once the webview is realised (`tauri-2.11.2/src/webview/mod.rs:1668-1677`); (b) `PlatformWebview::inner()` returns the underlying `webkit2gtk::WebView` on Linux (`tauri-2.11.2/src/webview/mod.rs:173`); (c) `webkit2gtk::WebView` `@extends gtk::Container, gtk::Widget` (`webkit2gtk-2.0.2/src/auto/web_view.rs:58`) so `gtk::WidgetExt::parent()` returns the container the webview is packed into (always `gtk::Box` per Tauri 2.11.2's wry-driven structure — verified at `tauri-runtime-wry-2.11.2/src/lib.rs:5234-5238`). The surgery is six steps inside the with_webview closure: (1) `webview.parent()` → downcast to `gtk::Box`; (2) `vbox.remove(webview)`; (3) construct `gtk::Overlay::new()` + `gtk::GLArea::new()` (with `set_has_alpha(false)` + `set_auto_render(false)`); (4) `overlay.add(&gl_area)` + `overlay.add_overlay(webview)`; (5) `webview.set_background_color(&RGBA(0,0,0,0))` (gated behind webkit2gtk's `v2_8` Cargo feature) to make controls composite over the GL area; (6) `vbox.pack_start(&overlay, true, true, 0)` matching wry's pack arguments + `overlay.show_all()`. This ADR also locks in the spike's rollout convention: **production code under an opt-in runtime gate, not isolated examples.** The `inject_overlay` function lands in `crates/kino-player/src/surface.rs` as a PUBLIC API (not behind a Cargo feature flag), and is invoked at startup from `src-tauri/src/lib.rs::run_libmpv_surface_spike` iff env var `KINO_LIBMPV_SURFACE_SPIKE=1`. Default builds (and CI) load the module but do not invoke the surgery, so the runtime behavior on `main` is unchanged from Session 020's subprocess driver. Session 037 imports `kino_player::inject_overlay` directly (no API churn) and replaces the env-var gate with the `libmpv-inprocess` Cargo feature gate when the actual libmpv driver lands. Rejected alternatives: (1) **standalone `examples/` binary** — would force Session 037 to either rebuild the API or migrate code, neither cheap. (2) **`#[cfg(test)] mod spike`** — would scope the surgery to tests, but the runtime exercise is the whole point of the spike. (3) **Cargo feature flag from day one** — would require landing the `libmpv2 = "3"` dep in Session 036 (premature) AND would still need a feature-flag flip in Session 037, so the env var is a strictly simpler rollout for the spike scope. (4) **upstreaming a wry accessor PR (avenue (iii))** — unnecessary because Tauri already exposes the container via `default_vbox()`. (5) **intercepting `Builder::setup` / `on_window_event` (avenue (ii))** — unnecessary because the post-creation walk through `with_webview` is well-defined. This ADR also notes the workspace-feature-unification nuance: the explicit `webkit2gtk/v2_8` feature on kino-player's direct dep is needed for single-crate `cargo check -p kino-player` to succeed (sibling-crate `wry`'s `webkit2gtk/v2_38` feature does NOT propagate when only one crate is in the build graph; in `cargo --workspace` it does propagate via unification, but single-crate builds need self-sufficient feature declarations). | 036 |
+| ADR-135 | **F-015 Linux libmpv in-process driver (Session 037) opts kino-player's crate-level `[lints.rust] unsafe_code` from `forbid` to `deny`, scoping a single `#[allow(unsafe_code)]` to the `libmpv` module for one `libc::dlsym(RTLD_DEFAULT, ...)` FFI call. Every other module in kino-player remains unsafe-free under the relaxed lint.** ADR-030 documented the original `forbid(unsafe_code)` per-crate policy; Session 037 ran into the policy's strict-precedence semantics when wiring the libmpv2 6.0.0 `OpenGLInitParams::get_proc_address` callback. libmpv requires a `(name: &str) -> *mut c_void` symbol resolver; the natural primitive on Linux glibc is `libc::dlsym(RTLD_DEFAULT, name_cstr)` which is declared `unsafe extern "C"` and requires an `unsafe { ... }` block at every call site. `forbid` blocks any `#[allow(...)]` override at any narrower scope, so the only way to land the call under the original lint policy was to extract it into a separate crate with its own lint policy — a heavyweight option that adds a new workspace member for one function declaration. ADR-135 picks the lighter alternative: relax kino-player's lint to `deny` (still emits an error on accidental unsafe in any other module) and add a file-level `#![allow(unsafe_code)]` at the top of `crates/kino-player/src/libmpv.rs` (the second module-level attribute, right after `#![cfg(...)]`). The `unsafe { libc::dlsym(...) }` block carries a SAFETY comment documenting the dlsym contract: it's a pure symbol lookup over the process's already-loaded shared libraries, re-entrant + thread-safe per POSIX, and the returned function pointer libmpv is contractually allowed to call back into. The scoping convention this ADR establishes for future driver / FFI work: (a) keep the crate-level lint at `deny` (not `forbid`) so narrow exceptions are mechanically possible; (b) the `#![allow(unsafe_code)]` lives at the TOP of the module file (within the first 10 lines, immediately under any `#![cfg(...)]`) so a code reviewer can audit "which modules opt out of the deny" via a one-grep query; (c) every `unsafe { ... }` block carries a `// SAFETY: ...` comment justifying the call. Rejected alternatives: (1) **separate `kino-player-libmpv-sys` crate** — would add a new workspace member for one extern declaration + function, plus the cascading `[dependencies]` overhead in kino-player and the workspace `[workspace.members]` list. The complexity-to-payoff ratio doesn't justify the carve-out at the workspace level. (2) **build.rs-emitted code** — would push the unsafe into a generated file that bypasses the lint, but a build.rs that emits Rust code is harder to audit than a `#[allow]` on a hand-written module. (3) **dynamic library loading via `libloading` crate** — adds a heavier dep (libloading is ~1k LOC) for the same fundamental unsafe call (libloading's `Library::new` and `Symbol::get` are both unsafe). (4) **change ADR-030 to allow narrow unsafe carve-outs across the workspace** — out of scope for Session 037; a future session can broaden the convention if a second driver hits the same wall. This ADR does NOT broaden the workspace-wide policy; the `unsafe_code = "forbid"` lint stays in place for `kino-core`, `kino-metadata`, `kino-addons`, `kino-torrent`, `kino-server`, `src-tauri`, `tauri-plugin-kino-player`. Only kino-player crosses into `deny` because libmpv's callback design fundamentally requires the FFI call. | 037 |
 
 ---
 
@@ -10144,15 +10608,93 @@ consuming `OverlaySurgery::gl_area`) + Session 038 (CI
 matrix + bundle deps + default flip). See ADR-134 for the
 spike's avenue-choice rationale + rollout convention.
 
-This entry STAYS OPEN until Session 037 + 038 (the
-implementation + CI bundle integration) land, OR — in the
-fallback arc — Session 039's PRD-revision proposal is
-ratified by the human. The F-015 Feature Tracker checkbox
-stays `[ ]`. See the Session 035 entry for the full route
-scoring + verbatim source/citation set, the Session 036
-entry for the spike's API survey + surgery code, ADR-133 for
-the multi-session split rationale, and ADR-134 for the
-spike's avenue-choice outcome.
+**Driver landed (Session 037) — implementation EXISTS on
+`main` behind the `libmpv-inprocess` Cargo feature flag.**
+Session 037 added the ~700-LOC `crates/kino-player/src/
+libmpv.rs` module implementing `LibmpvPlayer` as a peer
+`PlayerHandle` driver via the [`libmpv2 = "6"`](https://
+crates.io/crates/libmpv2/6.0.0) Rust binding. Driver
+constructed via `LibmpvPlayer::new_attached(OverlaySurgery)`
+inside the same `with_webview` closure that runs the
+Session-036 surgery. PRD §F-015 / `mpv.conf` config applied
+inline via `init.set_property` calls + `apply-profile
+high-quality` post-init. OpenGL `RenderContext` built with
+`libc::dlsym(RTLD_DEFAULT, name)` as the proc-address
+callback (the process-wide symbol lookup resolves every GL
+symbol pulled in transitively by libwebkit2gtk's libepoxy
+linkage — no need for a separate `libepoxy-dev` link). The
+`GLArea::render` signal calls `RenderContext::render(0,
+w*scale, h*scale, true)` (flip=true for mpv's
+positive-Y-up orientation). libmpv's render-update
+callback bridges to a `glib::MainContext::default().
+spawn_local` future via `async_channel::unbounded` so
+`GLArea::queue_render` runs on the GTK main thread (the
+!Send GLArea lives in the local future; the Send + Sync
+channel sender lives in the libmpv callback).
+
+A dedicated `kino-libmpv-events` OS thread polls
+`mpv.wait_event(0.25s)` and translates libmpv property
+changes + `EndFile` / `FileLoaded` events into the same
+`PlayerEvent` vocabulary the subprocess driver already
+emits. Track-list is fetched as a JSON string via
+`mpv.get_property::<String>("track-list")` and parsed
+through the existing `TrackList::from_mpv_tracks` helper
+so both drivers share the parser.
+
+Host-side wiring: `src-tauri/src/lib.rs::
+setup_libmpv_inprocess` replaces the Session-036
+`run_libmpv_surface_spike` env-var path — under
+`#[cfg(all(target_os = "linux", feature =
+"libmpv-inprocess"))]` it runs the surface surgery, builds
+the LibmpvPlayer, and `app.manage`s the resulting
+`Arc<dyn PlayerHandle>` under a `LibmpvPlayerHandle`
+newtype. The Linux branch of `commands::
+spawn_platform_player` tries the managed handle first when
+the feature is on, falling through to the subprocess
+`MpvPlayer::spawn()` if the state isn't populated.
+
+When the feature is OFF (default through Session 037): the
+host's `setup()` block doesn't run any libmpv code; the
+subprocess driver remains the Linux player; CI builds are
+unchanged. ADR-135 documents the `unsafe_code = "deny"`
+lint carve-out the dlsym call requires.
+
+PRD §F-015 Linux acceptance status per constraint after
+Session 037:
+
+-   **C1: `libmpv-rs` in-process binding** — ✅ satisfied
+    (libmpv2 6.0.0; same author lineage as libmpv-rs).
+-   **C2: GL surface owned by the Tauri window** — ✅
+    satisfied (Session 036 surgery + Session 037
+    RenderContext bound to the freshly-injected GLArea).
+-   **C3: controls composited over the surface by the
+    browser** — ✅ satisfied structurally (Session 036
+    GtkOverlay layout + webview transparent background);
+    visual verification is §6B-1.
+-   **mpv config from `mpv.conf`** — ✅ every directive
+    applied (`vo=libmpv`, `hwdec=auto-safe`, `keep-open=
+    yes`, `cache=yes`, `demuxer-max-bytes=200 MiB`,
+    `demuxer-readahead-secs=20`, `audio-spdif=...`,
+    `sub-auto=fuzzy`, `sub-ass=yes`, `idle=yes`, +
+    `apply-profile high-quality`).
+
+This entry STAYS OPEN until **Session 038** lands the CI
+matrix update (apt-install `libmpv-dev` + `libgtk-3-dev`
+in `lint`/`test`/`build-linux`; bundle deps in
+`tauri.conf.json::bundle.linux.deb.depends`; flip the
+feature on by default) AND a human re-verifies §6B-1
+locally (Linux AppImage launches + libmpv plays a stream
+end-to-end with controls overlay functional on Ubuntu
+22.04 + 24.04). The F-015 Feature Tracker checkbox stays
+`[ ]` until both gates close.
+
+See the Session 035 entry for the full route scoring +
+verbatim source/citation set, the Session 036 entry for
+the spike's API survey + surgery code, the Session 037
+entry for the driver implementation rationale + verified
+clippy/test commands, ADR-133 for the multi-session split
+rationale, ADR-134 for the spike's avenue-choice outcome,
+and ADR-135 for the unsafe-code carve-out convention.
 
 ### ~~F-016 §4 / Cache directory picker~~ — RESOLVED in Session 029
 

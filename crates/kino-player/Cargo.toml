@@ -9,7 +9,13 @@ repository.workspace = true
 description = "Native player drivers for kino (Linux mpv subprocess; Android plugin wiring lives in src-tauri)."
 
 [lints.rust]
-unsafe_code = "forbid"
+# `deny` rather than `forbid` so the F-015 libmpv-inprocess driver
+# (Session 037) can call `libc::dlsym(RTLD_DEFAULT, ...)` for OpenGL
+# function pointer resolution (see ADR-135). The carve-out is scoped
+# to the libmpv module via `#![allow(unsafe_code)]`; the other
+# modules in this crate (`mpv`, `surface`, `ipc`, `event`, etc.)
+# remain unsafe-free under the crate-level deny.
+unsafe_code = "deny"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
@@ -43,10 +49,59 @@ uuid = { workspace = true }
 # feature set is `v2_38`; the explicit `v2_8` here just makes the
 # single-crate `cargo check -p kino-player` build (which doesn't pull
 # in wry) self-sufficient.
+#
+# `glib` is the GObject runtime gtk/gdk/webkit2gtk all stand on; we use
+# it directly for `idle_add_local_once` (the post-update redraw dispatch
+# from libmpv's render thread back onto the GTK main thread). Same 0.18
+# pin as gtk/gdk.
+#
+# `libmpv2` is the in-process libmpv binding (PRD §F-015 + ADR-133 Route
+# B + ADR-134 / Session 036 spike). OPTIONAL + gated by the
+# `libmpv-inprocess` feature so default builds (and CI through Session
+# 037) DO NOT require `libmpv2-dev` at link time. Session 038 adds the
+# `libmpv2-dev` apt-install line and flips the feature on by default
+# after §6B-1 hardware verification.
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
 gdk = "0.18"
+glib = "0.18"
 webkit2gtk = { version = "2.0", features = ["v2_8"] }
+libmpv2 = { version = "6", optional = true }
+# `async-channel` is the recommended replacement for the deprecated
+# `glib::MainContext::channel`. The libmpv driver uses it to bridge
+# libmpv's render-update callback (which fires on libmpv's render
+# thread) to a GTK main-context `spawn_local` future that calls
+# `GLArea::queue_render` (which must run on the GTK main thread).
+# `async-channel`'s `Sender<T>` is `Send + Sync`; the future
+# captured by `spawn_local` is allowed to be `!Send` (the GLArea
+# clone lives there). Feature-gated to keep the default build
+# dependency-graph unchanged.
+async-channel = { version = "2", optional = true }
+# libc is used by the libmpv driver for `dlsym(RTLD_DEFAULT, ...)` —
+# libmpv's render API needs a `get_proc_address(name) -> ptr` callback
+# for OpenGL function pointer resolution; on Linux glibc the `RTLD_
+# DEFAULT` handle (null) gives process-wide symbol lookup that covers
+# every GL symbol pulled in transitively by libwebkit2gtk's libepoxy
+# linkage. libepoxy itself does NOT export a generic
+# `epoxy_get_proc_address` symbol (only `epoxy_eglGetProcAddress` /
+# `epoxy_glXGetProcAddress` function pointers), so the dlsym route is
+# the simplest cross-backend approach.
+libc = { version = "0.2", optional = true }
+
+# Crate-level Cargo features.
+#
+# `libmpv-inprocess`: enables the F-015 Linux in-process libmpv driver
+# (Session 037 / ADR-133 / ADR-134). When ON the [`libmpv`] module is
+# compiled and `LibmpvPlayer` is re-exported; the host's setup() block
+# invokes [`inject_overlay`] + [`LibmpvPlayer::new_attached`] and the
+# Tauri command layer routes `player_open` through the in-process
+# driver instead of the subprocess `MpvPlayer`. When OFF the module
+# is excluded from the build and there's no link dependency on
+# `libmpv`. OFF by default until Session 038's CI matrix + bundle
+# integration land.
+[features]
+default = []
+libmpv-inprocess = ["dep:libmpv2", "dep:async-channel", "dep:libc"]
 
 [dev-dependencies]
 tokio = { workspace = true }
