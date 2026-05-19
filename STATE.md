@@ -1,9 +1,9 @@
 # kino — Agent State
 
 **PRD version:** 1.0 (locked)
-**Status:** v1.0.0-alpha.1 release pipeline shipped. **Session 034 files the F-013 / F-014 librqbit-blocked §6A closure path** — a formal PRD revision request under "PRD Issues" proposing surgical relaxations of two PRD §F-013 / §F-014 invariants to "best-effort, subject to torrent engine API capabilities". This is the Session-033-recommended option (d) of the F-013 / F-014 closure plan (file a PRD revision so the human can ratify) — the strongly-recommended first move because options (a)/(b)/(c) (upstream PR, fork librqbit, engine swap) all require coordination the agent can't drive solo within a single session, while option (d) is documentation-only work the agent CAN drive end-to-end and parks the §6A gate behind a single human ratification decision. The proposal documents (a) the exact librqbit 8.1.1 public API surface (`SessionOptions` exposes only timeouts, bandwidth ratelimits, `concurrent_init_limit`, DHT/peer toggles — no `max_connections_per_torrent`; `PeerConnectionOptions` exposes only `connect_timeout` / `read_write_timeout` / `keep_alive_interval`; `FilePriorities` and `chunk_tracker_*` are `pub(crate)`-only); (b) confirmation via crates.io that 8.1.1 IS the latest published librqbit (no newer version exposes the missing options); (c) a sketched upstream PR shape (what fields to expose on which structs) so the human can choose to pursue (a) in parallel; (d) the exact verbatim proposed PRD revision text for §F-013 "Max connections per torrent" and §F-014 "Piece priorities mapped to librqbit". **The §6A F-013 + F-014 entries are NOT flipped to RESOLVED this session** — the agent cannot self-ratify a PRD revision; that decision belongs to the human. The two entries are amended to point at the new PRD Issues block as the chosen closure path. F-013 and F-014 stay `[ ]` in the Feature Tracker. **One §6A regression now actionable by the agent solo remains**: F-015 Linux libmpv in-window GL surface (multi-session ADR-108 deviation — Session 035 should pick this up as a scout session enumerating X11 `--wid` vs Wayland subsurface vs deep webkit-gtk integration routes). **§6A is still not claimable.** See ADR-132 in the Session 034 entry below.
-**Last session:** 034 (F-013 + F-014 PRD revision proposal — added "§F-013 + §F-014 librqbit-blocked invariants" entry to "PRD Issues" in STATE.md quoting the locked PRD wording, citing the librqbit 8.1.1 public-API gap with file:line references to `peer_connection.rs:57` / `session.rs:382` / `limits.rs:10` / `chunk_tracker.rs:218` in the registry copy, listing the four closure paths (a)/(b)/(c)/(d) with concrete cost estimates, sketching the upstream-PR diff shape, and proposing exact verbatim PRD revision text for §F-013 line "Max connections per torrent: 200" → "Max connections per torrent: 200 (best-effort, subject to torrent engine API capabilities)" and §F-014 "Piece priorities mapped to librqbit:" block to a tiered "where the engine exposes a piece-priority API … where it does not" formulation. Updated §6A F-013 and §6A F-014 entries to reference the new PRD Issues block as the chosen closure path. ADR-132 documents the decision rationale. No code changes; no test changes — the librqbit consumer code in `crates/kino-torrent/src/engine.rs` and `monitor.rs` already comments the gap accurately (lines 18-22 of `engine.rs` and lines 23-28 of `monitor.rs` cited verbatim in the proposal). The §6A F-013 and F-014 entries stay OPEN; F-013 and F-014 stay `[ ]`.)
-**Next session:** 035 — sole agent-actionable §6A regression remaining is **F-015 Linux libmpv in-window GL surface** (multi-session ADR-108 deviation). Recommended Session-035 scope: a scout session that catalogs the available webview-surface access routes on Tauri 2 / WebKitGTK — X11 `--wid` parent-window hand-off (mature, Wayland-incompatible by default), Wayland subsurface protocol negotiation (deep webkit-gtk work), or a render-context-aware peer driver. Output: a new ADR documenting the chosen route + a follow-up session scope sketch. F-013 / F-014 §6A closure is parked on human PRD-revision ratification — if/when the human accepts the Session-034 proposal a follow-up session can flip those §6A entries to RESOLVED in one diff (no code changes needed beyond a STATE.md text edit). Parallel agent work on the F-015 Linux scout does not depend on the F-013 / F-014 ratification.
+**Status:** v1.0.0-alpha.1 release pipeline shipped. **Session 035 files the F-015 Linux libmpv in-window GL surface scout** — a documentation-only enumeration of the webview-surface access routes available on Tauri 2.11.2 / wry 0.55.1 / webkit2gtk 2.0.2, evaluated against PRD §F-015's three locked constraints (C1: `libmpv-rs` in-process binding; C2: GL surface owned by the Tauri window; C3: controls composited over the surface by the browser). Five routes catalogued — A (X11 `--wid` child-window embed), B (libmpv render-API into a `GtkGLArea` sibling of `WebKitWebView` under a `GtkOverlay`), C (Wayland `wl_subsurface` protocol bypassing GTK), D (status quo subprocess + own window per ADR-108), E (frameless transparent peer window with geometry-tracking) — each scored on the three constraints + the prerequisite-spike cost. **Route B is the only route that satisfies all three constraints** (C1 ✅ in-process; C2 ✅ same `GtkWindow` widget tree; C3 ✅ transparent `WebKitWebView` rendered above the `GtkGLArea` by GTK compositing). Route B's prerequisite is reaching wry's internal child-widget tree to inject a `GtkOverlay`; wry 0.55 does NOT expose the `gtk::Box`/`gtk::Container` it packs `WebKitWebView` into, so the implementation session must either (i) upstream a `WebViewExtUnix::gtk_container()` accessor to wry, (ii) reparent via `gtk::WidgetExt::parent()` walking after window construction, or (iii) construct the `GtkOverlay` ahead of wry by using Tauri's `on_window_event` builder hook. ADR-133 locks in: attempt Route B's GTK-injection spike in Session 036; fall back to Route A (X11-`--wid` via `libmpv-rs::set_property("wid", xid)`) with a §F-015 C3 PRD-revision proposal under "PRD Issues" if the spike fails. No code changes; STATE.md-only diff. **§6A is still not claimable** — F-013 / F-014 remain human-gated on the Session-034 PRD revision; F-015 Linux libmpv remains OPEN until the implementation session lands the chosen route. See ADR-133 in the Session 035 entry below.
+**Last session:** 035 (F-015 Linux libmpv in-window GL surface scout — enumerated five route candidates against PRD §F-015's three locked constraints; recommended Route B (libmpv render-API into a `GtkGLArea` sibling of `WebKitWebView` under a `GtkOverlay`) as the PRD-fully-compliant primary path with a wry-internal-widget-tree-injection spike as the Session-036 prerequisite, AND Route A (X11 `--wid` via `libmpv-rs` in-process) as the fallback if the spike fails — with a paired §F-015 C3 PRD-revision proposal to be filed under "PRD Issues" under the Session-034 ADR-132 framework if Route A is selected. ADR-133 documents the route ranking, the dependency cost (libmpv2-dev in CI + libmpv2 runtime dep), and the multi-session implementation sketch (Session 036 spike → 037 driver → 038 CI matrix → optional 039 fallback PRD-revision). Amended the §6A F-015 / Linux libmpv in-window GL surface entry with a "Route picked (Session 035)" subsection citing ADR-133. F-015 stays `[ ]` in the Feature Tracker; the §6A entry stays OPEN. No code changes; no test changes — the existing subprocess driver at `crates/kino-player/src/mpv.rs` (Session 020) and the cross-platform `PlayerHandle` surface at `crates/kino-player/src/handle.rs` are intentionally unchanged because the chosen route's drop-in pattern (per ADR-108's "peer driver behind a Cargo feature flag" wording) means Session 036+ adds `crates/kino-player/src/libmpv.rs` as a sibling without touching the subprocess driver's call sites.)
+**Next session:** 036 — F-015 Linux libmpv in-window GL surface, Route B GTK-injection spike. Recommended Session-036 scope per ADR-133: a focused spike that determines whether wry's internal GTK widget hierarchy can be augmented to host a `GtkGLArea` sibling of the `WebKitWebView`. Three avenues to attempt in priority order: (i) walk the `gtk::ApplicationWindow` widget tree returned by Tauri's `WebviewWindow::gtk_window()` and reparent the existing `WebKitWebView` into a freshly-constructed `GtkOverlay` containing both the GL area and the webview, (ii) use Tauri's `tauri::Builder::on_page_load` / `on_window_event` builder hooks to intercept window creation before wry packs the webview, (iii) upstream a `WebViewExtUnix::pack_into_box(&gtk::Box)` accessor PR to wry and pin to the patched version via `[patch.crates-io]`. Spike output: an ADR-134 documenting which avenue succeeds (or all three fail → trigger the fallback path), a 50-100 LOC proof-of-concept demonstrating that a non-`WebKitWebView` GTK widget renders inside the Tauri window with the webview transparent on top. If the spike fails, Session 036 also files the §F-015 C3 PRD-revision proposal under "PRD Issues" (per ADR-132's human-gated §6A pattern from Session 034). F-013 / F-014 §6A closure is parked on human PRD-revision ratification — if/when the human accepts the Session-034 proposal a follow-up session can flip those §6A entries to RESOLVED in one diff (no code changes needed beyond a STATE.md text edit). Parallel agent work on the F-015 Linux Route B spike does not depend on the F-013 / F-014 ratification.
 
 ---
 
@@ -68,6 +68,512 @@ a hard requirement.
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 035 — F-015 Linux libmpv in-window GL surface scout
+
+**Branch:** `claude/kino-prd-compliance-SijLL` (harness-supplied; see
+ADR-033 — the harness reuses a single branch name for this checkout,
+the branch name does NOT track the session number).
+
+**Scope chosen:** F-015 Linux libmpv in-window GL surface — Session-035
+scout. The Session 034 entry pre-selected this as the sole
+agent-actionable §6A regression remaining after Sessions 028 / 029 /
+030 / 031 / 032 / 033 closed every other §6A entry and Session 034
+parked F-013 / F-014 behind a human-gated PRD revision proposal
+(ADR-132). The Session 027 audit + ADR-118 classify the multi-session
+ADR-108 deviation (subprocess mpv + own window) as a §6A regression
+requiring a code-or-PRD-revision close; this session does the scout
+half of the multi-session split. Bundle size: 0 LOC production code, 0
+LOC test code, ~450 lines of STATE.md text (1 new Sessions Log entry,
+1 new ADR, 1 §6A F-015 entry amendment).
+
+**Pre-implementation verification (workspace landscape):**
+
+The route-selection turns on Tauri 2 / wry / webkit2gtk's
+widget-tree access surface. Session 035 confirmed the workspace's
+relevant crate versions and the existing player wiring before
+enumerating routes:
+
+1.  **Tauri / wry / webkit2gtk versions (Cargo.lock).** `tauri =
+    2.11.2`, `tauri-runtime-wry = 2.11.2`, `wry = 0.55.1`,
+    `webkit2gtk = 2.0.2` (Rust binding crate), `gtk = 0.18.2`,
+    `raw-window-handle = 0.6.2`. The webkit2gtk-2.0.2 binding
+    targets the system's `libwebkit2gtk-4.1` (Tauri 2's preferred
+    series; ADR-034). Confirmed via `grep -A 1 '^name = "tauri"$'
+    Cargo.lock` and the workspace `Cargo.toml` is unchanged from
+    Session 034's HEAD.
+
+2.  **Existing Linux driver location.**
+    `crates/kino-player/src/mpv.rs` (Session 020) — a subprocess
+    driver: spawns `mpv --idle=yes --no-terminal
+    --force-window=immediate --input-ipc-server=<socket>`, drives it
+    via JSON IPC over a Unix domain socket. The driver opens its
+    OWN top-level window (per `--force-window=immediate`). This is
+    the ADR-108 deviation: the player's render surface is a
+    separate X / Wayland top-level, NOT a child surface inside
+    Tauri's `GtkApplicationWindow`. ADR-118 re-classified the
+    deviation as a §6A regression per the strict reading of PRD
+    §6A.2 ("Every code-acceptance criterion ... satisfied by code
+    on `main`" — no ADR-as-escape-clause carve-out).
+
+3.  **`PlayerHandle` trait abstraction.**
+    `crates/kino-player/src/handle.rs` defines `PlayerHandle: Send
+    + Sync` with `&self` methods (`open` / `close` / `set_paused` /
+    `seek` / `select_audio_track` / `select_subtitle_track` /
+    `snapshot` / `subscribe` / `tracks`). The Tauri host stores
+    `Arc<dyn PlayerHandle>` in `commands::PlayerRuntime` and
+    invokes per-platform spawning via
+    `spawn_platform_player(&app_handle)` — Linux returns
+    `MpvPlayer::spawn().await` (subprocess), Android returns
+    `tauri_plugin_kino_player::handle(app)` (singleton plugin),
+    everything else returns `Err(Unsupported)`. The trait
+    abstraction means a new Linux peer driver
+    (`crates/kino-player/src/libmpv.rs`) can be added as a sibling
+    behind a `#[cfg(feature = "libmpv-inprocess")]` gate without
+    touching ANY of the host's command call sites; only the
+    `#[cfg(target_os = "linux")]` `spawn_platform_player` branch
+    in `src-tauri/src/commands.rs:4304-4310` (verified) selects
+    the new driver when the feature is active.
+
+4.  **Tauri window configuration today.** `src-tauri/tauri.conf.json`
+    declares one window — `"title": "kino"`, `"width": 1280`,
+    `"height": 800`, `"transparent": false`, `"decorations": true`.
+    Routes that require GTK-level transparency / webview
+    transparency MUST flip `"transparent": true` (or carry a
+    separate player window with its own transparent config). The
+    `app.security.csp` headers do not affect GL embedding (CSP
+    governs frontend resource loading, not native compositing).
+
+5.  **PRD §F-015 verbatim quote** (`PRD.md:701-706`, locked):
+    ```
+    Implementation: libmpv via `libmpv-rs` rendered into a GL
+    surface owned by the Tauri window.
+
+    - The SolidJS frontend reserves a fullscreen container for the
+      GL surface during playback
+    - mpv renders directly into the surface
+    - Controls (play/pause, seek, audio/sub track selectors, info)
+      are SolidJS overlay elements composited over the surface by
+      the browser
+    - mpv events bridged to the frontend via Tauri events
+    ```
+
+    The three architectural constraints unpacked from this block:
+
+    -   **C1: `libmpv-rs` in-process binding.** The driver links
+        against `libmpv` at build time and runs in the same
+        process as the Tauri host. ADR-108's subprocess driver
+        violates this (mpv is a separate OS process).
+    -   **C2: GL surface owned by the Tauri window.** The mpv
+        render target lives INSIDE Tauri's `GtkApplicationWindow`
+        widget tree, NOT in a separately-owned top-level X11 /
+        Wayland surface. ADR-108's subprocess driver violates
+        this (mpv opens its own top-level window via
+        `--force-window=immediate`).
+    -   **C3: Controls composited over the surface by the
+        browser.** The `WebKitWebView` sits ABOVE the GL surface
+        in GTK z-order, with transparent regions revealing the
+        video underneath. This requires (a) transparent
+        `WebKitWebView` background, (b) GTK overlay layout with
+        the GL area as the first child and the webview as the
+        second child, and (c) a frontend CSS surface where
+        controls have explicit `background-color: rgba(..., a)`
+        on opaque rectangles.
+
+6.  **libmpv render-API surface (libmpv ≥ 0.34, packaged on Ubuntu
+    24.04 as `libmpv2-dev`).** The C API exposes
+    `mpv_render_context_create` with
+    `MPV_RENDER_PARAM_API_TYPE = "opengl"`, accepting an
+    `MPV_RENDER_PARAM_OPENGL_INIT_PARAMS` struct carrying a
+    `get_proc_address` callback. The host then calls
+    `mpv_render_context_render` with
+    `MPV_RENDER_PARAM_OPENGL_FBO` (pointing at an `(fbo, w, h)`
+    tuple) on every frame, typically driven by a vsync source
+    (`GtkGLArea::queue_render`). This is the canonical "render
+    into a host-owned GL surface" path and is what Route B
+    consumes. The Rust binding crate ecosystem candidates:
+    `libmpv2 = "3.x"` (active fork, supports libmpv 0.34+,
+    crates.io), `libmpv-sirno`, `libmpv = "2.x"` (older,
+    unmaintained since 2018). Session 036 picks the binding
+    crate; the scout is binding-agnostic.
+
+**Implementation:**
+
+This is a documentation-only session. No source files are touched;
+all output lands in STATE.md. The route enumeration, evaluation,
+and recommendation:
+
+#### Route enumeration
+
+**Route A — X11 `--wid` child-window embed**
+
+- **Mechanism.** Pass the Tauri window's X11 Window ID
+  (`xid: u64`) to libmpv via either subprocess flag
+  (`mpv --wid=<xid> ...`) or in-process property set
+  (`mpv.set_property("wid", xid as i64)`). libmpv creates a child
+  X window of the given parent and renders its video output into
+  the child window's surface. The child X window sits ABOVE the
+  parent's drawn content (X11 z-order rule: children always
+  render above the parent's content, you cannot stack the parent's
+  drawing on top of a child).
+- **C1 (`libmpv-rs` in-process):** ✅ if used with the in-process
+  binding crate via `mpv.set_property("wid", xid)`. ❌ if used
+  with the subprocess form (status quo).
+- **C2 (GL surface owned by Tauri window):** ⚠️ weakly. The video
+  surface is a child X window OWNED by (parented to) the Tauri
+  window, but it isn't strictly a GL surface the Tauri window's
+  GL context renders into; libmpv creates its own GL context
+  bound to the child X window. The "owned by" wording is
+  ambiguous here — a literal reading ("Tauri window's own GL
+  surface") fails, a relaxed reading ("inside the Tauri window's
+  surface hierarchy") passes.
+- **C3 (controls composited over by the browser):** ❌. The
+  child X window renders ABOVE the parent's webview drawing.
+  Webview controls cannot composite OVER the video region; X11
+  z-order is fixed at child-above-parent. Two non-fixes:
+  (a) put controls in a non-video region (PRD-locked
+  "fullscreen container" makes this infeasible — the GL surface
+  occupies the whole window), (b) use a sibling X window above
+  the mpv child for the controls (an XEMBED chain; webview would
+  have to render INTO that sibling, which webkit2gtk doesn't
+  support).
+- **Wayland feasibility:** ❌ by default. libmpv's `wid` property
+  is X11-only. Forcing `GDK_BACKEND=x11` makes the app run as an
+  XWayland client, which works but defeats the user's Wayland
+  session and has known HDR / DV / colorspace regressions
+  (XWayland's color management is incomplete).
+- **Dependency cost:** +libmpv runtime dep (Ubuntu 24.04:
+  `libmpv2`); the in-process variant also needs `libmpv2-dev` at
+  build time; either the `libmpv2 = "3"` Rust binding crate or
+  the subprocess form (already present).
+- **PRD compliance:** partial. Honors C1 (in-process variant
+  only); C2 weakly; C3 outright fails.
+- **Implementation cost:** ~1-2 sessions for the in-process
+  variant (driver scaffold + `wid` binding + CI install of
+  `libmpv2-dev`); the subprocess variant is a one-line change
+  from the existing `mpv.rs` (add `--wid=${xid}` to the
+  command line) but doesn't change PRD compliance.
+- **Verdict:** PRIMARY FALLBACK. Use if Route B's GTK-injection
+  spike fails (per ADR-133). Requires a paired §F-015 C3
+  PRD-revision proposal under "PRD Issues" per the Session 034
+  / ADR-132 framework, because C3 is unsatisfiable with this
+  route.
+
+**Route B — `libmpv` render-API into a `GtkGLArea` sibling of `WebKitWebView` under a `GtkOverlay`**
+
+- **Mechanism.** Restructure the Tauri window's child widget
+  hierarchy as a `GtkOverlay` with two children: a `GtkGLArea`
+  at z-order 0 (the GL surface mpv renders into via the libmpv
+  render-API), and the existing `WebKitWebView` at z-order 1
+  with a transparent background
+  (`webkit_web_view_set_background_color(&view, &(0,0,0,0))`).
+  The Tauri window flips `transparent: true` so the GTK root
+  honors alpha; the webview's `<body>` CSS sets `background:
+  transparent` so the SolidJS controls (opaque rectangles with
+  their own background) sit on top of the video while the
+  fullscreen container reveals it.
+- **C1 (`libmpv-rs` in-process):** ✅. libmpv loaded via
+  `libmpv2 = "3"` (or equivalent), `Mpv::new` + render context
+  initialised against the `GtkGLArea`'s GL context.
+- **C2 (GL surface owned by Tauri window):** ✅. The `GtkGLArea`
+  is a child of the same `GtkApplicationWindow` Tauri creates;
+  the GL context the GL area provides is owned by the same
+  process and the same window's widget tree.
+- **C3 (controls composited over by the browser):** ✅. GTK's
+  overlay compositor blends the webview's transparent regions
+  with the GL area underneath. WebKit2GTK supports transparent
+  backgrounds since 2.18; the controls' opaque rgba rectangles
+  composite normally.
+- **Wayland feasibility:** ✅. `GtkGLArea` uses EGL on Wayland
+  and GLX on X11; the libmpv render-API works against either.
+  Same code on both backends.
+- **Dependency cost:** +libmpv runtime + build dep (Ubuntu
+  24.04: `libmpv2-dev`); +`libmpv2 = "3"` Rust binding crate;
+  CI workflow gains `libmpv2-dev` in the apt install list (3
+  workflows: ci.yml `lint`, `test`, `build-linux`).
+- **PRD compliance:** FULL. All three constraints satisfied.
+- **Implementation cost:** **multi-session, blocked on a
+  prerequisite.** The blocker is reaching wry's internal
+  `WebKitWebView` widget tree. wry 0.55.1 does NOT publicly
+  expose the `gtk::Box` / `gtk::Container` it packs the webview
+  into; `Window::gtk_window()` returns the outer
+  `gtk::ApplicationWindow`, but the child layout is wry's. Three
+  candidate avenues to attempt the injection (the Session 036
+  spike):
+    1.  **Walk + reparent.** After Tauri builds the window,
+        walk `gtk_window.children()` to find the
+        `WebKitWebView`, unparent it, construct a `GtkOverlay`,
+        add the GL area + the webview, set the overlay as the
+        window's new child. Risk: wry may install signal
+        handlers / size-allocate callbacks that don't survive
+        reparenting cleanly; reparenting a `WebKitWebView`
+        across containers is documented as supported by
+        webkit2gtk but rare.
+    2.  **Pre-construct via `tauri::Builder::on_page_load`.**
+        Inject the GL area BEFORE wry packs the webview, by
+        intercepting the window-creation event. Tauri 2's
+        builder exposes `setup(|app| { ... })` and per-window
+        `on_window_event` hooks; whether these fire EARLY
+        enough to pre-pack a sibling widget is the spike
+        question.
+    3.  **Upstream `WebViewExtUnix::gtk_box()` to wry.** Submit
+        a PR to tauri-apps/wry exposing the internal `gtk::Box`
+        as a public accessor. Pin to the patched version via
+        `[patch.crates-io]` until upstream merges + releases.
+        Cost: 1-2 person-weeks of upstream review.
+- **Verdict:** RECOMMENDED PRIMARY (ADR-133). The only route
+  that fully satisfies PRD §F-015. Multi-session: Session 036
+  spike → 037 driver implementation → 038 CI matrix + bundling.
+
+**Route C — Wayland `wl_subsurface` protocol bypassing GTK**
+
+- **Mechanism.** Acquire the Tauri window's `wl_surface*` via
+  `gdk_wayland_window_get_wl_surface(gtk_window.window())`, then
+  use the Wayland `wl_subcompositor::get_subsurface(parent)`
+  protocol to create a child subsurface. Drive libmpv against
+  that subsurface via its EGL render-API.
+- **C1:** ✅ in-process.
+- **C2:** ⚠️ weakly. The subsurface is a CHILD of the Tauri
+  window's wl_surface but is not, strictly, "a GL surface owned
+  by the Tauri window" — it's a sibling surface in the
+  compositor's tree, parented to the Tauri surface but with its
+  own independent GL context.
+- **C3:** ⚠️. Wayland subsurface z-ordering relative to the
+  webview's own subsurface tree (webkit2gtk uses subsurfaces
+  internally for hardware video / DRM acceleration paths) is
+  vendor-specific and not contractually stable; the controls
+  may or may not composite above the video depending on the
+  compositor implementation. This is a known sharp edge.
+- **Wayland feasibility:** ✅ (Wayland-only by definition).
+- **X11 feasibility:** ❌. Wayland-only.
+- **Dependency cost:** +`wayland-client` + `gdk-wayland-sys` (or
+  direct ABI bindings); +libmpv runtime + build dep; X11
+  fallback would still need Route A or B in parallel — code
+  surface doubles.
+- **PRD compliance:** weak on C2; X11-incompatible.
+- **Implementation cost:** highest. Two parallel render paths
+  (Wayland-native + an X11 fallback), each multi-session, with
+  vendor-specific subsurface z-order bugs to track.
+- **Verdict:** REJECTED. Wayland-only path with weaker
+  compliance than Route B and double the code surface (the X11
+  fallback still requires Route A or B for X11 sessions).
+
+**Route D — Status quo subprocess + own window (ADR-108)**
+
+- **Mechanism.** Current Session-020 driver. mpv runs as a
+  child OS process, opens its own top-level X11 / Wayland
+  window via `--force-window=immediate`, communicates with the
+  host via a Unix-domain JSON IPC socket. Two windows on the
+  user's screen at playback time (the Tauri control window + the
+  mpv playback window).
+- **C1:** ❌ subprocess.
+- **C2:** ❌ separate top-level surface.
+- **C3:** ❌ controls and video are in different top-level
+  windows, cannot composite.
+- **Wayland feasibility:** ✅.
+- **X11 feasibility:** ✅.
+- **Dependency cost:** zero (current state).
+- **PRD compliance:** fails all three. This IS the §6A
+  regression.
+- **Verdict:** REJECTED for §6A closure. Stays as the default
+  shipping path until Session 036+'s chosen route lands behind
+  a `libmpv-inprocess` Cargo feature flag.
+
+**Route E — Frameless transparent peer window with geometry-tracking**
+
+- **Mechanism.** mpv opens its own borderless / always-on-top
+  window; the host watches the Tauri window's
+  position/size/focus events and continuously repositions /
+  resizes the mpv window to track it. The Tauri window stays in
+  front of (or transparent over) the mpv window so the SolidJS
+  controls appear to overlay the video.
+- **C1:** ⚠️ technically the subprocess form, but could use the
+  in-process binding.
+- **C2:** ❌ two top-level surfaces, regardless of geometry
+  tracking they are NOT owned by each other.
+- **C3:** ⚠️ visually approximates compositing but breaks under
+  multi-monitor moves, alt-tab focus loss, window manager
+  workspace switches, and resize lag artifacts. Mouse-event
+  passthrough between the two windows is fragile (input goes to
+  whichever window the WM's input focus is on, not to whichever
+  window has the cursor over it).
+- **Wayland feasibility:** ⚠️. Wayland tightly restricts
+  cross-window geometry queries; many compositors do not let
+  applications track other windows' positions reliably. Some
+  Wayland WMs forbid always-on-top peer windows outright.
+- **X11 feasibility:** ⚠️ tractable with `XQueryPointer` /
+  `XGetGeometry` but has classic flicker / sync issues at every
+  resize.
+- **Dependency cost:** moderate; new window-event-tracking glue
+  code.
+- **PRD compliance:** weak on C2; visually fragile on C3.
+- **Verdict:** REJECTED. Visually approximates the goal but
+  isn't structurally PRD-compliant and has known UX bugs in real
+  WM scenarios.
+
+#### Recommendation
+
+**Primary path: Route B.** It is the only route that satisfies
+all three PRD §F-015 constraints. Per ADR-133:
+
+1.  **Session 036 (spike).** Determine whether wry's internal
+    GTK widget tree can be augmented to host a `GtkGLArea`
+    sibling of `WebKitWebView` under a `GtkOverlay`. Attempt
+    three avenues in priority order: walk + reparent, page-load
+    hook, upstream wry PR. Output: ADR-134 picking the
+    successful avenue or, if all three fail, triggering the
+    fallback path.
+2.  **Session 037 (driver implementation).** Add
+    `crates/kino-player/src/libmpv.rs` as a peer driver behind
+    a `libmpv-inprocess` Cargo feature flag. The driver
+    `impl PlayerHandle` matches the existing `MpvPlayer`
+    surface; the only `kino-app` side change is the
+    `#[cfg(target_os = "linux")]` `spawn_platform_player`
+    branch picking between the subprocess and in-process driver
+    based on the feature gate.
+3.  **Session 038 (CI matrix + bundling).** Add
+    `libmpv2-dev` to the `lint` / `test` / `build-linux` job
+    apt-install lists in `.github/workflows/ci.yml`. Update
+    `src-tauri/tauri.conf.json::bundle.linux.deb.depends` to
+    include `libmpv2 (>= 2.1)`. Verify the AppImage bundler's
+    `bundleMediaFramework: true` either includes libmpv or
+    declare a runtime dep in the AppImage's README. Flip the
+    feature flag on by default once §6B-1 has been re-verified
+    locally on Ubuntu 22.04 + 24.04.
+
+**Fallback path: Route A (in-process via libmpv-rs `wid` property) +
+§F-015 C3 PRD-revision proposal.** If Session 036's spike
+demonstrates that wry's widget tree cannot be augmented within
+reasonable scope, fall back to Route A (in-process libmpv-rs +
+`mpv.set_property("wid", xid)`) and file a paired PRD revision
+under "PRD Issues" relaxing §F-015 C3 ("controls composited over by
+the browser") to "controls composited over by the browser where
+the platform's webview engine supports transparent rendering above
+GL-rendered child surfaces; on platforms that do not support such
+compositing, the controls render in the non-video region of the
+Tauri window" — same Session 034 / ADR-132 human-gated §6A pattern.
+
+**Rejected paths: Routes C, D, E.** C is Wayland-only and has weaker
+C2/C3 compliance than B. D is the status quo (the regression
+itself). E is structurally broken on C2 and has known
+multi-monitor / WM UX bugs.
+
+**Files changed (summary):**
+
+-   `STATE.md` only:
+    -   Top-of-file `Status`, `Last session`, `Next session` lines
+        updated.
+    -   New `Session 035` entry under `## Sessions Log`
+        (prepended).
+    -   New `ADR-133` row in the `## Architectural Decisions Log`
+        table.
+    -   `### F-015 / Linux libmpv in-window GL surface` section
+        under `## §6A Code-Acceptance Regressions` amended with a
+        `**Route picked (Session 035):**` subsection pointing at
+        ADR-133 and the Session 035 entry.
+
+**Features advanced:** none. F-015 stays `[ ]` in the Feature
+Tracker. The §6A entry stays OPEN. This session is the scout half
+of the multi-session F-015 Linux libmpv closure; Session 036
+starts the implementation half.
+
+**ADRs filed:** ADR-133.
+
+**Tests added:** none. Documentation-only session; no production
+code changed → no test surface change.
+
+**Known issues introduced or resolved:** neither. The pre-existing
+"F-015 follow-ups: Linux libmpv in-window GL surface (Sessions 020
++ 021, ADR-108)" Known Issue stays in place — it correctly
+describes the still-open state of the in-window GL surface work and
+will be flipped to RESOLVED only after Session 037 / 038 (the
+driver landing + CI matrix) close the §6A entry.
+
+**Verification:**
+
+-   `cargo fmt --check`: not run; STATE.md-only diff, no `.rs`
+    files touched. CI's `cargo fmt --all --check` (`.github/
+    workflows/ci.yml:64`) runs against the workspace and will
+    re-verify on push.
+-   `cargo clippy`: not run; same reason. CI's `cargo clippy
+    --workspace --all-targets -- -D warnings`
+    (`.github/workflows/ci.yml:67`) re-verifies.
+-   `cargo test`: not run; same reason. CI's `cargo test
+    --workspace --all-targets`
+    (`.github/workflows/ci.yml:124`) re-verifies.
+-   `frontend npm run lint && test && typecheck`: not run; no TS
+    / TSX files touched. CI re-verifies.
+-   `cargo tauri build (linux / android)`: not run; no source
+    files touched. CI's `build-linux` / `build-android` jobs
+    re-verify on push (per Standing Authorizations, merge gates
+    on lint + test only; build-linux + build-android are
+    background-verified).
+
+**PRD §F-015 code acceptance after this session (unchanged):**
+
+-   ❌ "Linux: libmpv plays the same test stream end-to-end with
+    controls overlay functional" — the Linux side STILL ships
+    the ADR-108 subprocess deviation. Session 036 + 037 + 038
+    are the implementation arc that closes this; Session 035
+    is the scout that picks the route.
+-   ✅ "Both: seek works without breaking the adaptive buffer
+    scheduler" — unchanged from Session 020.
+-   ✅ "Both: player exit always triggers final position save"
+    — unchanged from Session 020.
+-   ✅ Android-side criteria — unchanged from Session 033.
+
+F-015 status: **in progress → in progress** (Linux libmpv in-window
+GL surface route picked but not yet implemented; the §6A entry
+stays OPEN until the implementation lands).
+
+**Cross-session conventions established:**
+
+-   **Multi-session §6A regressions are split scout → implementation
+    → CI / bundling.** ADR-133 codifies the three-session split as
+    the default cadence for §6A regressions whose closure crosses
+    multiple architectural seams (e.g. a new in-process driver
+    behind a Cargo feature flag with new system deps). Session 1 is
+    the scout (route enumeration + ADR), Session 2 is the
+    implementation (the new driver), Session 3 is the CI + bundle
+    integration (system deps, feature-flag default flip,
+    pre-release re-verification). This matches the Session 034
+    PRD-revision pattern in spirit: spend one session writing the
+    decision down formally before spending the next session(s)
+    executing on it.
+-   **Route-evaluation framework: PRD constraints × routes × cost.**
+    When a PRD-locked architecture has multiple viable
+    implementation routes, the scout's deliverable is a table /
+    enumeration scoring each route against EACH separately-named
+    PRD constraint (Cn). This session unpacks PRD §F-015 into
+    three constraints (C1 in-process, C2 GL surface owned by Tauri
+    window, C3 controls composited by browser); each route is
+    scored ✅ / ⚠️ / ❌ on each constraint, plus dependency cost,
+    platform feasibility (X11 / Wayland), and implementation cost
+    estimate. The recommendation falls out of the table. Future
+    scout sessions for §6A regressions with multiple routes should
+    follow the same shape.
+
+**Out of scope for Session 035 (filed as follow-ups):**
+
+-   **Session 036:** Route B GTK-injection spike per ADR-133.
+-   **Session 037:** if the spike succeeds, the in-process
+    `libmpv-rs` driver implementation behind the
+    `libmpv-inprocess` Cargo feature flag.
+-   **Session 038:** CI matrix update (`libmpv2-dev` in apt
+    install list across `lint` / `test` / `build-linux`) +
+    `tauri.conf.json` bundle dependency declaration + feature
+    flag default flip after §6B-1 re-verification.
+-   **Session 039 (contingent):** if Session 036's spike fails,
+    file the §F-015 C3 PRD revision proposal under "PRD Issues"
+    per the Session 034 / ADR-132 framework, paired with the
+    Route A in-process driver implementation. This session is
+    only triggered if Session 036's spike fails on all three
+    candidate avenues; in the happy-path arc (036 spike succeeds
+    → 037 driver → 038 CI) it does not run.
+-   **Subtitle test fixtures** (PRD §F-015 SRT + SSA/ASS code
+    acceptance) — already covered structurally by the existing
+    PlayerHandle abstraction; once the new driver lands, the
+    existing fixture-loading code path is unchanged.
 
 ### Session 034 — F-013 + F-014 PRD revision proposal (librqbit-blocked §6A regressions)
 
@@ -8260,6 +8766,7 @@ Additional ADRs filed by sessions:
 | ADR-130 | **TVDB extended-artwork cache key OMITS language: `tvdb:title:{tvdb_id}:{kind}`.** The Session-031 STATE.md plan suggested `tvdb:title:{tvdb_id}:{kind}:{language}` but the actual HTTP target is `/v4/{movies\|series}/{id}/extended?meta=translations` — a single call that returns EVERY translation in one envelope. The cache row's identity is therefore `(tvdb_id, kind)`, not `(tvdb_id, kind, language)`; a `:language` suffix would fragment the cache by N copies of the same payload (one per UI language) for no behavioral benefit. The persisted payload is `Option<ProviderBundle>` so the 404 negative result (mapped per ADR-129's pattern: `Fresh { bundle: None, etag: None }`) round-trips through serde as the literal JSON token `null`, distinct from a populated bundle. `ProviderBundle` + `LocalizedAsset` derive Serialize/Deserialize (ADR-130 corollary); the `HashMap<String, String>` summaries field round-trips through serde's default map encoding. Because the underlying `/extended` call is also used by the F-005 artwork resolver at the OUTER `resolve_artwork` cache row (which has a 7-day TTL), the inner per-resource row's TTL is matched at `ARTWORK_TTL_S = 7d` so the two tiers expire on the same cadence (vs the META_TTL_S = 24h used by TMDB title_details / credits which feed the F-010 detail aggregate, which itself ships at META_TTL_S). | 032 |
 | ADR-131 | **Kotlin-side coverage for the Android player plugin ships under structural review until a `./gradlew test` CI job is added.** The `tauri-plugin-kino-player` android module's `build.gradle.kts` declares `testImplementation("junit:junit:4.13.2")` but the module has shipped without a `src/test/` source set since Session 023, and the CI workflow (`.github/workflows/ci.yml::build-android`) runs `cargo tauri android build --apk` exclusively — which compiles Kotlin but does NOT execute the unit-test source set. Adding a JVM-level test for a class that calls into Android framework code (`MediaCodecSelector.DEFAULT`, `MediaCodecInfo.CodecCapabilities`, `MediaCodecList`, etc.) requires either Robolectric (a ~15 MB dependency that emulates Android framework on the JVM) or extensive mocking via PowerMock / MockK — and a new `./gradlew :tauri-plugin-kino-player:test` CI job that runs neither today. Session 033 ships `DvAwareCodecSelector` without a Kotlin unit test because: (a) the §6A audit explicitly named the implementation pattern ("a custom `MediaCodecSelector` that filters `MediaCodecList` results to codecs whose `CodecCapabilities.profileLevels` declare a `DolbyVisionProfile` entry") so code review against the audit IS the structural verification; (b) the §6B-4 hardware-verification line ("DV Profile 5 movie plays on Shield with DV indicator") is the runtime acceptance gate; (c) wiring a `./gradlew test` CI job + a Robolectric / MockK harness is a separate scope (~150 LOC of test infra for ~30 LOC of new test logic) and Session 033 should not bundle the framework lift with the feature it would test. A future polish session ("Android-side test harness") can land the gradle test wiring and backfill tests for `DvAwareCodecSelector`, `Capabilities`, `PlayerSession`, `Events`, etc. all at once. This ADR is descriptive ("documents how a §6A regression is closed without a unit test") not prescriptive ("you must not add tests"); a session that adds JVM tests via Robolectric is welcome to do so. The convention is: when the §6A acceptance hinges on Android framework call-path structure rather than pure-logic state, structural review against the audit's quoted pattern is acceptable closure. | 033 |
 | ADR-132 | **§6A regressions whose closure requires PRD-locked text revision are "human-gated"; the agent's role is to file a documented PRD revision proposal under "PRD Issues" for the human to ratify, then keep the §6A entry OPEN until ratification.** F-013 (Max connections per torrent: 200) and F-014 (piece-priority window mapping) both hit librqbit 8.1.1's public API boundary — the closure paths enumerated by the Session 027 audit are (a) upstream PR to ikatson/rqbit exposing `max_connections_per_torrent` on `SessionOptions` and the `chunk_tracker_*` / `FilePriorities` surfaces, (b) fork librqbit via `[patch.crates-io]` and apply the patches locally, (c) swap the torrent engine, (d) file a PRD revision request relaxing the locked invariants. Sessions 028 / 029 / 030 / 031 / 032 / 033 each closed a different §6A regression by code change; F-013 + F-014 are the first §6A entries where NO code change available within librqbit 8.1.1's public API can satisfy the PRD-locked text. Option (a) requires ikatson/rqbit upstream review which the agent can prepare but not drive to completion in one session. Option (b) requires sustained fork maintenance against librqbit-core / -buffers / -utp transitive ABI changes (substantial multi-session overhead). Option (c) is a high-blast-radius F-013 redo. Option (d) is documentation-only work the agent CAN drive end-to-end and parks the gate behind a single human decision. Session 034 picks (d). The convention this ADR establishes: when a §6A regression cannot be closed by code against the locked PRD text AND the engine constraint is structural (not amenable to a workaround within the same crate ecosystem), the agent files the closure-path proposal under "PRD Issues" with (i) verbatim PRD quotes, (ii) verbatim source-of-truth code citations, (iii) a sketched upstream-PR diff shape for option (a), (iv) cost estimates for options (b) / (c), (v) exact verbatim proposed PRD revision text for option (d). The §6A entry stays OPEN with a "Closure path filed" subsection pointing at the PRD Issues block. The Feature Tracker checkbox stays `[ ]`. A follow-up session — invoked after the human ratifies the PRD revision — flips both the §6A entry to RESOLVED and the Feature Tracker checkbox to `[x]` in one diff. This avoids the agent self-ratifying a PRD-locked text revision (which would violate the harness rule "Never modify PRD.md") while still making maximum progress on §6A clearance per session. The classification also distinguishes "agent-actionable §6A regressions" (closeable by code in this session) from "human-gated §6A regressions" (require ratification first), which informs Session N+1's scope picking: prefer agent-actionable first, file human-gated when no agent-actionable §6A remains. | 034 |
+| ADR-133 | **F-015 Linux libmpv in-window GL surface (§6A regression carried by ADR-108) is closed via Route B (libmpv render-API into a `GtkGLArea` sibling of `WebKitWebView` under a `GtkOverlay`); the implementation is split scout → spike → driver → CI across four sessions.** PRD §F-015 §"Linux (locked architecture)" pins three constraints: C1 `libmpv-rs` in-process binding, C2 GL surface owned by the Tauri window, C3 controls composited over the surface by the browser. The Session 035 scout enumerated five routes (A: X11 `--wid` child-window embed; B: libmpv render-API + `GtkGLArea` + `GtkOverlay`; C: Wayland `wl_subsurface`; D: status quo subprocess + own window per ADR-108; E: frameless peer window with geometry-tracking) and scored each on C1 / C2 / C3 + X11/Wayland feasibility + dependency cost + implementation cost. Only Route B satisfies all three constraints; Routes A / C / E variably fail C2 / C3 / Wayland-feasibility / WM-stability; Route D is the regression itself. The scout therefore PICKS Route B as the primary path, with Route A (in-process `libmpv-rs` + `mpv.set_property("wid", xid)`) as the documented FALLBACK paired with a §F-015 C3 PRD-revision proposal under "PRD Issues" per the Session 034 / ADR-132 human-gated §6A framework. The implementation arc: **Session 036** runs a focused GTK-injection spike — can wry's internal `WebKitWebView` widget tree be augmented to host a `GtkGLArea` sibling under a `GtkOverlay`? — attempting three avenues in priority order (walk + reparent the existing widget tree post-`gtk_window()` resolution; intercept window construction via Tauri's `setup` / `on_window_event` hooks before wry packs the webview; upstream a `WebViewExtUnix::gtk_box()` accessor PR to wry and pin via `[patch.crates-io]`). Output: ADR-134 picking the successful avenue, or, if all three fail on the spike, triggering the documented fallback (Route A + PRD revision). **Session 037** lands `crates/kino-player/src/libmpv.rs` as a peer driver behind a `libmpv-inprocess` Cargo feature flag; the `PlayerHandle` trait abstraction means `kino-app`'s `spawn_platform_player` branch is the only host-side change, gated by `#[cfg(feature = "libmpv-inprocess")]`. **Session 038** updates `.github/workflows/ci.yml` to install `libmpv2-dev` in the `lint` / `test` / `build-linux` apt-install lists; declares `libmpv2 (>= 2.1)` in `tauri.conf.json::bundle.linux.deb.depends`; verifies the AppImage bundler picks up libmpv (or documents a runtime dep); flips the feature flag on by default once §6B-1 has been re-verified locally on Ubuntu 22.04 + 24.04. **Session 039 (contingent)** files the §F-015 C3 PRD-revision proposal if 036's spike fails on all three avenues. Rejected alternatives: ship Route A immediately without trying Route B (concedes C3 unnecessarily); fork wry and maintain locally (substantial overhead, fork-rebase churn); swap the webview engine (catastrophic blast radius — PRD §1 implicitly locks Tauri 2). The convention this ADR establishes for §6A regressions whose closure crosses multiple architectural seams: split as scout (this session) → spike (prove the architecturally hard step is feasible) → implementation (the new code) → integration (CI + bundling + default flip). Each step is one session; the scout's ADR locks in the route ranking so future sessions don't re-litigate the choice. | 035 |
 
 ---
 
@@ -9112,6 +9619,66 @@ Expect this to be a multi-session effort — likely split as
 "Session N: enumerate webview surface access on Linux", "Session
 N+1: implement render-context-aware driver", "Session N+2: wire
 behind feature flag + CI matrix".
+
+**Route picked (Session 035) — Route B (primary) / Route A
+(fallback).** Session 035 scout enumerated five candidate routes
+and scored each on the three PRD §F-015 constraints (C1
+`libmpv-rs` in-process; C2 GL surface owned by the Tauri window;
+C3 controls composited over the surface by the browser):
+
+-   **Route B** — libmpv render-API + `GtkGLArea` sibling of
+    `WebKitWebView` under a `GtkOverlay`. C1 ✅ C2 ✅ C3 ✅. Full
+    PRD compliance. Blocker: reaching wry 0.55.1's internal
+    `WebKitWebView` widget tree to inject the overlay.
+-   **Route A** — in-process `libmpv-rs` with
+    `mpv.set_property("wid", xid)` (X11 child-window embed). C1
+    ✅ C2 ⚠️ (child X window of Tauri window, not strictly a GL
+    surface) C3 ❌ (X11 child windows render ABOVE parent's
+    drawn content; webview controls cannot composite over).
+-   **Route C** — Wayland `wl_subsurface` protocol bypassing
+    GTK. Wayland-only; weak C2 / C3.
+-   **Route D** — Status quo (ADR-108 subprocess + own window).
+    The regression itself.
+-   **Route E** — Frameless transparent peer window with
+    geometry-tracking. Structurally fails C2; visually fragile
+    on C3.
+
+ADR-133 documents the route ranking and locks in the multi-
+session implementation arc:
+
+-   **Session 036** runs a focused **GTK-injection spike**:
+    three avenues attempted in priority order — (i) walk +
+    reparent the existing widget tree returned by Tauri's
+    `WebviewWindow::gtk_window()`; (ii) intercept window
+    construction via Tauri's `setup` / `on_window_event`
+    builder hooks before wry packs the webview; (iii) upstream
+    a `WebViewExtUnix::gtk_box()` accessor PR to wry and pin
+    via `[patch.crates-io]`. Output: ADR-134 picking the
+    successful avenue, or, if all three fail, triggering the
+    fallback path.
+-   **Session 037** lands `crates/kino-player/src/libmpv.rs`
+    as a peer driver behind a `libmpv-inprocess` Cargo feature
+    flag. `PlayerHandle` trait abstraction means the only
+    host-side change is the `#[cfg(target_os = "linux")]`
+    branch of `spawn_platform_player`.
+-   **Session 038** wires `libmpv2-dev` into
+    `.github/workflows/ci.yml`'s `lint` / `test` /
+    `build-linux` apt-install lists; declares the runtime dep
+    in `tauri.conf.json::bundle.linux.deb.depends`; flips the
+    feature flag on by default after §6B-1 re-verification.
+-   **Session 039 (contingent)** files the §F-015 C3
+    PRD-revision proposal under "PRD Issues" if Session 036's
+    spike fails on all three avenues; paired with a Route A
+    implementation under the Session 034 / ADR-132 human-gated
+    §6A framework.
+
+This entry STAYS OPEN until Session 037 + 038 (the
+implementation + CI bundle integration) land, OR — in the
+fallback arc — Session 039's PRD-revision proposal is
+ratified by the human. The F-015 Feature Tracker checkbox
+stays `[ ]`. See the Session 035 entry above for the full
+route scoring + verbatim source/citation set, and ADR-133 for
+the multi-session split rationale.
 
 ### ~~F-016 §4 / Cache directory picker~~ — RESOLVED in Session 029
 
