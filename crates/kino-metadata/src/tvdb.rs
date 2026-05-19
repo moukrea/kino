@@ -19,7 +19,7 @@ use tokio::sync::RwLock;
 use crate::artwork::{LocalizedAsset, ProviderBundle};
 use crate::error::Error;
 use crate::trending::ProviderItem;
-use kino_core::http::{fetch_with_retry, HttpConfig};
+use kino_core::http::{fetch_with_etag, fetch_with_retry, FetchOutcome, HttpConfig};
 use kino_core::title::{TitleKind, TitleSummary};
 
 /// TVDB v4 artwork type ids the F-005 resolver cares about.
@@ -78,6 +78,30 @@ pub const TVDB_BASE_URL: &str = "https://api4.thetvdb.com";
 
 /// Maximum trending items the F-004 aggregator asks for per provider.
 const TRENDING_LIMIT: usize = 100;
+
+/// Result of [`TvdbClient::artwork_with_etag`] — either a fresh extended-
+/// title payload (parsed into a [`ProviderBundle`], with the server's
+/// `ETag` header when present) or the cache-hit `304 Not Modified` signal
+/// that the caller's prior cached bundle is still current. PRD §F-003
+/// round-trip on the `/v4/{movies|series}/{id}/extended` endpoint.
+///
+/// A TVDB `404` (id unknown) is surfaced as `Fresh { bundle: None, etag:
+/// None }` so the caller can cache the absence for the TTL just like any
+/// other negative result.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TvdbArtworkFetch {
+    /// Server confirmed the caller's cached bundle is still current. The
+    /// caller re-uses its existing bundle and only refreshes the cache
+    /// row's `expires_at`.
+    NotModified,
+    /// Server returned a fresh body (or a `404` we map to `bundle: None`).
+    /// `etag` is the parsed `ETag` header (or `None` if the endpoint
+    /// didn't send one).
+    Fresh {
+        bundle: Option<ProviderBundle>,
+        etag: Option<String>,
+    },
+}
 
 /// TVDB v4 API client.
 ///
@@ -168,30 +192,61 @@ impl TvdbClient {
         tvdb_id: u64,
         kind: TitleKind,
     ) -> Result<Option<ProviderBundle>, Error> {
+        match self.artwork_with_etag(tvdb_id, kind, None).await? {
+            TvdbArtworkFetch::Fresh { bundle, .. } => Ok(bundle),
+            // Unreachable: `prior_etag = None` means the server cannot
+            // legally produce a 304. Treat as decode error in case a
+            // misbehaving mock yields one.
+            TvdbArtworkFetch::NotModified => Err(Error::Decode(
+                "tvdb extended: 304 returned without prior etag".to_string(),
+            )),
+        }
+    }
+
+    /// `ETag`-aware variant of [`artwork`](Self::artwork) for cache
+    /// revalidation (PRD §F-003). Pass the cache row's stored `ETag` as
+    /// `prior_etag`; on `304 Not Modified` the server confirms the cached
+    /// bundle is still current and the caller re-uses it (refreshing the
+    /// row's `expires_at`). On a fresh `2xx`, the parsed `ETag` header is
+    /// returned alongside the new payload for persistence.
+    pub async fn artwork_with_etag(
+        &self,
+        tvdb_id: u64,
+        kind: TitleKind,
+        prior_etag: Option<&str>,
+    ) -> Result<TvdbArtworkFetch, Error> {
         let path = match kind {
             TitleKind::Movie => "movies",
             TitleKind::Series => "series",
         };
         let url = format!("{}/v4/{path}/{tvdb_id}/extended", self.base_url);
         let token = self.login().await?;
-        let request_result = fetch_with_retry(
+        let request_result = fetch_with_etag(
             || {
                 self.client
                     .get(&url)
                     .bearer_auth(&token)
                     .query(&[("meta", "translations")])
             },
+            prior_etag,
             &self.config,
         )
         .await;
-        let response = match request_result {
-            Ok(r) => r,
+        let outcome = match request_result {
+            Ok(o) => o,
             Err(kino_core::http::HttpError::Http { status, .. })
                 if status == StatusCode::NOT_FOUND.as_u16() =>
             {
-                return Ok(None);
+                return Ok(TvdbArtworkFetch::Fresh {
+                    bundle: None,
+                    etag: None,
+                });
             }
             Err(e) => return Err(e.into()),
+        };
+        let (response, etag) = match outcome {
+            FetchOutcome::NotModified => return Ok(TvdbArtworkFetch::NotModified),
+            FetchOutcome::Fresh { response, etag } => (response, etag),
         };
         let envelope: ExtendedEnvelope = response
             .json()
@@ -223,13 +278,16 @@ impl TvdbClient {
                 summaries.insert(t.language, t.overview);
             }
         }
-        Ok(Some(ProviderBundle {
-            posters,
-            backdrops,
-            logos,
-            clearart,
-            summaries,
-        }))
+        Ok(TvdbArtworkFetch::Fresh {
+            bundle: Some(ProviderBundle {
+                posters,
+                backdrops,
+                logos,
+                clearart,
+                summaries,
+            }),
+            etag,
+        })
     }
 
     /// Search TVDB for movies AND series (PRD §F-011).
@@ -710,6 +768,119 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn artwork_with_etag_no_prior_returns_fresh_with_server_etag() {
+        // PRD §F-003 round-trip on `/v4/{movies}/{id}/extended`: first
+        // fetch yields a parsed bundle AND the server's ETag for
+        // revalidation.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v4/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status":"success","data":{"token":"tok"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v4/movies/5/extended"))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ETag", "\"tvdb-5-v1\"")
+                    .set_body_json(json!({
+                        "status":"success",
+                        "data": {
+                            "id": 5,
+                            "artworks": [
+                                {"id":1,"image":"https://tvdb/p.jpg","type":14,"language":"eng"}
+                            ],
+                            "translations": {"overviewTranslations": []}
+                        }
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TvdbClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let fetch = client
+            .artwork_with_etag(5, TitleKind::Movie, None)
+            .await
+            .unwrap();
+        match fetch {
+            TvdbArtworkFetch::Fresh { bundle, etag } => {
+                assert_eq!(etag.as_deref(), Some("\"tvdb-5-v1\""));
+                let bundle = bundle.expect("present on 200");
+                assert_eq!(bundle.posters.len(), 1);
+            }
+            TvdbArtworkFetch::NotModified => panic!("expected Fresh on first fetch"),
+        }
+    }
+
+    #[tokio::test]
+    async fn artwork_with_etag_prior_sends_if_none_match_and_304_yields_not_modified() {
+        // PRD §F-003 304 cache-hit path on the `/extended` endpoint.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v4/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status":"success","data":{"token":"tok"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v4/series/123/extended"))
+            .and(header("if-none-match", "\"tvdb-123-v2\""))
+            .respond_with(ResponseTemplate::new(304))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TvdbClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let fetch = client
+            .artwork_with_etag(123, TitleKind::Series, Some("\"tvdb-123-v2\""))
+            .await
+            .unwrap();
+        assert!(matches!(fetch, TvdbArtworkFetch::NotModified));
+    }
+
+    #[tokio::test]
+    async fn artwork_with_etag_404_yields_fresh_none_so_absence_is_cacheable() {
+        // TVDB returns 404 for ids it doesn't know. The ETag-aware variant
+        // surfaces that as `Fresh { bundle: None, etag: None }` so the
+        // caller can cache the negative result for the TTL.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v4/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status":"success","data":{"token":"tok"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v4/movies/9999/extended"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TvdbClient::with_options("test-key", HttpConfig::for_test(), server.uri()).unwrap();
+        let fetch = client
+            .artwork_with_etag(9999, TitleKind::Movie, None)
+            .await
+            .unwrap();
+        match fetch {
+            TvdbArtworkFetch::Fresh { bundle, etag } => {
+                assert!(bundle.is_none());
+                assert!(etag.is_none());
+            }
+            TvdbArtworkFetch::NotModified => panic!("expected Fresh(None) on 404"),
+        }
     }
 
     #[tokio::test]

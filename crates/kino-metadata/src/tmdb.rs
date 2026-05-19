@@ -84,11 +84,47 @@ pub enum TmdbTitleDetailsFetch {
 }
 
 /// One cast member, top-level for the PRD §F-010 cast row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize` / `Deserialize` are derived so the value can be persisted in
+/// `response_cache` for the per-resource `ETag` round-trip (PRD §F-003;
+/// Session 032).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TmdbCastMember {
     pub name: String,
     pub character: Option<String>,
     pub photo_url: Option<String>,
+}
+
+/// Cast roster wrapper persisted in `response_cache` for the per-resource
+/// `ETag` round-trip on TMDB `/credits` (PRD §F-003; Session 032).
+///
+/// Wrapping the `Vec<TmdbCastMember>` in a named struct keeps the JSON
+/// payload self-describing on cache reads and mirrors the
+/// [`TmdbTitleDetails`] shape (one resource, one struct).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TmdbCredits {
+    pub tmdb_id: u64,
+    pub kind: TitleKind,
+    pub cast: Vec<TmdbCastMember>,
+}
+
+/// Result of [`TmdbClient::credits_with_etag`] — either a fresh roster
+/// (with the server's `ETag` header, when present) or the cache-hit `304
+/// Not Modified` signal that the caller's prior cached [`TmdbCredits`] is
+/// still current. PRD §F-003 round-trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TmdbCreditsFetch {
+    /// Server confirmed the caller's cached cast list is still current.
+    /// The caller re-uses its existing [`TmdbCredits`] and only refreshes
+    /// the cache row's `expires_at`.
+    NotModified,
+    /// Server returned a fresh body. `etag` is the parsed `ETag` header
+    /// (or `None` if the endpoint didn't send one); persist it alongside
+    /// the new payload in `response_cache.etag`.
+    Fresh {
+        credits: TmdbCredits,
+        etag: Option<String>,
+    },
 }
 
 /// TMDB v3 API client.
@@ -377,25 +413,53 @@ impl TmdbClient {
         tmdb_id: u64,
         kind: TitleKind,
     ) -> Result<Vec<TmdbCastMember>, Error> {
+        match self.credits_with_etag(tmdb_id, kind, None).await? {
+            TmdbCreditsFetch::Fresh { credits, .. } => Ok(credits.cast),
+            // Unreachable: `prior_etag = None` means the server cannot
+            // legally produce a 304. Treat as decode error in case a
+            // misbehaving mock yields one.
+            TmdbCreditsFetch::NotModified => Err(Error::Decode(
+                "tmdb credits: 304 returned without prior etag".to_string(),
+            )),
+        }
+    }
+
+    /// `ETag`-aware variant of [`credits`](Self::credits) for cache
+    /// revalidation (PRD §F-003). Pass the cache row's stored `ETag` as
+    /// `prior_etag`; on `304 Not Modified` the server confirms the cached
+    /// cast list is still current and the caller re-uses it (refreshing
+    /// the row's `expires_at`). On a fresh `2xx`, the parsed `ETag` header
+    /// is returned alongside the new payload for persistence.
+    pub async fn credits_with_etag(
+        &self,
+        tmdb_id: u64,
+        kind: TitleKind,
+        prior_etag: Option<&str>,
+    ) -> Result<TmdbCreditsFetch, Error> {
         let media = match kind {
             TitleKind::Movie => "movie",
             TitleKind::Series => "tv",
         };
         let url = format!("{}/3/{media}/{tmdb_id}/credits", self.base_url);
-        let response = fetch_with_retry(
+        let outcome = fetch_with_etag(
             || {
                 self.client
                     .get(&url)
                     .query(&[("api_key", self.key.as_str())])
             },
+            prior_etag,
             &self.config,
         )
         .await?;
+        let (response, etag) = match outcome {
+            FetchOutcome::NotModified => return Ok(TmdbCreditsFetch::NotModified),
+            FetchOutcome::Fresh { response, etag } => (response, etag),
+        };
         let body: CreditsResponse = response
             .json()
             .await
             .map_err(|e| Error::Decode(format!("tmdb {media} credits: {e}")))?;
-        Ok(body
+        let cast = body
             .cast
             .into_iter()
             .filter(|c| !c.name.is_empty())
@@ -404,7 +468,15 @@ impl TmdbClient {
                 character: c.character.filter(|s| !s.is_empty()),
                 photo_url: c.profile_path.as_deref().map(tmdb_profile_url),
             })
-            .collect())
+            .collect();
+        Ok(TmdbCreditsFetch::Fresh {
+            credits: TmdbCredits {
+                tmdb_id,
+                kind,
+                cast,
+            },
+            etag,
+        })
     }
 
     /// Multi-search across movies and TV shows (PRD §F-011).
@@ -1592,6 +1664,94 @@ mod tests {
             TmdbClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
         let cast = client.credits(603, TitleKind::Movie).await.unwrap();
         assert!(cast.is_empty());
+    }
+
+    #[tokio::test]
+    async fn credits_with_etag_no_prior_returns_fresh_with_server_etag() {
+        // PRD §F-003 round-trip on TMDB `/credits`: the first fetch (no
+        // prior cache row) yields a fresh cast list AND the server's ETag
+        // so the next call can revalidate.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/3/movie/603/credits"))
+            .and(query_param("api_key", "test-key"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ETag", "\"cast-v1\"")
+                    .set_body_json(json!({
+                        "cast": [
+                            {
+                                "name": "Keanu Reeves",
+                                "character": "Neo",
+                                "profile_path": "/k.jpg"
+                            }
+                        ]
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TmdbClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let fetch = client
+            .credits_with_etag(603, TitleKind::Movie, None)
+            .await
+            .unwrap();
+        match fetch {
+            TmdbCreditsFetch::Fresh { credits, etag } => {
+                assert_eq!(etag.as_deref(), Some("\"cast-v1\""));
+                assert_eq!(credits.tmdb_id, 603);
+                assert_eq!(credits.kind, TitleKind::Movie);
+                assert_eq!(credits.cast.len(), 1);
+                assert_eq!(credits.cast[0].name, "Keanu Reeves");
+            }
+            TmdbCreditsFetch::NotModified => panic!("expected Fresh on first fetch"),
+        }
+    }
+
+    #[tokio::test]
+    async fn credits_with_etag_prior_sends_if_none_match_and_304_yields_not_modified() {
+        // PRD §F-003 304 cache-hit path on `/credits`.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/3/tv/1399/credits"))
+            .and(query_param("api_key", "test-key"))
+            .and(header("if-none-match", "\"got-cast-v2\""))
+            .respond_with(ResponseTemplate::new(304))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TmdbClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let fetch = client
+            .credits_with_etag(1399, TitleKind::Series, Some("\"got-cast-v2\""))
+            .await
+            .unwrap();
+        assert!(matches!(fetch, TmdbCreditsFetch::NotModified));
+    }
+
+    #[tokio::test]
+    async fn credits_back_compat_unchanged_when_server_sends_etag() {
+        // The back-compat `credits` wrapper still returns the bare
+        // `Vec<TmdbCastMember>` even when the server sends an ETag.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/3/movie/603/credits"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ETag", "\"cast-v1\"")
+                    .set_body_json(json!({
+                        "cast": [{ "name": "Keanu Reeves", "character": "Neo" }]
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            TmdbClient::with_options("test-key", HttpConfig::default(), server.uri()).unwrap();
+        let cast = client.credits(603, TitleKind::Movie).await.unwrap();
+        assert_eq!(cast.len(), 1);
+        assert_eq!(cast[0].name, "Keanu Reeves");
     }
 
     #[tokio::test]

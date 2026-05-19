@@ -58,7 +58,11 @@ impl Provider {
 /// A single image asset returned by a provider, with the language it's tagged
 /// with (the empty string means "no language" / textless artwork, which is
 /// always a valid match for every lang tier).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize` / `Deserialize` are derived so [`ProviderBundle`] can be
+/// persisted in `response_cache` for the per-resource `ETag` round-trip
+/// (PRD §F-003; Session 032).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalizedAsset {
     /// Language tag the provider tagged the asset with. Lowercased BCP-47-ish;
     /// providers normalize ahead of inserting.
@@ -70,7 +74,11 @@ pub struct LocalizedAsset {
 /// All assets returned by a single provider for a single title. Built once
 /// per `resolve_artwork` call per provider (zero network if the provider lacks
 /// a key) and consumed by the cascade.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// `Serialize` / `Deserialize` are derived so the value can be persisted in
+/// `response_cache` for the per-resource `ETag` round-trip
+/// (PRD §F-003; Session 032 — TVDB extended-title call site).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderBundle {
     pub posters: Vec<LocalizedAsset>,
     pub backdrops: Vec<LocalizedAsset>,
