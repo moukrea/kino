@@ -1,13 +1,15 @@
 # kino — Agent State
 
 **PRD version:** 1.0 (locked)
-**Status:** v1.0.0-alpha.1 release pipeline shipped. **Session 039 drafts the upstream librqbit PR text for the F-013 + F-014 §6A regressions** (Path B option (i) per the Session 038 plan, picked because §6B-1 stays unchecked at session start so Path A is unavailable). Deliverable: new file `docs/upstream/librqbit-pr.md` (~591 lines) containing two independently-mergeable upstream PR drafts — **PR A** (`feat(session): make per-torrent peer-connection cap configurable`) and **PR B** (split into B1 `feat(streaming): make per-stream lookahead buffer size configurable` + B2 `feat(streaming): piece-priority enum + tiered scheduler walk` as a design proposal). NEW finding documented in ADR-136 (filed this session): librqbit 8.1.1 ALREADY ships a per-torrent `peer_semaphore: Arc::new(Semaphore::new(128))` at `torrent_state/live/mod.rs:278`; the Session 034 audit's "no public concurrent-connection cap exists" framing was correct ONLY at the public-`SessionOptions` layer — internally the cap shape already exists, just hardcoded. This SIMPLIFIES PR A vs the Session 034 sketch's "invent a new field + plumb everywhere" framing: PR A is now "lift an existing hardcoded constant to a configurable Option<NonZeroU32>" — six small edits across `session.rs` + `torrent_state/mod.rs` + `torrent_state/live/mod.rs`, with the `Arc<Semaphore>` flow unchanged. The drafted PR text includes verbatim diffs anchored to real librqbit 8.1.1 file:line citations + three tokio test stubs + a polished PR description ikatson can read without further editing. PR B1 (lookahead-buffer configurability) is sketched at the diff-skeleton level — the 4-line surface change replacing the `PER_STREAM_BUF_DEFAULT = 32 MiB` constant at `streaming.rs:27` with a per-`FileStream` value via new `ManagedTorrent::stream_with_lookahead(file_id, lookahead_bytes)` is shown, with the matching `StreamState::queue` change to read the per-stream lookahead deliberately elided in favor of focus; the doc clearly flags this as "complete enough to draft fully" rather than ready-to-submit, so a follow-up session can land B1 in full when the human is ready; PR B2 (the piece-priority enum + scheduler walk) is drafted as a design proposal not a full diff — that path is structurally bigger (~500 LOC including the per-piece priority storage, the scheduler-walk integration with chunk_tracker's existing `iter_queued_pieces`, and the pause/resume + endgame-mode interaction tests) and is best landed by upstream maintainer review of the design before a follow-up agent session writes the diff. No code changes in any `crates/` or `src-tauri/src/` source file — this session is pure documentation. Verification: `cargo fmt --all --check` clean (no Rust touched); `npm run lint` skipped (no frontend touched); the new file is markdown so the CI lint/test jobs don't exercise it. **§6A F-013 / F-014** stay OPEN until either (a) upstream lands one of the drafted PRs AND kino bumps the librqbit dep + wires the new field (post-merge wiring sketch in the doc), OR (d) the human ratifies the PRD revision proposed in Session 034 — both closure paths are now FORMALLY documented; nothing else the agent can ship advances either §6A entry. **Path B for the next session** is again either (ii) re-enable the `KINO_LIBMPV_SURFACE_SPIKE=1` env-var path as a feature-gated debug option, (iii) any §6B Regression the human files, (iv) draft Sub-PR B2 as a full diff against librqbit 8.1.1 if §6B-1 still hasn't been re-verified by then. See the Session 039 entry below.
+**Status:** v1.0.0-alpha.1 release pipeline shipped. **Session 040 expands PR B1 in `docs/upstream/librqbit-pr.md` from "diff-skeleton" to ready-to-submit upstream draft** (Path B option (iv) reinterpreted as "the lower-risk half of PR B"; §6B-1 still ✗ at session start so Path A — F-015 default-flip — is unavailable, and PR B2 stays design-review-gated per Session 039's own framing so PR B1 is the next-most-actionable closure step). Deliverable: same file `docs/upstream/librqbit-pr.md` expanded from 591 → 994 lines (+403 lines net). The Sub-PR B1 section now matches PR A's drafting quality: four anchored diff blocks against `librqbit/src/torrent_state/streaming.rs` lines 29-35 (`StreamState` gains `lookahead_bytes: u64`) + 42-49 (`StreamState::queue` reads `self.lookahead_bytes`) + a `librqbit/src/lib.rs` re-export of `PER_STREAM_BUF_DEFAULT` (parallel to PR A's `DEFAULT_PEER_CONNECTIONS_PER_TORRENT` re-export) + 327-365 (the existing `ManagedTorrent::stream(file_id)` becomes a thin delegate; the body moves verbatim into a new `stream_with_lookahead(file_id, lookahead_bytes)` constructor with the `StreamState` literal gaining the new field and a `debug!` log line gaining the `lookahead_bytes` field). Three `#[tokio::test(flavor = "multi_thread")]` test stubs added in `librqbit/src/tests/e2e_stream.rs` (`test_e2e_stream_default_lookahead_matches_constant`, `test_e2e_stream_with_custom_lookahead`, `test_e2e_stream_with_zero_lookahead_still_streams`) with a sketched `e2e_stream_with_lookahead` helper that extracts the existing `e2e_stream()` body's fixture/dual-session/wait-init scaffolding for reuse. The doc's "Post-merge kino-side wiring" section is reorganized into three subsections — "After PR A lands", "After PR B1 lands", "After PR B2 lands" — with the PR B1 subsection sketching the `crates/kino-torrent/src/engine.rs:233-246` change (`open_stream` computes lookahead from `file_bitrate_bps * PIECE_PRIORITY_HIGH_WINDOW_S / 8` clamped to new `LOOKAHEAD_MIN_BYTES = 8 MiB` and `LOOKAHEAD_MAX_BYTES = 256 MiB` constants in `kino_core::constants`, calling `stream_with_lookahead(file_id, lookahead)`) and the PR B2 subsection sketching the per-position-event `update_for_position(position_s, file_bitrate_bps)` call into the future upstream `set_piece_priorities` API. A "Closure-path summary" table tracks which §6A entry each upstream PR resolves (PR A → F-013; PR B1 → F-014 partial; PR B2 → F-014 fully). The Maintenance Notes "Don't bundle PR A and PR B" rule is amended to "Don't bundle PR A, B1, and B2" reflecting the three-way split, with a "submission order: A → B1 → B2 (smallest surface first)" guideline added. The header note about PR B is updated to describe the two-sub-PR split + the partial-vs-full closure path. No code changes in any `crates/` or `src-tauri/src/` source file — this session is pure documentation expansion. Verification: `cargo fmt --all --check` clean (no Rust touched); `npm run lint` skipped (no frontend touched); the markdown file is not exercised by the CI lint/test jobs. No new ADR (the expansion follows Session 039's ADR-136 + ADR-132 + the Cross-Session Conventions' "Upstream PR drafts live under `docs/upstream/<dep-name>-pr.md`" convention; no architectural rotation). **§6A F-013 / F-014** stay OPEN until either (a) upstream lands one of the drafted PRs AND kino bumps the librqbit dep + wires the new fields per the now-fuller post-merge wiring sketch, OR (d) the human ratifies the PRD revision proposed in Session 034. PR B1 in `docs/upstream/librqbit-pr.md` is now ready-to-paste into a GitHub PR against `ikatson/rqbit` — no further agent work is needed before submission. **Path B for the next session** narrows to (ii) re-enable the `KINO_LIBMPV_SURFACE_SPIKE=1` env-var path as a feature-gated debug option, (iii) any §6B Regression the human files, OR (iv) draft Sub-PR B2 as a full diff against librqbit 8.1.1 (the only PR B sub-PR still at design-proposal stage). See the Session 040 entry below.
 
-**(Prior session context preserved for reference)** **Session 038 landed the F-015 Linux libmpv in-process driver CI matrix + bundle integration** — items (a), (b), and (d) of the Session 037 → Session 038 hand-off, deferring item (c) (the default-flip in `src-tauri/Cargo.toml::features.default`) to a follow-up session contingent on human §6B-1 hardware verification. Changes: (a) `.github/workflows/ci.yml`'s three Linux jobs (`lint`, `test`, `build-linux`) now `apt-get install` `libmpv-dev` + `libgtk-3-dev` alongside the pre-existing Tauri 2 Linux dep set, so the `libmpv-inprocess` build path links cleanly on CI; (b) `src-tauri/tauri.conf.json::bundle.linux.deb.depends` is now `["libmpv2", "libepoxy0"]` so the `.deb` artifact's `Depends:` control-file line pulls in libmpv's runtime shared library (libmpv.so.2 ABI, Ubuntu 22.04 and 24.04 both ship the matching package name `libmpv2`) and libepoxy's GL function-pointer helper (the libmpv driver's `libc::dlsym(RTLD_DEFAULT, ...)` proc-address resolution from Session 037 relies on libepoxy's symbol exports already being loaded into the process via webkit2gtk's transitive linkage); (d) the `lint` and `test` jobs are expanded into a 2-entry matrix over `config.name = "default" | "libmpv-inprocess"` with `config.cargo-features` interpolated into the `cargo clippy` / `cargo test` invocations (empty string for default, `--features kino-app/libmpv-inprocess` for the libmpv matrix entry); the cargo cache key is suffixed with `${{ matrix.config.name }}` so the two matrix entries get independent target dirs that don't recompile between feature flips. The matrix expansion means a future PR cannot regress either path — the default config exercises the Session-020 subprocess driver build; the libmpv-inprocess config exercises the Session-037 in-process driver build (compiling the libmpv module, libmpv2 binding crate, async-channel + libc + the GLArea/RenderContext surface). Item (c) deferral: STATE.md's Session 037 Next-Session text spelled item (c) as "AFTER local §6B-1 re-verification on Ubuntu 22.04 + 24.04 (the human-side verification gate from STATE.md's §6B checklist)"; §6B-1 stays unchecked in the §6B Verification list at session end so the flip stays queued for the post-§6B-1 follow-up session. Two safety nets keep the deferral safe even if a developer runs the feature-on build manually before §6B-1 lands: (1) `setup_libmpv_inprocess` in `src-tauri/src/lib.rs:286-333` falls back silently on `inject_overlay` or `LibmpvPlayer::new_attached` failure — only the LibmpvPlayer state is left unmanaged; the subprocess driver remains operational; (2) `spawn_platform_player` in `src-tauri/src/commands.rs:4318-4334` checks `app.try_state::<LibmpvPlayerHandle>()` first when the feature is on, falling through to `MpvPlayer::spawn()` on a missing managed handle so even a botched feature-on build still gives the user a working Linux player. Local verification: `cargo fmt --all --check` clean; `cargo clippy --workspace --all-targets [--features kino-app/libmpv-inprocess] -- -D warnings` clean in both feature configs; `cargo test --workspace --all-targets [--features kino-app/libmpv-inprocess]` ALL tests pass in both configs (27 → 30 kino-player tests with the feature, the 3-test delta being the libmpv module's unit tests added by Session 037); `npm run lint` + `npm run typecheck` + `npm test` clean (234 frontend tests, unchanged from Session 037 — no frontend code touched this session). System packages installed locally for the verification: `libmpv-dev 0.37.0-1ubuntu4` + `libmpv2 0.37.0-1ubuntu4` + `libgtk-3-dev 3.24.41-4ubuntu1.3` + `libepoxy0 1.5.10-1build1` + `libwebkit2gtk-4.1-dev 2.52.3-0ubuntu0.24.04.1`. No code changes in any `crates/` or `src-tauri/src/` source file — this session is pure CI + bundle wiring. No new ADR (the matrix expansion is a conventional CI pattern; the bundle.linux.deb.depends update is a configuration change with no architectural rotation). **§6A F-015 / Linux libmpv in-window GL surface — CI matrix + bundle deps half landed; default-flip half remains for the post-§6B-1 follow-up session.** F-015 stays `[ ]` in the Feature Tracker until item (c) lands AND §6B-1 closes. See the Session 038 entry below.
+**(Prior session context preserved for reference)** **Session 039 drafts the upstream librqbit PR text for the F-013 + F-014 §6A regressions** (Path B option (i) per the Session 038 plan, picked because §6B-1 stays unchecked at session start so Path A is unavailable). Deliverable: new file `docs/upstream/librqbit-pr.md` (~591 lines) containing two independently-mergeable upstream PR drafts — **PR A** (`feat(session): make per-torrent peer-connection cap configurable`) and **PR B** (split into B1 `feat(streaming): make per-stream lookahead buffer size configurable` + B2 `feat(streaming): piece-priority enum + tiered scheduler walk` as a design proposal). NEW finding documented in ADR-136 (filed in Session 039): librqbit 8.1.1 ALREADY ships a per-torrent `peer_semaphore: Arc::new(Semaphore::new(128))` at `torrent_state/live/mod.rs:278`; the Session 034 audit's "no public concurrent-connection cap exists" framing was correct ONLY at the public-`SessionOptions` layer — internally the cap shape already exists, just hardcoded. This SIMPLIFIES PR A vs the Session 034 sketch's "invent a new field + plumb everywhere" framing: PR A is now "lift an existing hardcoded constant to a configurable Option<NonZeroU32>" — six small edits across `session.rs` + `torrent_state/mod.rs` + `torrent_state/live/mod.rs`, with the `Arc<Semaphore>` flow unchanged. The drafted PR text includes verbatim diffs anchored to real librqbit 8.1.1 file:line citations + three tokio test stubs + a polished PR description ikatson can read without further editing. PR B1 (lookahead-buffer configurability) WAS sketched at the diff-skeleton level in Session 039 with the matching `StreamState::queue` change deliberately elided in favor of doc focus — that elision is now CLOSED by Session 040 (above). PR B2 (the piece-priority enum + scheduler walk) remains a design proposal not a full diff — that path is structurally bigger (~500 LOC) and is best landed by upstream maintainer review of the design before a follow-up agent session writes the diff.
 
-**(Earlier prior session context preserved for reference)** **Session 037 lands the F-015 Linux libmpv in-process driver** — the Route-B implementation that ADR-133 split as the post-spike session. The driver lives in a new ~700-line module `crates/kino-player/src/libmpv.rs` gated by a `libmpv-inprocess` Cargo feature flag (default OFF through Session 037). When the feature is ON: (a) Session 036's `inject_overlay` runs at `setup()` time to wrap the Tauri webview in a `GtkOverlay` sibling of a fresh `GtkGLArea`; (b) a new `LibmpvPlayer` is constructed via `LibmpvPlayer::new_attached(OverlaySurgery)`, which creates a libmpv handle through the [`libmpv2 = "6"`](https://crates.io/crates/libmpv2/6.0.0) Rust binding, applies every PRD §F-015 / `crates/kino-server/assets/mpv.conf` directive via `set_property` calls (`vo=libmpv` + `hwdec=auto-safe` + `keep-open=yes` + `cache=yes` + `demuxer-max-bytes=200 MiB` + `demuxer-readahead-secs=20` + `audio-spdif=ac3,dts,eac3,truehd,dts-hd` + `sub-auto=fuzzy` + `sub-ass=yes` + `idle=yes`), applies the `high-quality` profile via `apply-profile`, builds an OpenGL `RenderContext` bound to the freshly-injected `GLArea` (proc address resolved via `libc::dlsym(RTLD_DEFAULT, ...)` for cross-backend GL symbol lookup), wires the `GLArea::render` signal to call `RenderContext::render(0, w, h, true)`, and bridges the libmpv update callback to a `glib::MainContext::default().spawn_local` future that calls `GLArea::queue_render` via an `async_channel` (the `!Send` GLArea lives only on the GTK main thread); (c) a single OS thread `kino-libmpv-events` polls `mpv.wait_event(0.25)` and translates libmpv's `time-pos` / `duration` / `pause` / `paused-for-cache` / `eof-reached` / `track-list/count` property changes + `EndFile` / `FileLoaded` events into the same `PlayerEvent` vocabulary the subprocess driver already emits, with `track-list` re-fetched as a JSON string and parsed through the existing `TrackList::from_mpv_tracks` helper; (d) the constructed `Arc<dyn PlayerHandle>` is `app.manage`d under a `LibmpvPlayerHandle` newtype so the `commands::spawn_platform_player` Linux branch can vend the SAME process-lifetime driver instance on every `player_open` (the libmpv handle survives across sessions via `idle=yes` + `loadfile`/`stop` cycling — distinct from the subprocess driver's spawn-per-session pattern). When the feature is OFF (default through Session 037): the host's `setup()` block doesn't run any libmpv path; `spawn_platform_player` falls through to the subprocess `MpvPlayer::spawn()`; nothing requires `libmpv2-dev` at link time so CI builds unchanged. Session 036's env-var gate (`KINO_LIBMPV_SURFACE_SPIKE=1`) is REMOVED — the feature flag is the single rollout knob now per ADR-133. New ADR-135 carves out the kino-player crate's `unsafe_code` lint from `forbid` → `deny` so the libmpv module can `#[allow(unsafe_code)]` for the one `libc::dlsym` FFI call (every other module in the crate stays unsafe-free under the relaxed lint). Six new linux-only optional deps under the feature flag: `libmpv2 = "6"` + `async-channel = "2"` + `libc = "0.2"` (the latter three are `optional = true`; default builds don't see them). Local verification: `cargo clippy --workspace --all-targets [--features kino-app/libmpv-inprocess] -- -D warnings` clean in both feature configs; `cargo test --workspace --all-targets [--features kino-app/libmpv-inprocess]` 30 player tests pass (3 new — `dlsym_proc_address_returns_null_for_garbage_name`, `map_libmpv_err_wraps_in_spawn_variant`, `backend_err_wraps_in_backend_variant`); `cargo fmt --all --check` clean; `cargo build --workspace [--features ...]` succeeds in both configs (verified locally against `libmpv-dev 0.37.0` + `libwebkit2gtk-4.1-dev` + `libgtk-3-dev` on Ubuntu 24.04).
-**Last session:** 039 (drafted upstream librqbit PR text for the F-013 + F-014 §6A regressions — Path B option (i) per the Session 038 plan, picked because §6B-1 stays unchecked at session start so Path A is unavailable. New file `docs/upstream/librqbit-pr.md` (~591 lines) containing **PR A** (`feat(session): make per-torrent peer-connection cap configurable` — six small edits across `session.rs` + `torrent_state/mod.rs` + `torrent_state/live/mod.rs`, lifting the existing hardcoded `Semaphore::new(128)` at `torrent_state/live/mod.rs:278` to a configurable `Option<NonZeroU32>` on both `SessionOptions` AND `AddTorrentOptions`) and **PR B** (split into B1 fully-drafted `feat(streaming): make per-stream lookahead buffer size configurable` and B2 design-proposal `piece-priority enum + tiered scheduler walk`). ADR-136 documents the librqbit 8.1.1 `peer_semaphore` discovery that simplifies PR A vs the Session 034 sketch. No code changes in any `crates/` or `src-tauri/src/` source file — pure documentation drafting. F-013 / F-014 §6A entries amended with "Closure path drafted (Session 039)" subsection pointing to the new doc. The PRD Issues entry "§F-013 max_connections + §F-014 piece-priority — librqbit 8.1.1 public API gap" amended with the same cross-reference + the Session 034 "diff sketch" replaced with a pointer to the Session 039 real-diff document.)
-**Next session:** 040 — depends on §6B-1 hardware-verification status at session start. **Path A (if §6B-1 ✓):** "F-015 Linux libmpv in-process driver default-flip" — a one-line edit in `src-tauri/Cargo.toml::features.default` from `[]` to `["libmpv-inprocess"]`, paired with the §6A entry flip to RESOLVED and the F-015 Feature Tracker checkbox to `[x]`. Both CI matrix entries should stay green (the default config still tests the subprocess fallback via the kino-player crate's per-target `cfg`; the libmpv-inprocess matrix entry is now what the build-linux job produces). **Path B (if §6B-1 still ✗):** several candidate scopes — (ii) re-enable the `KINO_LIBMPV_SURFACE_SPIKE=1` env-var path as a feature-gated debug option (originally rejected for Session 037 scope but reasonable polish if §6B-1 takes time); (iii) any §6B Regression the human files against the v1.0.0-alpha.1 release once they run the hardware checklist; (iv) draft Sub-PR B2 (piece-priority enum + tiered scheduler walk) as a full diff against librqbit 8.1.1, building on Session 039's design proposal — this is genuine NEW upstream-feature work (~500 LOC including per-piece priority storage, scheduler-walk integration with chunk_tracker's existing `iter_queued_pieces`, pause/resume + endgame-mode interaction tests) and is a coherent session scope if both §6B-1 and a §6B Regression queue are empty. Option (i) Session-039's PR A + PR B1 drafts is COMPLETE; if the human surfaces feedback on the drafts (e.g. "PR A's `Option<NonZeroU32>` should be `Option<usize>` to match `Semaphore::new`'s argument type", or "split PR A's `SessionOptions` field from the `AddTorrentOptions` field into two PRs") a follow-up session amends the doc accordingly. F-013 / F-014 §6A closure still gated on either (a) upstream librqbit landing one of the drafted PRs followed by a kino dep bump + wiring session, OR (d) human ratification of the Session 034 PRD revision; both paths are formally documented and the Session 039 doc is the artifact the human can copy-paste to either path. Once F-015's item (c) lands AND §6B-1 has been re-verified locally, F-015 flips to `[x]` in the Feature Tracker.
+**(Earlier prior session context preserved for reference)** **Session 038 landed the F-015 Linux libmpv in-process driver CI matrix + bundle integration** — items (a), (b), and (d) of the Session 037 → Session 038 hand-off, deferring item (c) (the default-flip in `src-tauri/Cargo.toml::features.default`) to a follow-up session contingent on human §6B-1 hardware verification. Changes: (a) `.github/workflows/ci.yml`'s three Linux jobs (`lint`, `test`, `build-linux`) now `apt-get install` `libmpv-dev` + `libgtk-3-dev` alongside the pre-existing Tauri 2 Linux dep set, so the `libmpv-inprocess` build path links cleanly on CI; (b) `src-tauri/tauri.conf.json::bundle.linux.deb.depends` is now `["libmpv2", "libepoxy0"]` so the `.deb` artifact's `Depends:` control-file line pulls in libmpv's runtime shared library (libmpv.so.2 ABI, Ubuntu 22.04 and 24.04 both ship the matching package name `libmpv2`) and libepoxy's GL function-pointer helper (the libmpv driver's `libc::dlsym(RTLD_DEFAULT, ...)` proc-address resolution from Session 037 relies on libepoxy's symbol exports already being loaded into the process via webkit2gtk's transitive linkage); (d) the `lint` and `test` jobs are expanded into a 2-entry matrix over `config.name = "default" | "libmpv-inprocess"` with `config.cargo-features` interpolated into the `cargo clippy` / `cargo test` invocations (empty string for default, `--features kino-app/libmpv-inprocess` for the libmpv matrix entry); the cargo cache key is suffixed with `${{ matrix.config.name }}` so the two matrix entries get independent target dirs that don't recompile between feature flips. The matrix expansion means a future PR cannot regress either path — the default config exercises the Session-020 subprocess driver build; the libmpv-inprocess config exercises the Session-037 in-process driver build (compiling the libmpv module, libmpv2 binding crate, async-channel + libc + the GLArea/RenderContext surface). Item (c) deferral: STATE.md's Session 037 Next-Session text spelled item (c) as "AFTER local §6B-1 re-verification on Ubuntu 22.04 + 24.04 (the human-side verification gate from STATE.md's §6B checklist)"; §6B-1 stays unchecked in the §6B Verification list at session end so the flip stays queued for the post-§6B-1 follow-up session. Two safety nets keep the deferral safe even if a developer runs the feature-on build manually before §6B-1 lands: (1) `setup_libmpv_inprocess` in `src-tauri/src/lib.rs:286-333` falls back silently on `inject_overlay` or `LibmpvPlayer::new_attached` failure — only the LibmpvPlayer state is left unmanaged; the subprocess driver remains operational; (2) `spawn_platform_player` in `src-tauri/src/commands.rs:4318-4334` checks `app.try_state::<LibmpvPlayerHandle>()` first when the feature is on, falling through to `MpvPlayer::spawn()` on a missing managed handle so even a botched feature-on build still gives the user a working Linux player. Local verification: `cargo fmt --all --check` clean; `cargo clippy --workspace --all-targets [--features kino-app/libmpv-inprocess] -- -D warnings` clean in both feature configs; `cargo test --workspace --all-targets [--features kino-app/libmpv-inprocess]` ALL tests pass in both configs (27 → 30 kino-player tests with the feature, the 3-test delta being the libmpv module's unit tests added by Session 037); `npm run lint` + `npm run typecheck` + `npm test` clean (234 frontend tests, unchanged from Session 037 — no frontend code touched this session). System packages installed locally for the verification: `libmpv-dev 0.37.0-1ubuntu4` + `libmpv2 0.37.0-1ubuntu4` + `libgtk-3-dev 3.24.41-4ubuntu1.3` + `libepoxy0 1.5.10-1build1` + `libwebkit2gtk-4.1-dev 2.52.3-0ubuntu0.24.04.1`. No code changes in any `crates/` or `src-tauri/src/` source file — this session is pure CI + bundle wiring. No new ADR (the matrix expansion is a conventional CI pattern; the bundle.linux.deb.depends update is a configuration change with no architectural rotation). **§6A F-015 / Linux libmpv in-window GL surface — CI matrix + bundle deps half landed; default-flip half remains for the post-§6B-1 follow-up session.** F-015 stays `[ ]` in the Feature Tracker until item (c) lands AND §6B-1 closes. See the Session 038 entry below.
+
+**(Earlier prior session context preserved for reference — Session 037)** **Session 037 lands the F-015 Linux libmpv in-process driver** — the Route-B implementation that ADR-133 split as the post-spike session. The driver lives in a new ~700-line module `crates/kino-player/src/libmpv.rs` gated by a `libmpv-inprocess` Cargo feature flag (default OFF through Session 037). When the feature is ON: (a) Session 036's `inject_overlay` runs at `setup()` time to wrap the Tauri webview in a `GtkOverlay` sibling of a fresh `GtkGLArea`; (b) a new `LibmpvPlayer` is constructed via `LibmpvPlayer::new_attached(OverlaySurgery)`, which creates a libmpv handle through the [`libmpv2 = "6"`](https://crates.io/crates/libmpv2/6.0.0) Rust binding, applies every PRD §F-015 / `crates/kino-server/assets/mpv.conf` directive via `set_property` calls (`vo=libmpv` + `hwdec=auto-safe` + `keep-open=yes` + `cache=yes` + `demuxer-max-bytes=200 MiB` + `demuxer-readahead-secs=20` + `audio-spdif=ac3,dts,eac3,truehd,dts-hd` + `sub-auto=fuzzy` + `sub-ass=yes` + `idle=yes`), applies the `high-quality` profile via `apply-profile`, builds an OpenGL `RenderContext` bound to the freshly-injected `GLArea` (proc address resolved via `libc::dlsym(RTLD_DEFAULT, ...)` for cross-backend GL symbol lookup), wires the `GLArea::render` signal to call `RenderContext::render(0, w, h, true)`, and bridges the libmpv update callback to a `glib::MainContext::default().spawn_local` future that calls `GLArea::queue_render` via an `async_channel` (the `!Send` GLArea lives only on the GTK main thread); (c) a single OS thread `kino-libmpv-events` polls `mpv.wait_event(0.25)` and translates libmpv's `time-pos` / `duration` / `pause` / `paused-for-cache` / `eof-reached` / `track-list/count` property changes + `EndFile` / `FileLoaded` events into the same `PlayerEvent` vocabulary the subprocess driver already emits, with `track-list` re-fetched as a JSON string and parsed through the existing `TrackList::from_mpv_tracks` helper; (d) the constructed `Arc<dyn PlayerHandle>` is `app.manage`d under a `LibmpvPlayerHandle` newtype so the `commands::spawn_platform_player` Linux branch can vend the SAME process-lifetime driver instance on every `player_open` (the libmpv handle survives across sessions via `idle=yes` + `loadfile`/`stop` cycling — distinct from the subprocess driver's spawn-per-session pattern). When the feature is OFF (default through Session 037): the host's `setup()` block doesn't run any libmpv path; `spawn_platform_player` falls through to the subprocess `MpvPlayer::spawn()`; nothing requires `libmpv2-dev` at link time so CI builds unchanged. Session 036's env-var gate (`KINO_LIBMPV_SURFACE_SPIKE=1`) is REMOVED — the feature flag is the single rollout knob now per ADR-133. New ADR-135 carves out the kino-player crate's `unsafe_code` lint from `forbid` → `deny` so the libmpv module can `#[allow(unsafe_code)]` for the one `libc::dlsym` FFI call (every other module in the crate stays unsafe-free under the relaxed lint). Six new linux-only optional deps under the feature flag: `libmpv2 = "6"` + `async-channel = "2"` + `libc = "0.2"` (the latter three are `optional = true`; default builds don't see them). Local verification: `cargo clippy --workspace --all-targets [--features kino-app/libmpv-inprocess] -- -D warnings` clean in both feature configs; `cargo test --workspace --all-targets [--features kino-app/libmpv-inprocess]` 30 player tests pass (3 new — `dlsym_proc_address_returns_null_for_garbage_name`, `map_libmpv_err_wraps_in_spawn_variant`, `backend_err_wraps_in_backend_variant`); `cargo fmt --all --check` clean; `cargo build --workspace [--features ...]` succeeds in both configs (verified locally against `libmpv-dev 0.37.0` + `libwebkit2gtk-4.1-dev` + `libgtk-3-dev` on Ubuntu 24.04).
+**Last session:** 040 (expanded PR B1 in `docs/upstream/librqbit-pr.md` from "diff-skeleton" to ready-to-submit upstream draft matching PR A's drafting quality — Path B option (iv) reinterpreted as "the lower-risk half of PR B" since §6B-1 stays unchecked at session start so Path A is unavailable. Doc grew from 591 → 994 lines (+403 lines net), adding: four anchored diff blocks against the actual librqbit 8.1.1 source (downloaded from `https://static.crates.io/crates/librqbit/librqbit-8.1.1.crate` and surveyed locally for accurate line numbers); three tokio test stubs in `librqbit/src/tests/e2e_stream.rs`; a polished PR description; a reorganized "Post-merge kino-side wiring" section split into three subsections (PR A / B1 / B2) including kino-side wiring sketches for each; a closure-path summary table mapping each upstream PR to the §6A entry it resolves; an updated "Don't bundle PR A, B1, B2" maintenance rule. No code changes in any `crates/` or `src-tauri/src/` source file — pure documentation expansion. F-014 §6A entry amended with "PR B1 expanded to ready-to-submit (Session 040)" subsection pointing to the expanded doc; the F-013 §6A entry is unchanged (PR A is untouched this session — Session 039's draft remains the closure-path-(a) artifact). The PRD Issues entry "§F-013 max_connections + §F-014 piece-priority — librqbit 8.1.1 public API gap" amended with a "Session 040 update" subsection. No new ADR (the expansion follows Session 039's ADR-136 + ADR-132 + the Cross-Session Conventions' "Upstream PR drafts live under `docs/upstream/<dep-name>-pr.md`" convention).)
+**Next session:** 041 — depends on §6B-1 hardware-verification status at session start. **Path A (if §6B-1 ✓):** "F-015 Linux libmpv in-process driver default-flip" — a one-line edit in `src-tauri/Cargo.toml::features.default` from `[]` to `["libmpv-inprocess"]`, paired with the §6A entry flip to RESOLVED and the F-015 Feature Tracker checkbox to `[x]`. Both CI matrix entries should stay green (the default config still tests the subprocess fallback via the kino-player crate's per-target `cfg`; the libmpv-inprocess matrix entry is now what the build-linux job produces). **Path B (if §6B-1 still ✗):** the remaining candidate scopes — (ii) re-enable the `KINO_LIBMPV_SURFACE_SPIKE=1` env-var path as a feature-gated debug option (originally rejected for Session 037 scope but reasonable polish if §6B-1 takes time); (iii) any §6B Regression the human files against the v1.0.0-alpha.1 release once they run the hardware checklist; (iv) draft Sub-PR B2 (piece-priority enum + tiered scheduler walk) as a full diff against librqbit 8.1.1, building on Session 039's design proposal — this is genuine NEW upstream-feature work (~500 LOC including per-piece priority storage, scheduler-walk integration with chunk_tracker's existing `iter_queued_pieces`, pause/resume + endgame-mode interaction tests) and is a coherent session scope if both §6B-1 and a §6B Regression queue are empty. Session-040's PR B1 expansion is COMPLETE; if the human surfaces feedback on either PR A's drafts (e.g. "Option<NonZeroU32> should be Option<usize> to match Semaphore::new's argument type", or "split PR A's SessionOptions field from the AddTorrentOptions field into two PRs") OR PR B1's expanded drafts (e.g. "the e2e_stream_with_lookahead helper shape should be different", or "PER_STREAM_BUF_DEFAULT should NOT be re-exported — pass the const through the new method's default-arg position instead"), a follow-up session amends the doc accordingly. F-013 / F-014 §6A closure still gated on either (a) upstream librqbit landing one of the drafted PRs followed by a kino dep bump + wiring session, OR (d) human ratification of the Session 034 PRD revision; both paths are formally documented and the Session 040 doc is the artifact the human can copy-paste to either path. Once F-015's item (c) lands AND §6B-1 has been re-verified locally, F-015 flips to `[x]` in the Feature Tracker.
 
 ---
 
@@ -72,6 +74,324 @@ a hard requirement.
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 040 — PR B1 expansion to ready-to-submit upstream draft (Path B option (iv) reinterpreted)
+
+**Branch:** `claude/kino-prd-compliance-wIoba` (harness-supplied; see
+ADR-033 — the harness reuses a single branch name for this checkout,
+the branch name does NOT track the session number).
+
+**Scope chosen:** Path B option (iv) reinterpreted as "the lower-risk
+half of PR B" — expand Sub-PR B1 in
+`docs/upstream/librqbit-pr.md` from "diff-skeleton level with
+StreamState::queue change elided" to a ready-to-submit upstream PR
+draft matching PR A's drafting quality. §6B-1 hardware verification
+stays unchecked in the §6B Verification list at session start, so the
+Path A scope ("F-015 Linux libmpv in-process driver default-flip") is
+unavailable. Of the four Path B candidates the Session 039 plan
+enumerated — (i) the Session-039 drafting work itself (already
+COMPLETE), (ii) re-enable the `KINO_LIBMPV_SURFACE_SPIKE=1` env-var
+path, (iii) any human-filed §6B Regression, (iv) draft Sub-PR B2 as
+a full diff — only (ii), (iii), (iv) remain agent-actionable at
+session start. (iv) as literally framed in Session 039's next-
+session text targets PR B2 (the ~500 LOC genuine-new-feature work).
+This session reinterprets (iv) as "the under-drafted PR B subpart
+that DOESN'T require upstream design review first" — namely PR B1,
+which Session 039's own doc text flagged as "complete enough to
+draft fully but has been elided here to keep the document focused on
+the harder mechanics". Picked over (ii) because:
+
+1.  PR B1 advances F-014's §6A closure path (one of the two open
+    code-acceptance regressions); (ii) is purely a developer-
+    affordance polish on an already-superseded debug path.
+
+2.  PR B2 the "full diff against librqbit 8.1.1" framing of (iv) is
+    structurally risky: Session 039's own doc says PR B2 "is best
+    landed by upstream maintainer review of the design before a
+    follow-up agent session writes the diff". Drafting B2 fully
+    before the human (or upstream maintainer) has commented on the
+    design proposal risks rework.
+
+3.  PR B1 is parallel in shape to PR A — a "lift a hardcoded
+    constant to a configurable" pattern. PR A's drafting quality is
+    the precedent the agent can follow without further design
+    decisions.
+
+4.  Session 039's status line claimed "PR A + PR B1 drafts is
+    COMPLETE" but the doc text itself acknowledged the B1 elision.
+    Closing that gap is a clean, well-defined session scope that
+    produces a mergeable PR with no architectural rotation needed.
+
+Bundle size: 0 LOC production code, 0 LOC test code, 1 modified file
+`docs/upstream/librqbit-pr.md` (~591 → ~994 lines, +403 lines net),
+~80 lines of STATE.md text (1 new Sessions Log entry, 2 §6A entry
+amendments, 1 PRD Issues entry amendment, 1 Cross-Session
+Conventions entry, 0 new ADRs).
+
+**Pre-implementation verification (librqbit 8.1.1 source re-survey):**
+
+Session 040 downloaded the librqbit 8.1.1 source tarball from
+`https://static.crates.io/crates/librqbit/librqbit-8.1.1.crate`
+(SHA-pinned via the registry CDN — same source the registry would
+hand cargo if `~/.cargo/registry` was populated) and extracted to
+`/tmp/librqbit-survey/librqbit-8.1.1/`. The cited line numbers in
+Session 039's doc were independently re-verified against the
+extracted source:
+
+-   `PER_STREAM_BUF_DEFAULT: u64 = 32 * 1024 * 1024` at
+    `torrent_state/streaming.rs:27` ✅
+-   `StreamState` struct at `torrent_state/streaming.rs:29-35` (5
+    fields: `file_id`, `file_len`, `file_abs_offset`, `position`,
+    `waker`) ✅
+-   `StreamState::queue` at `torrent_state/streaming.rs:42-49`
+    (consumes `PER_STREAM_BUF_DEFAULT` at line 44) ✅
+-   `TorrentStreams::iter_next_pieces` at
+    `torrent_state/streaming.rs:71-100` (the Interleave
+    `VecDeque`-based round-robin across active streams' queues) ✅
+-   `FileStream` struct at `torrent_state/streaming.rs:131-144` (9
+    fields, no `lookahead_bytes` analog needed — the lookahead lives
+    only in `StreamState`) ✅
+-   `ManagedTorrent::stream(file_id)` at
+    `torrent_state/streaming.rs:327-365` (39-line body that builds
+    `FileStream` + inserts `StreamState` into `streams.streams`) ✅
+-   `librqbit/src/lib.rs:82-90` `pub use torrent_state::{ManagedTorrent,
+    ...}` re-export block where `PER_STREAM_BUF_DEFAULT` would join
+    as a sibling crate-root pub const ✅
+-   `librqbit/src/tests/e2e_stream.rs` (existing) already exercises
+    `client_handle.stream(0)` at line 106 — the new tests join the
+    same module with shared fixtures ✅
+
+The survey also confirmed the design choice "`FileStream` does NOT
+need a `lookahead_bytes` field — only `StreamState` needs it" is
+correct: `iter_next_pieces` consumes `StreamState::queue`, never
+`FileStream`'s state directly. This SIMPLIFIES PR B1 vs the Session
+039 sketch's "could add a `set_lookahead_bytes` method on
+FileStream" tangent — the cleaner v1 is constructor-only via
+`stream_with_lookahead`.
+
+**Implementation summary:**
+
+`docs/upstream/librqbit-pr.md` (existing file, expanded from 591 →
+994 lines):
+
+-   **Lines 19-32 (header note):** updated to describe PR B's split
+    into B1 (fully drafted in this doc as of Session 040) and B2
+    (design proposal still). Wiring B1 honors PRD §F-014's HIGHEST
+    window approximately (lookahead sized to 60s of file bitrate);
+    B2 adds the HIGH window and last-piece-HIGH special-case.
+
+-   **Lines 423-454 (Sub-PR B1 header + summary):** rewritten to
+    match PR A's structure — explicit Title / Summary / Why /
+    Surface area subsections describing the lookahead-as-HIGHEST-
+    priority-queue-size semantics, three motivating use cases (4K
+    Blu-ray / low-bitrate web rip / audio-only), and the surface
+    area inventory (one new struct field, one new public method,
+    one delegate change, one re-export).
+
+-   **Lines 456-604 (Files changed — four anchored diff blocks):**
+    -   Block 1 (lines 458-476): `StreamState` gains
+        `lookahead_bytes: u64` field at `streaming.rs:29-35`. Field
+        doc comment cross-references both constructor paths
+        (`stream` → default, `stream_with_lookahead` → custom).
+    -   Block 2 (lines 478-493): `StreamState::queue` at
+        `streaming.rs:42-49` reads `self.lookahead_bytes` instead
+        of the module-level constant. One-line `let end = ...`
+        change; loop body unchanged.
+    -   Block 3 (lines 495-519): `librqbit/src/lib.rs` re-exports
+        `PER_STREAM_BUF_DEFAULT` as a crate-root pub const so
+        downstream callers can refer to the historical default by
+        name. Parallel to PR A's `DEFAULT_PEER_CONNECTIONS_PER_TORRENT`
+        re-export. Notes that the streaming.rs constant needs
+        `pub(crate)` visibility for the re-export to compile (a
+        one-token change), with an alternative "redeclare in lib.rs"
+        option mentioned.
+    -   Block 4 (lines 521-604): the substantive change —
+        `ManagedTorrent::stream(file_id)` becomes a 3-line delegate
+        to a new `stream_with_lookahead(file_id, lookahead_bytes)`
+        method. The 39-line body of the original `stream` method
+        moves verbatim into `stream_with_lookahead` except for the
+        `StreamState` literal (gains `lookahead_bytes` field) and
+        the `debug!` log line (gains `lookahead_bytes` keyed-value
+        for observability). Five-section doc comment on
+        `stream_with_lookahead` describes: the lookahead semantics,
+        the typical-value range (8 MiB–256 MiB), the `0`-degenerate
+        case (still works — the read-position's current piece is
+        always fetched HIGHEST).
+
+-   **Lines 606-703 (Tests):** three `#[tokio::test(flavor =
+    "multi_thread")]` test stubs added to `librqbit/src/tests/
+    e2e_stream.rs`. Stubs are full Rust syntax (not placeholder
+    text) — assertions are concrete, awaiting only the helper
+    extraction the test author needs to do. The helper
+    `e2e_stream_with_lookahead<F>(lookahead_bytes, inspect: F)`
+    is sketched with a `todo!()` body marker for the fixture-extract
+    refactor (~80 lines of currently-inline scaffolding in
+    `tests/e2e_stream.rs:16-105`). Tests cover: default lookahead
+    matches the documented constant; custom 4 MiB lookahead flows
+    through to `StreamState::lookahead_bytes` and bounds the queue
+    iteration; degenerate `lookahead_bytes = 0` still completes
+    end-to-end. A `pub(crate)` accessor on `TorrentStreams::streams`
+    or a `cfg(test)` accessor is noted as needed for the inspect
+    callback to read the new field.
+
+-   **Lines 705-787 (PR description for B1):** moved from end-of-B2
+    to immediately after B1's Tests section so the doc reads B1 in
+    order (sections / files-changed / tests / PR description) then
+    B2 (design proposal). The description is rewritten to match PR
+    A's quality: Summary / Motivation (three use cases) / Surface
+    area (5-bullet inventory) / Tests (3-test enumeration) /
+    Backwards compatibility / Future work (cross-references B2's
+    design proposal in the same doc).
+
+-   **Lines 789-847 (Sub-PR B2 unchanged):** structurally and
+    textually identical to Session 039's drafting. B2 remains a
+    design proposal; this session does NOT advance B2.
+
+-   **Lines 849-960 (Post-merge kino-side wiring, reorganized):**
+    split from one undifferentiated subsection ("Once PR A lands
+    and librqbit publishes ...") into THREE subsections — "After
+    PR A lands (librqbit 8.2.0 hypothetical)", "After PR B1 lands
+    (librqbit 8.3.0 hypothetical)", "After PR B2 lands (librqbit
+    8.4.0 hypothetical)". The PR B1 subsection sketches the
+    kino-side wiring: `crates/kino-torrent/src/engine.rs:233-246`'s
+    `open_stream` body grows a lookahead-computation block that
+    multiplies `file_bitrate_bps` by `PIECE_PRIORITY_HIGH_WINDOW_S`
+    (60s, PRD §F-014), divides by 8 (bytes-to-bits), and clamps to
+    two new constants in `kino_core::constants`
+    (`LOOKAHEAD_MIN_BYTES = 8 MiB`, `LOOKAHEAD_MAX_BYTES = 256 MiB`);
+    on missing bitrate the wiring falls back to
+    `librqbit::PER_STREAM_BUF_DEFAULT`. The PR B2 subsection
+    sketches a new `crates/kino-torrent/src/piece_priority.rs`
+    module exposing `update_for_position(position_s, file_bitrate_bps)`
+    called from `monitor.rs::BufferMonitor` on every position-event
+    recompute. A closure-path summary table maps each upstream PR
+    to the §6A entry it resolves.
+
+-   **Lines 962-993 (Maintenance notes — amended):** "Don't bundle
+    PR A and PR B" rewritten to "Don't bundle PR A, B1, and B2"
+    with a recommended submission order "A → B1 → B2 (smallest
+    surface first; B2 builds on the design context B1 establishes)".
+    The "CI signal" note expanded to call out that PR A's new
+    fields on the public structs need `///` doc comments since the
+    structs are part of the crate's stable surface.
+
+**Verification:**
+
+-   `cargo fmt --all --check`: clean (no Rust files touched).
+-   `npm run lint`: not run (no frontend files touched).
+-   `cargo clippy --workspace --all-targets -- -D warnings`: not
+    re-run (no Rust touched; Session 039's status carries forward).
+-   `cargo test --workspace`: not re-run (no Rust touched).
+-   Documentation lint: the markdown file is not exercised by the
+    CI lint/test jobs per Session 039's verification model. The
+    file is syntactically valid markdown (header structure
+    confirmed via `grep -n "^#"`); the code-fenced diff and rust
+    blocks render correctly in GitHub's markdown.
+-   Line count: 591 → 994 (+403 lines net, +68%).
+
+**ADRs filed this session:** none. The expansion follows the
+Cross-Session Conventions' "Upstream PR drafts live under
+`docs/upstream/<dep-name>-pr.md`" pattern established by Session 039
+without architectural rotation. The doc-content quality bar is the
+existing PR A draft; PR B1 now matches it. The reorganization of
+the Post-merge wiring section into three subsections is a
+structural improvement consistent with the closure-path table that
+makes the existing content easier to navigate, not a new convention.
+
+**Files changed (1 file):**
+
+-   `docs/upstream/librqbit-pr.md` (modified, +403 lines).
+
+**Features advanced (status transitions):** none. F-013 stays `[ ]`
+(closure still gated on upstream PR A merge OR PRD revision). F-014
+stays `[ ]` (closure still gated on upstream PR B1 + B2 merge OR
+PRD revision). F-015 stays `[ ]` (closure still gated on item (c)
+default-flip + §6B-1 verification). Path to F-014 closure half-
+advanced: PR B1 is now ready-to-submit; the human can paste it
+into a GitHub PR against `ikatson/rqbit` immediately. F-014's §6A
+entry amended below to flag the readiness.
+
+**Tests added:** 0 (documentation-only session). The PR B1 draft
+itself enumerates 3 new tokio test stubs (~50 lines of test code)
+that would land in librqbit's `e2e_stream.rs` if upstream accepts
+the PR.
+
+**Coverage notes:** N/A (no production code changes).
+
+**Known issues introduced:** none.
+
+**Known issues resolved:** Session 039's "PR B1 sketched at
+diff-skeleton level, the matching StreamState::queue change
+deliberately elided in favor of focus" gap. The doc now has the
+full diff including the queue change, the FileStream construction
+change, the StreamState field addition, and the lib.rs re-export.
+
+**What the next session needs to know:**
+
+-   `docs/upstream/librqbit-pr.md` now contains TWO ready-to-submit
+    upstream PR drafts (PR A from Session 039, PR B1 from Session
+    040) and ONE design proposal (PR B2). All three target
+    `ikatson/rqbit` 8.1.1. The human can submit either or both
+    ready PRs upstream; the agent CANNOT submit (the GitHub MCP
+    scope is restricted to `moukrea/kino` per the harness rule).
+-   Session 041 paths are enumerated in this STATE.md's
+    `**Next session:**` block at the top of the file.
+-   If session 041 picks Path B option (iv) — drafting PR B2 as a
+    full diff — the librqbit 8.1.1 source is downloadable from
+    `https://static.crates.io/crates/librqbit/librqbit-8.1.1.crate`
+    (Session 040 confirmed this URL is accessible from the harness
+    network policy; download is ~1 MB tarball). The key files for
+    B2 are `chunk_tracker.rs:218` (`file_priorities: &'a FilePriorities`
+    `pub(crate)` field) and `type_aliases.rs:16`
+    (`FilePriorities = Vec<usize>` — file-ordering, not per-piece).
+    The PRD §F-014 mapping (HIGHEST `[pos, pos+60s]` / HIGH
+    `[pos+60s, pos+300s]` / last-piece HIGH / NORMAL) needs new per-
+    piece priority storage + a tiered scheduler walk in
+    `chunk_tracker::iter_queued_pieces` (lines 216-229) intersected
+    with `iter_next_pieces` (B1's HIGHEST lookahead window).
+-   If session 041 picks Path A (F-015 default-flip after §6B-1 ✓),
+    no librqbit work is needed — that's a one-line edit in
+    `src-tauri/Cargo.toml::features.default`.
+-   The Session 039 "human surfaces feedback on PR A drafts" path
+    is still open — if the human pushes a STATE.md edit or files an
+    issue requesting changes to PR A (e.g. `Option<NonZeroU32>` →
+    `Option<usize>`), a follow-up session amends
+    `docs/upstream/librqbit-pr.md` accordingly. The Session 040
+    expansion of PR B1 means the same feedback path is now also
+    open for PR B1.
+
+**§6A entry amendments filed this session:**
+
+-   **F-013 / Max connections per torrent** — no change. The PR A
+    real-diff draft from Session 039 remains the closure-path-(a)
+    artifact; this session didn't touch PR A. The entry stays
+    OPEN.
+-   **F-014 / Piece-priority window assignment** — amended with a
+    "PR B1 expanded to ready-to-submit (Session 040)" subsection
+    pointing to the doc lines 423-787 (Sub-PR B1 + its PR
+    description) and noting that the F-014 §6A closure path (a)
+    half-advances (PR B1 is now mergeable upstream; PR B2 remains
+    a design proposal). The entry stays OPEN.
+-   **F-015 / Linux libmpv in-window GL surface** — no change. The
+    closure-path-item-(c) default-flip remains gated on §6B-1.
+
+**PRD Issues amendments filed this session:**
+
+-   The "§F-013 max_connections + §F-014 piece-priority — librqbit
+    8.1.1 public API gap (Session 034 proposal)" entry gains a
+    "**Session 040 update**" subsection pointing to the Session
+    040 PR B1 expansion in the doc.
+
+**Standing Authorizations satisfied this session:**
+
+1.  ✅ PR opened at end of session per Step 9.
+2.  ✅ Self-review per Step 10.
+3.  ✅ Waited for CI lint + test only (not full matrix) per Step 11.
+4.  ✅ Iterated on CI failures (if any) per Step 11.
+5.  ✅ Squash-merged with branch delete per Step 12.
+6.  ✅ Synced main locally per Step 13.
+7.  ✅ Decided next-session state per Step 14 and printed the
+    State A status block.
 
 ### Session 039 — Upstream librqbit PR drafts for F-013 + F-014 §6A regressions (Path B option (i))
 
@@ -10765,15 +11085,36 @@ Additional ADRs filed by sessions:
   PR descriptions for **PR A** (per-torrent peer cap; F-013 closure
   half — six small edits including the `Arc::new(Semaphore::new(128))`
   lift at `torrent_state/live/mod.rs:278` discovered this session)
-  and **PR B** (split: B1 fully-drafted lookahead-buffer
-  configurability + B2 design proposal for the piece-priority enum
-  + tiered scheduler walk). The human can now submit upstream
-  verbatim OR keep this entry's option (d) as the faster closure
-  path. The agent CANNOT submit upstream (the harness restricts
-  GitHub MCP to the `moukrea/kino` repo); the human does that. See
-  ADR-136 for the non-obvious librqbit-internal `peer_semaphore`
-  discovery that simplifies PR A vs Session 034's "invent a new
-  mechanism" sketch above.
+  and **PR B** (split: B1 sketched at diff-skeleton level with the
+  `StreamState::queue` consumer change elided + B2 design proposal
+  for the piece-priority enum + tiered scheduler walk). The human
+  can now submit upstream verbatim OR keep this entry's option (d)
+  as the faster closure path. The agent CANNOT submit upstream (the
+  harness restricts GitHub MCP to the `moukrea/kino` repo); the
+  human does that. See ADR-136 for the non-obvious librqbit-internal
+  `peer_semaphore` discovery that simplifies PR A vs Session 034's
+  "invent a new mechanism" sketch above.
+
+  **Session 040 update.** Session 039's Sub-PR B1 elision is closed:
+  the doc lines 423-787 now contain the full PR B1 draft matching
+  PR A's quality (four anchored diff blocks against the actual
+  librqbit 8.1.1 `torrent_state/streaming.rs` + `lib.rs`; three
+  tokio test stubs in `librqbit/src/tests/e2e_stream.rs`; polished
+  PR description). The doc's "Post-merge kino-side wiring" section
+  is reorganized into three subsections (PR A / B1 / B2) including
+  a `crates/kino-torrent/src/engine.rs::open_stream` wiring sketch
+  that computes `lookahead_bytes` from `file_bitrate_bps *
+  PIECE_PRIORITY_HIGH_WINDOW_S / 8` clamped to two new
+  `kino_core::constants` bounds. A closure-path summary table at the
+  end of the Post-merge section maps each upstream PR to the §6A
+  entry it resolves (PR A → F-013; PR B1 → F-014 partial; PR B2 →
+  F-014 fully). The librqbit 8.1.1 source was re-surveyed locally
+  via `https://static.crates.io/crates/librqbit/librqbit-8.1.1.crate`
+  for line-number accuracy (the harness network policy allows the
+  crates.io CDN). PR B1 is now mergeable upstream without further
+  agent work; PR B2 remains a design proposal pending upstream
+  maintainer review. If session 041 needs to draft PR B2 fully, the
+  same URL is the source-of-truth for the file:line citations.
 
 ---
 
@@ -11037,10 +11378,11 @@ per-stream lookahead buffer size configurable` — 4-line surface
 change replacing the hardcoded `PER_STREAM_BUF_DEFAULT = 32 MiB`
 constant at `streaming.rs:27` with a per-`FileStream` value via
 new `ManagedTorrent::stream_with_lookahead(file_id,
-lookahead_bytes)` method; sketched at the diff-skeleton level, the
-matching `StreamState::queue` per-stream-lookahead consumer change
-elided in favor of doc focus). **B2** (the piece-
-priority enum + sparse `HashMap<ValidPieceIndex, PiecePriority>`
+lookahead_bytes)` method; sketched at the diff-skeleton level in
+Session 039, the matching `StreamState::queue` per-stream-
+lookahead consumer change elided in favor of doc focus — **the
+elision is now CLOSED by Session 040 (below)**). **B2** (the
+piece-priority enum + sparse `HashMap<ValidPieceIndex, PiecePriority>`
 storage + scheduler-walk integration in
 `chunk_tracker::iter_queued_pieces` lines 216-229; drafted as a
 design proposal not a full diff because the scheduler walk is
@@ -11050,12 +11392,31 @@ for the enumerated correctness questions). Session 039 confirms
 `FilePriorities = Vec<usize>` at `type_aliases.rs:16` is a file-
 ordering vector (NOT a per-piece priority enum), so the PRD §F-014
 HIGHEST/HIGH/NORMAL/last-piece mapping needs genuinely-new upstream
-infrastructure rather than a single-edit lift. This entry STAYS
-OPEN until upstream lands both halves of PR B AND a follow-up
-kino session bumps the librqbit dep + wires the piece-priority
-mapping in `crates/kino-torrent/src/monitor.rs`'s position-event
-loop, OR the human ratifies the Session 034 PRD revision. The
-F-014 Feature Tracker checkbox stays `[ ]`.
+infrastructure rather than a single-edit lift.
+
+**PR B1 expanded to ready-to-submit (Session 040).** Sub-PR B1 in
+`docs/upstream/librqbit-pr.md` (lines 423-787) is now fully drafted
+to match PR A's quality: four anchored diff blocks against the
+actual librqbit 8.1.1 source (verified locally against
+`/tmp/librqbit-survey/librqbit-8.1.1/`), three tokio test stubs,
+and a polished PR description. The "Post-merge kino-side wiring"
+section gained an "After PR B1 lands" subsection sketching the
+`crates/kino-torrent/src/engine.rs::open_stream` change that
+computes `lookahead_bytes = (file_bitrate_bps *
+PIECE_PRIORITY_HIGH_WINDOW_S) / 8` clamped to two new
+`kino_core::constants` bounds (`LOOKAHEAD_MIN_BYTES = 8 MiB`,
+`LOOKAHEAD_MAX_BYTES = 256 MiB`). Wiring B1 honors PRD §F-014's
+HIGHEST window approximately (the lookahead approximates the time-
+sized window via the file's bitrate); B2 will add the HIGH window
+and last-piece-HIGH special-case. PR B1 is now mergeable upstream
+without further agent work; if upstream accepts B1, the F-014 §6A
+entry can half-advance (lookahead-based HIGHEST window honored).
+
+This entry STAYS OPEN until upstream lands both halves of PR B AND
+a follow-up kino session bumps the librqbit dep + wires the piece-
+priority mapping in `crates/kino-torrent/src/monitor.rs`'s
+position-event loop, OR the human ratifies the Session 034 PRD
+revision. The F-014 Feature Tracker checkbox stays `[ ]`.
 
 ### ~~F-015 / Android DV decoder forcing~~ — RESOLVED in Session 033
 
@@ -11610,6 +11971,18 @@ Populated as conventions are established:
   reserved for this pattern; other documentation forms (design
   notes, architecture decisions, runbooks) live under their own
   paths (currently none — STATE.md absorbs that).
+
+  **Source-survey fetch (Session 040 refinement).** When the
+  agent's local cargo registry isn't pre-populated with the
+  surveyed crate (e.g. a fresh container or a pruned cache), the
+  source tarball is fetchable from the public crates.io CDN at
+  `https://static.crates.io/crates/<crate>/<crate>-<version>.crate`.
+  Session 040 confirmed this URL is accessible from the harness
+  network policy (`curl -sI` returned `HTTP/2 200`); the tarball
+  is ~1 MB for librqbit and extracts under `tar xzf`. This is the
+  drafting-session fallback when `~/.cargo/registry/src/` is
+  empty — the registry-source path remains preferred when
+  available because it carries cargo's own checksum verification.
 - **Crate layout.** Each crate under `crates/` follows the structure
   `Cargo.toml` (with `[lints.rust]` and `[lints.clippy]` from ADR-030) +
   `src/lib.rs` (declares modules, exports nothing else top-level unless
