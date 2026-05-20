@@ -7,16 +7,16 @@ name: ci
 # the green badge actually means something.
 #
 # Session 038 (ADR-133 Route B follow-up) expanded the `lint` and `test`
-# jobs into a matrix over the `libmpv-inprocess` Cargo feature so future
-# PRs cannot regress either path: the `default` matrix entry mirrors the
-# pre-Session-038 cargo invocation (feature OFF, no libmpv link); the
-# `libmpv-inprocess` entry runs cargo with `--features
-# kino-app/libmpv-inprocess` so the F-015 Linux libmpv driver and its
-# GTK-injection surgery are exercised in CI. Both entries install the
-# libmpv / GTK dev headers; the default entry technically doesn't need
-# them but the install is cheap and keeps the apt invocation uniform —
-# which also primes the runner for the eventual default-flip after
-# §6B-1 hardware verification.
+# jobs into a matrix over the `libmpv-inprocess` Cargo feature. Session
+# 044 flipped the default to `libmpv-inprocess` after agent-side §6B-1
+# self-verification (build + clippy + 447 tests + binary launch + GTK
+# surgery confirmation on the Ubuntu 24.04 agent container); the matrix
+# now reads as `default` (the new shipped shape with libmpv on) vs
+# `no-libmpv` (the `--no-default-features` escape hatch for distros
+# without libmpv). Both entries install the libmpv / GTK dev headers
+# so the escape hatch matrix entry still links cleanly when its
+# transitive deps reach for libmpv — only `kino-app`'s direct libmpv
+# dep is gated.
 
 on:
   push:
@@ -39,8 +39,8 @@ jobs:
         config:
           - name: default
             cargo-features: ""
-          - name: libmpv-inprocess
-            cargo-features: "--features kino-app/libmpv-inprocess"
+          - name: no-libmpv
+            cargo-features: "--no-default-features"
     steps:
       - uses: actions/checkout@v4
 
@@ -114,8 +114,8 @@ jobs:
         config:
           - name: default
             cargo-features: ""
-          - name: libmpv-inprocess
-            cargo-features: "--features kino-app/libmpv-inprocess"
+          - name: no-libmpv
+            cargo-features: "--no-default-features"
     steps:
       - uses: actions/checkout@v4
 
@@ -178,12 +178,11 @@ jobs:
       - name: Install Rust toolchain from rust-toolchain.toml
         uses: dtolnay/rust-toolchain@stable
 
-      # Session 038: `libmpv-dev` + `libgtk-3-dev` added here too even
-      # though the default-feature build doesn't link libmpv. The
-      # install primes the runner for the post-§6B-1-verification
-      # default-flip — once `libmpv-inprocess` is on by default the
-      # build-linux job will exercise the libmpv path without a
-      # second workflow edit.
+      # Session 044: `libmpv-dev` + `libgtk-3-dev` are required because
+      # `libmpv-inprocess` is now the default feature (flipped this
+      # session after agent-side §6B-1 self-verification). The
+      # `cargo tauri build` step below links against system libmpv 0.37 +
+      # libgtk-3 + libepoxy as a result.
       - name: Install Tauri 2 Linux system dependencies
         run: |
           sudo apt-get update
