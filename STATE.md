@@ -1,7 +1,9 @@
 # kino — Agent State
 
 **PRD version:** 1.0 (locked)
-**Status:** v1.0.0-alpha.1 release pipeline shipped. **Session 042 re-enables the `KINO_LIBMPV_SURFACE_SPIKE=1` env-var path as a feature-gated developer-affordance debug option** (Path B option (ii) per the Session 041 next-session plan — the only agent-actionable option remaining once §6B-1 is still ✗ at session start (Path A unavailable), the §6B Regressions section is empty (option (iii) unavailable), and no upstream-PR feedback has arrived (option (v) unavailable); the agent has exhausted the upstream-PR-drafting scope as of Session 041 so the remaining Path B candidate IS (ii)). Deliverable: new Cargo feature `libmpv-surface-spike` in `src-tauri/Cargo.toml::features` (default OFF; mutually exclusive with `libmpv-inprocess` via the call site's `cfg(not(feature = "libmpv-inprocess"))` predicate); restored `run_libmpv_surface_spike()` function at `src-tauri/src/lib.rs:368-419` gated by `cfg(all(target_os = "linux", feature = "libmpv-surface-spike", not(feature = "libmpv-inprocess")))` performing the `kino_player::inject_overlay` surgery STANDALONE (no `LibmpvPlayer::new_attached` driver attach) when the `KINO_LIBMPV_SURFACE_SPIKE` env var is `"1"`; updated `surface.rs` module docs (`crates/kino-player/src/surface.rs::Trigger`) to document the now-two host-side call sites (the `libmpv-inprocess` Session 037 path + the `libmpv-surface-spike` Session 042 path) and their mutual exclusion. The developer affordance lets one verify the GtkOverlay reparenting on a Linux distro WITHOUT installing `libmpv-dev` — the subprocess `MpvPlayer` (ADR-108) keeps driving playback when the spike runs so the app remains operational while the surgery side-effects (transparent webview + black GLArea behind) are visually observable. New ADR-137 (this session) formalizes the design choices: (a) why re-enable an env-var path Session 037 superseded (it serves a different audience: distro-verification developers vs production users), (b) why a new Cargo feature instead of `cfg(debug_assertions)` (release builds may also need to verify on QA hardware), (c) why mutually exclusive with `libmpv-inprocess` via `cfg(not(...))` instead of runtime guard (double-surgery would error at `vbox.remove(webview)` for the second call, compile-time is the safer gate), (d) why NOT added to the CI lint/test matrix (the feature's surface is a single env-var-gated delegate call into already-exercised code, and a third matrix entry triples CI runtime for ~30 LOC of new code — ADR-137 accepts manual-review-on-modify as the regression-protection model). Bundle size: ~75 LOC of new Rust (43 lines new function body + cfg gating + 32 lines updated module docs in surface.rs); ~14 lines new Cargo.toml feature block; no test changes (the new function inherits coverage from the existing `inject_overlay` structural tests which run on the kino-player crate's default lint/test path); ~70 lines of new STATE.md text (Session 042 entry + ADR-137 + §6A F-015 entry amendment + this Status block). Verification: `cargo fmt --all --check` clean; `cargo clippy --workspace --all-targets [no-features | --features kino-app/libmpv-surface-spike | --features kino-app/libmpv-inprocess | --features "kino-app/libmpv-surface-spike kino-app/libmpv-inprocess"] -- -D warnings` clean across all FOUR configurations (the both-on configuration is structurally important to verify since ADR-137 documents the mutually-exclusive cfg predicate); `cargo test --workspace --all-targets [..]` ALL tests pass in all three productive configurations (444 / 444 / 447 — surface-spike adds zero new tests since the env-var-gated path is exercised through `inject_overlay`'s existing 2-test structural coverage); `npm run lint` + `npm run typecheck` + `npm test` clean (234 frontend tests, unchanged — no frontend touched). **§6A F-015 / Linux libmpv in-window GL surface** — item (c) default-flip half STILL remains queued; the new feature is a developer affordance NOT a §6A closure. F-015 stays `[ ]` in the Feature Tracker. **§6A F-013 / F-014** — unchanged (upstream-PR drafts complete since Session 041; closure still gated on either (a) upstream landing or (d) human PRD revision). **Next session (043)** path mapping is unchanged from Session 041's next-session text — Path A if §6B-1 ✓; Path B (iii) if any human-filed regression appears; Path B (v) if upstream / human feedback arrives on the librqbit PR drafts. The new `libmpv-surface-spike` feature is the recommended distro-verification tool for the human's §6B-1 work: `cargo tauri dev --features kino-app/libmpv-surface-spike` + `KINO_LIBMPV_SURFACE_SPIKE=1` exercises the GTK surgery without compiling libmpv2 (a separate, larger §6B-1 line is `--features kino-app/libmpv-inprocess` which does compile + link libmpv).
+**Status:** v1.0.0-alpha.1 release pipeline shipped. **Session 043 documents agent work-exhaustion at the three remaining OPEN §6A entries (F-013, F-014, F-015) per Session 042's no-op-session fallback** — Path A (`§6B-1 ✓` → F-015 `libmpv-inprocess` default-flip) blocked because §6B-1 stays `[ ]` in the §6B Verification list; Path B(iii) (§6B Regression triage) blocked because the §6B Regressions queue is empty (no fresh human filings); Path B(v) (amend upstream PR drafts on human feedback) blocked because kino-side PRs #42 / #43 / #44 / #45 all merged with zero `comments` and zero `review_comments` (verified via `mcp__github__list_pull_requests` at session start) AND the upstream librqbit repo `ikatson/rqbit` sits outside the agent's GitHub MCP scope (`moukrea/kino`) so the agent cannot submit the drafts itself; Path B(ii) + (iv) already landed in Sessions 039 / 040 / 041 / 042. Deliverable: documentation-only — one new PRD Issues entry **"§6A work-exhaustion at Session 043 — three OPEN entries blocked on human action"** catalogues each OPEN §6A entry + the human action that unblocks it, one new Sessions Log entry, this Status block rewrite, and a `**Last session:**` / `**Next session:**` line bump. No code changes; CI lint+test inherits Session 042's green status by construction (the only file touched is `STATE.md`, which sits outside every CI lint / test / build job's input set). **Stabilization rule codified this session:** Sessions 044+ that find the same exhaustion landscape return control IMMEDIATELY without opening a PR — see the new PRD Issues entry below for the rationale (the work-exhaustion is documented once; re-documentation passes are deferred until one of the three required human actions changes the landscape). The three required human actions, any of which unblocks the corresponding §6A entry: (1) run §6B-1 hardware verification on Ubuntu 22.04 + 24.04 against the v1.0.0-alpha.1 AppImage (and pre-derisk via the `libmpv-surface-spike` feature added Session 042) to unblock F-015's default-flip; (2) submit one or more of the three ready-to-paste librqbit upstream PR drafts in `docs/upstream/librqbit-pr.md` to `ikatson/rqbit` to unblock F-013 / F-014 closure path (a); OR (3) ratify the Session 034 proposed PRD revision under "PRD Issues" to flip F-013 + F-014 §6A entries to RESOLVED via closure path (d). **§6A F-013 / F-014 / F-015** — all three STAY OPEN. **Feature Tracker** — F-013 / F-014 / F-015 stay `[ ]`. **No new ADRs, no new Cross-Session Conventions** — this is a status observation, not an architectural decision.
+
+**(Prior session context preserved for reference)** **Session 042 re-enabled the `KINO_LIBMPV_SURFACE_SPIKE=1` env-var path as a feature-gated developer-affordance debug option** (Path B option (ii) per the Session 041 next-session plan — the only agent-actionable option remaining once §6B-1 is still ✗ at session start (Path A unavailable), the §6B Regressions section is empty (option (iii) unavailable), and no upstream-PR feedback has arrived (option (v) unavailable); the agent has exhausted the upstream-PR-drafting scope as of Session 041 so the remaining Path B candidate IS (ii)). Deliverable: new Cargo feature `libmpv-surface-spike` in `src-tauri/Cargo.toml::features` (default OFF; mutually exclusive with `libmpv-inprocess` via the call site's `cfg(not(feature = "libmpv-inprocess"))` predicate); restored `run_libmpv_surface_spike()` function at `src-tauri/src/lib.rs:368-419` gated by `cfg(all(target_os = "linux", feature = "libmpv-surface-spike", not(feature = "libmpv-inprocess")))` performing the `kino_player::inject_overlay` surgery STANDALONE (no `LibmpvPlayer::new_attached` driver attach) when the `KINO_LIBMPV_SURFACE_SPIKE` env var is `"1"`; updated `surface.rs` module docs (`crates/kino-player/src/surface.rs::Trigger`) to document the now-two host-side call sites (the `libmpv-inprocess` Session 037 path + the `libmpv-surface-spike` Session 042 path) and their mutual exclusion. The developer affordance lets one verify the GtkOverlay reparenting on a Linux distro WITHOUT installing `libmpv-dev` — the subprocess `MpvPlayer` (ADR-108) keeps driving playback when the spike runs so the app remains operational while the surgery side-effects (transparent webview + black GLArea behind) are visually observable. New ADR-137 (this session) formalizes the design choices: (a) why re-enable an env-var path Session 037 superseded (it serves a different audience: distro-verification developers vs production users), (b) why a new Cargo feature instead of `cfg(debug_assertions)` (release builds may also need to verify on QA hardware), (c) why mutually exclusive with `libmpv-inprocess` via `cfg(not(...))` instead of runtime guard (double-surgery would error at `vbox.remove(webview)` for the second call, compile-time is the safer gate), (d) why NOT added to the CI lint/test matrix (the feature's surface is a single env-var-gated delegate call into already-exercised code, and a third matrix entry triples CI runtime for ~30 LOC of new code — ADR-137 accepts manual-review-on-modify as the regression-protection model). Bundle size: ~75 LOC of new Rust (43 lines new function body + cfg gating + 32 lines updated module docs in surface.rs); ~14 lines new Cargo.toml feature block; no test changes (the new function inherits coverage from the existing `inject_overlay` structural tests which run on the kino-player crate's default lint/test path); ~70 lines of new STATE.md text (Session 042 entry + ADR-137 + §6A F-015 entry amendment + this Status block). Verification: `cargo fmt --all --check` clean; `cargo clippy --workspace --all-targets [no-features | --features kino-app/libmpv-surface-spike | --features kino-app/libmpv-inprocess | --features "kino-app/libmpv-surface-spike kino-app/libmpv-inprocess"] -- -D warnings` clean across all FOUR configurations (the both-on configuration is structurally important to verify since ADR-137 documents the mutually-exclusive cfg predicate); `cargo test --workspace --all-targets [..]` ALL tests pass in all three productive configurations (444 / 444 / 447 — surface-spike adds zero new tests since the env-var-gated path is exercised through `inject_overlay`'s existing 2-test structural coverage); `npm run lint` + `npm run typecheck` + `npm test` clean (234 frontend tests, unchanged — no frontend touched). **§6A F-015 / Linux libmpv in-window GL surface** — item (c) default-flip half STILL remains queued; the new feature is a developer affordance NOT a §6A closure. F-015 stays `[ ]` in the Feature Tracker. **§6A F-013 / F-014** — unchanged (upstream-PR drafts complete since Session 041; closure still gated on either (a) upstream landing or (d) human PRD revision). **Next session (043)** path mapping is unchanged from Session 041's next-session text — Path A if §6B-1 ✓; Path B (iii) if any human-filed regression appears; Path B (v) if upstream / human feedback arrives on the librqbit PR drafts. The new `libmpv-surface-spike` feature is the recommended distro-verification tool for the human's §6B-1 work: `cargo tauri dev --features kino-app/libmpv-surface-spike` + `KINO_LIBMPV_SURFACE_SPIKE=1` exercises the GTK surgery without compiling libmpv2 (a separate, larger §6B-1 line is `--features kino-app/libmpv-inprocess` which does compile + link libmpv).
 
 **(Prior session context preserved for reference)** **Session 041 expanded Sub-PR B2 in `docs/upstream/librqbit-pr.md` from "design proposal" to ready-to-submit upstream draft** (Path B option (iv) — the structurally-bigger half of PR B that Session 040 deferred pending lower-risk B1 expansion; §6B-1 still ✗ at session start so Path A — F-015 default-flip — remains unavailable, no §6B Regression filed, and (ii) developer-affordance polish on the superseded env-var spike is lower value than completing the F-014 §6A closure-path drafting trilogy). Deliverable: same file `docs/upstream/librqbit-pr.md` expanded from 994 → 1880 lines (+886 lines net). The Sub-PR B2 section now matches PR A + B1 drafting quality: seven anchored diff blocks against the actual librqbit 8.1.1 source (re-verified via `https://static.crates.io/crates/librqbit/librqbit-8.1.1.crate` against `/tmp/librqbit-survey/librqbit-8.1.1/`) covering — (1) NEW module `librqbit/src/torrent_state/piece_priorities.rs` with `pub enum PiecePriority { Highest, High, Normal, DontDownload }` + `pub(crate) struct TorrentPiecePriorities` (sparse `RwLock<HashMap<ValidPieceIndex, PiecePriority>>` storage with `get` / `set_many` / `iter_tier` / `snapshot` methods); (2) module declaration in `torrent_state/mod.rs`; (3) `pub use` re-export in `lib.rs:87-91`; (4) `Arc<TorrentPiecePriorities>` field added to `TorrentStateLive` (`live/mod.rs:176-212`) + threaded through `TorrentStateLive::new()` (lines 255-300) + preserved across `TorrentStateLive::pause()` (lines 701-725); (5) mirror field on `TorrentStatePaused` (`paused.rs:8-15`); (6) Arc-init in `TorrentStateInitializing::check()` (`initializing.rs:272-280`) parallel to the existing `streams: Arc::new(Default::default())`; (7) substantive scheduler change in `TorrentStateLive::reserve_next_needed_piece` (`live/mod.rs:1227-1276`) inserting two new tier walks (HIGHEST then HIGH) chained between `priority_streamed_pieces` and `natural_order_pieces`, with `DontDownload` filter applied to all three walks; (8) `pub fn ManagedTorrent::set_piece_priorities(file_id, ranges)` + `pub fn ManagedTorrent::piece_priorities()` accessor on `torrent_state/mod.rs:203-300` (with metadata-resolved/file-id-bounds/range-validation guards, per-file→absolute `ValidPieceIndex` translation via `FileInfo::piece_range_usize`, and `live.new_pieces_notify.notify_waiters()` poke for parked-peer wake). Three `#[tokio::test(flavor = "multi_thread")]` test stubs added to `librqbit/src/tests/e2e_stream.rs` (`test_piece_priorities_highest_pieces_selected_first`, `test_piece_priorities_dont_download_excluded`, `test_piece_priorities_survive_pause_resume`) with a sketched `e2e_with_priorities` helper that needs the same fixture-extract refactor B1's tests also require — the stubs use full Rust syntax with concrete assertions, only the fixture-setup body is `todo!()`. Polished PR description in the same paste-ready format as PR A + B1: Summary / Motivation (three use cases) / Surface area (5-bullet inventory) / Tests (3-test enumeration) / Backwards compatibility (zero-default-behavior-change guarantee) / Interaction with existing scheduler features (endgame mode, streams' wake-on-piece-completed, `update_only_files`) / Future work (last-piece-HIGH convenience, FileStream accessor, HTTP API JSON shape). The "Post-merge kino-side wiring / After PR B2 lands" subsection (lines 1775-1820) is rewritten in detail: kino-side `crates/kino-torrent/src/piece_priority.rs` module sketched with `update_for_position(handle, file_id, position_s, file_bitrate_bps)` API + stale-annotation demotion logic (advancing playhead by >300s demotes previously-HIGH pieces to NORMAL so annotations don't accumulate); `BufferMonitor` integration sketched for the 1-second sampler tick; new unit-test enumeration in `crates/kino-torrent/tests/buffer_monitor.rs`. The Maintenance Notes "CI signal" entry is amended to call out PR B2's new `PiecePriority` enum + setter method as user-facing API needing full `///` docs; new "PR B2 sequencing on the kino side" note records that the B2 kino wiring depends on B1's wiring already being in place (both use the `LOOKAHEAD_MIN_BYTES` / `LOOKAHEAD_MAX_BYTES` constants and the §6A entry only flips to RESOLVED when both are wired together). Header note at lines 19-32 amended from "two-sub-PR split with B2 design-proposal" to "three independent PRs, all drafted ready-to-submit"; the "designed proposal" caveat is removed throughout. No code changes in any `crates/` or `src-tauri/src/` source file — this session is pure documentation expansion. Verification: `cargo fmt --all --check` clean (no Rust touched); `cargo clippy` + `cargo test` carried forward from Session 040's status (no Rust touched); `npm run lint` skipped (no frontend touched); the markdown file is not exercised by the CI lint/test jobs. No new ADR (the expansion follows Session 039's ADR-136 + ADR-132 + the Cross-Session Conventions' "Upstream PR drafts live under `docs/upstream/<dep-name>-pr.md`" + the Session 040 refinement of "Source-survey fetch via crates.io CDN tarball when registry cache is empty" — no architectural rotation needed; the design choice of `Arc<TorrentPiecePriorities>` parallel to `Arc<TorrentStreams>` follows the existing librqbit code shape and isn't a kino-side architectural commitment). **§6A F-013 / F-014** still stay OPEN — the agent's drafting work for all three upstream PRs (A + B1 + B2) is now complete; closure still requires either (a) upstream landing one or more of the drafted PRs AND a follow-up kino session bumping the librqbit dep + wiring the new fields per the post-merge wiring sketches, OR (d) the human ratifying the Session 034 PRD revision. Both PR B sub-drafts are now ready-to-paste into GitHub PRs against `ikatson/rqbit` — no further agent work is needed before submission. **Path B for the next session** narrows to (ii) re-enable the `KINO_LIBMPV_SURFACE_SPIKE=1` env-var path as a feature-gated debug option, (iii) any §6B Regression the human files, OR (v) NEW — amend the upstream drafts based on human feedback on PR A / B1 / B2 (no feedback received yet, so this is contingent). See the Session 041 entry below.
 
@@ -12,8 +14,8 @@
 **(Earlier prior session context preserved for reference)** **Session 038 landed the F-015 Linux libmpv in-process driver CI matrix + bundle integration** — items (a), (b), and (d) of the Session 037 → Session 038 hand-off, deferring item (c) (the default-flip in `src-tauri/Cargo.toml::features.default`) to a follow-up session contingent on human §6B-1 hardware verification. Changes: (a) `.github/workflows/ci.yml`'s three Linux jobs (`lint`, `test`, `build-linux`) now `apt-get install` `libmpv-dev` + `libgtk-3-dev` alongside the pre-existing Tauri 2 Linux dep set, so the `libmpv-inprocess` build path links cleanly on CI; (b) `src-tauri/tauri.conf.json::bundle.linux.deb.depends` is now `["libmpv2", "libepoxy0"]` so the `.deb` artifact's `Depends:` control-file line pulls in libmpv's runtime shared library (libmpv.so.2 ABI, Ubuntu 22.04 and 24.04 both ship the matching package name `libmpv2`) and libepoxy's GL function-pointer helper (the libmpv driver's `libc::dlsym(RTLD_DEFAULT, ...)` proc-address resolution from Session 037 relies on libepoxy's symbol exports already being loaded into the process via webkit2gtk's transitive linkage); (d) the `lint` and `test` jobs are expanded into a 2-entry matrix over `config.name = "default" | "libmpv-inprocess"` with `config.cargo-features` interpolated into the `cargo clippy` / `cargo test` invocations (empty string for default, `--features kino-app/libmpv-inprocess` for the libmpv matrix entry); the cargo cache key is suffixed with `${{ matrix.config.name }}` so the two matrix entries get independent target dirs that don't recompile between feature flips. The matrix expansion means a future PR cannot regress either path — the default config exercises the Session-020 subprocess driver build; the libmpv-inprocess config exercises the Session-037 in-process driver build (compiling the libmpv module, libmpv2 binding crate, async-channel + libc + the GLArea/RenderContext surface). Item (c) deferral: STATE.md's Session 037 Next-Session text spelled item (c) as "AFTER local §6B-1 re-verification on Ubuntu 22.04 + 24.04 (the human-side verification gate from STATE.md's §6B checklist)"; §6B-1 stays unchecked in the §6B Verification list at session end so the flip stays queued for the post-§6B-1 follow-up session. Two safety nets keep the deferral safe even if a developer runs the feature-on build manually before §6B-1 lands: (1) `setup_libmpv_inprocess` in `src-tauri/src/lib.rs:286-333` falls back silently on `inject_overlay` or `LibmpvPlayer::new_attached` failure — only the LibmpvPlayer state is left unmanaged; the subprocess driver remains operational; (2) `spawn_platform_player` in `src-tauri/src/commands.rs:4318-4334` checks `app.try_state::<LibmpvPlayerHandle>()` first when the feature is on, falling through to `MpvPlayer::spawn()` on a missing managed handle so even a botched feature-on build still gives the user a working Linux player. Local verification: `cargo fmt --all --check` clean; `cargo clippy --workspace --all-targets [--features kino-app/libmpv-inprocess] -- -D warnings` clean in both feature configs; `cargo test --workspace --all-targets [--features kino-app/libmpv-inprocess]` ALL tests pass in both configs (27 → 30 kino-player tests with the feature, the 3-test delta being the libmpv module's unit tests added by Session 037); `npm run lint` + `npm run typecheck` + `npm test` clean (234 frontend tests, unchanged from Session 037 — no frontend code touched this session). System packages installed locally for the verification: `libmpv-dev 0.37.0-1ubuntu4` + `libmpv2 0.37.0-1ubuntu4` + `libgtk-3-dev 3.24.41-4ubuntu1.3` + `libepoxy0 1.5.10-1build1` + `libwebkit2gtk-4.1-dev 2.52.3-0ubuntu0.24.04.1`. No code changes in any `crates/` or `src-tauri/src/` source file — this session is pure CI + bundle wiring. No new ADR (the matrix expansion is a conventional CI pattern; the bundle.linux.deb.depends update is a configuration change with no architectural rotation). **§6A F-015 / Linux libmpv in-window GL surface — CI matrix + bundle deps half landed; default-flip half remains for the post-§6B-1 follow-up session.** F-015 stays `[ ]` in the Feature Tracker until item (c) lands AND §6B-1 closes. See the Session 038 entry below.
 
 **(Earlier prior session context preserved for reference — Session 037)** **Session 037 lands the F-015 Linux libmpv in-process driver** — the Route-B implementation that ADR-133 split as the post-spike session. The driver lives in a new ~700-line module `crates/kino-player/src/libmpv.rs` gated by a `libmpv-inprocess` Cargo feature flag (default OFF through Session 037). When the feature is ON: (a) Session 036's `inject_overlay` runs at `setup()` time to wrap the Tauri webview in a `GtkOverlay` sibling of a fresh `GtkGLArea`; (b) a new `LibmpvPlayer` is constructed via `LibmpvPlayer::new_attached(OverlaySurgery)`, which creates a libmpv handle through the [`libmpv2 = "6"`](https://crates.io/crates/libmpv2/6.0.0) Rust binding, applies every PRD §F-015 / `crates/kino-server/assets/mpv.conf` directive via `set_property` calls (`vo=libmpv` + `hwdec=auto-safe` + `keep-open=yes` + `cache=yes` + `demuxer-max-bytes=200 MiB` + `demuxer-readahead-secs=20` + `audio-spdif=ac3,dts,eac3,truehd,dts-hd` + `sub-auto=fuzzy` + `sub-ass=yes` + `idle=yes`), applies the `high-quality` profile via `apply-profile`, builds an OpenGL `RenderContext` bound to the freshly-injected `GLArea` (proc address resolved via `libc::dlsym(RTLD_DEFAULT, ...)` for cross-backend GL symbol lookup), wires the `GLArea::render` signal to call `RenderContext::render(0, w, h, true)`, and bridges the libmpv update callback to a `glib::MainContext::default().spawn_local` future that calls `GLArea::queue_render` via an `async_channel` (the `!Send` GLArea lives only on the GTK main thread); (c) a single OS thread `kino-libmpv-events` polls `mpv.wait_event(0.25)` and translates libmpv's `time-pos` / `duration` / `pause` / `paused-for-cache` / `eof-reached` / `track-list/count` property changes + `EndFile` / `FileLoaded` events into the same `PlayerEvent` vocabulary the subprocess driver already emits, with `track-list` re-fetched as a JSON string and parsed through the existing `TrackList::from_mpv_tracks` helper; (d) the constructed `Arc<dyn PlayerHandle>` is `app.manage`d under a `LibmpvPlayerHandle` newtype so the `commands::spawn_platform_player` Linux branch can vend the SAME process-lifetime driver instance on every `player_open` (the libmpv handle survives across sessions via `idle=yes` + `loadfile`/`stop` cycling — distinct from the subprocess driver's spawn-per-session pattern). When the feature is OFF (default through Session 037): the host's `setup()` block doesn't run any libmpv path; `spawn_platform_player` falls through to the subprocess `MpvPlayer::spawn()`; nothing requires `libmpv2-dev` at link time so CI builds unchanged. Session 036's env-var gate (`KINO_LIBMPV_SURFACE_SPIKE=1`) is REMOVED — the feature flag is the single rollout knob now per ADR-133. New ADR-135 carves out the kino-player crate's `unsafe_code` lint from `forbid` → `deny` so the libmpv module can `#[allow(unsafe_code)]` for the one `libc::dlsym` FFI call (every other module in the crate stays unsafe-free under the relaxed lint). Six new linux-only optional deps under the feature flag: `libmpv2 = "6"` + `async-channel = "2"` + `libc = "0.2"` (the latter three are `optional = true`; default builds don't see them). Local verification: `cargo clippy --workspace --all-targets [--features kino-app/libmpv-inprocess] -- -D warnings` clean in both feature configs; `cargo test --workspace --all-targets [--features kino-app/libmpv-inprocess]` 30 player tests pass (3 new — `dlsym_proc_address_returns_null_for_garbage_name`, `map_libmpv_err_wraps_in_spawn_variant`, `backend_err_wraps_in_backend_variant`); `cargo fmt --all --check` clean; `cargo build --workspace [--features ...]` succeeds in both configs (verified locally against `libmpv-dev 0.37.0` + `libwebkit2gtk-4.1-dev` + `libgtk-3-dev` on Ubuntu 24.04).
-**Last session:** 042 (re-enabled the `KINO_LIBMPV_SURFACE_SPIKE=1` env-var path as a feature-gated developer-affordance debug option — Path B option (ii) per the Session 041 next-session plan. §6B-1 stays unchecked at session start so Path A remains unavailable; the §6B Regressions section is empty so (iii) is unavailable; no human feedback on the librqbit PR drafts so (v) is unavailable; the upstream-PR-drafting scope is exhausted post-Session 041 so (ii) becomes the highest-value Path B candidate. New `libmpv-surface-spike` Cargo feature added to `src-tauri/Cargo.toml::features` (default OFF); `run_libmpv_surface_spike()` function restored to `src-tauri/src/lib.rs` gated by `cfg(all(target_os = "linux", feature = "libmpv-surface-spike", not(feature = "libmpv-inprocess")))` so it's mutually exclusive with the production `libmpv-inprocess` path. When the env var is set to `"1"` AND the feature is on, the host invokes `kino_player::inject_overlay` STANDALONE — performing the GtkOverlay surgery without constructing a `LibmpvPlayer` driver, so the developer can verify the widget-tree reparenting works on their Linux distro WITHOUT first installing `libmpv-dev`. The subprocess `MpvPlayer` (ADR-108) keeps driving playback when the spike runs so the app remains operational. `surface.rs` module docs updated to describe the now-two host-side call sites (the `libmpv-inprocess` Session 037 path + the `libmpv-surface-spike` Session 042 path) and their mutually-exclusive cfg gating. New ADR-137 documents the design choices: (a) re-introducing an env-var Session 037 superseded because it serves a different audience (distro-verification developers vs production users); (b) Cargo feature over `cfg(debug_assertions)` because release builds may need QA verification; (c) cfg-level mutual exclusion over runtime guard because double-surgery would error at `vbox.remove(webview)`; (d) NOT added to CI matrix because the surface is one env-var-gated delegate call into already-exercised code, and a third matrix entry triples CI runtime for ~30 LOC of new code — manual-review-on-modify is the accepted regression-protection model. Verification: `cargo fmt --all --check` clean; `cargo clippy --workspace --all-targets [..]` clean across FOUR feature configurations (default, libmpv-surface-spike, libmpv-inprocess, both); `cargo test --workspace --all-targets [..]` clean (444/444/447 tests; the both-on config matches libmpv-inprocess since the cfg predicate excludes the spike path); 234 frontend tests unchanged. No new tests added — the new function inherits coverage from `inject_overlay`'s existing structural tests.)
-**Next session:** 043 — same Path A / Path B selector as Session 042 / 041 with one updated availability bit. **Path A (if §6B-1 ✓):** "F-015 Linux libmpv in-process driver default-flip" — a one-line edit in `src-tauri/Cargo.toml::features.default` from `[]` to `["libmpv-inprocess"]`, paired with the §6A entry flip to RESOLVED and the F-015 Feature Tracker checkbox to `[x]`. Path A is now MORE LIKELY to be available because the human has the `libmpv-surface-spike` distro-verification tool (added Session 042) for derisking the `libmpv-inprocess` build before committing to the full `libmpv-dev` install + §6B-1 runtime test. **Path B (if §6B-1 still ✗):** the remaining candidate scopes — (ii) already-landed in Session 042, so removed from the candidate list; (iii) any §6B Regression the human files against the v1.0.0-alpha.1 release once they run the hardware checklist; (v) amend the upstream drafts in `docs/upstream/librqbit-pr.md` based on human feedback (still not received). Path B is now slimmer — the only agent-driven candidates are (iii) (reactive) and (v) (reactive). If both stay empty at session 043's start, the agent's productive-work envelope on this branch is essentially exhausted until human input (§6B verification, PR feedback, or a §6B regression filing) arrives; a session-043 entry in that case would file a NEW PRD Issues entry observing the exhaustion and recommending the human take one of: (1) run §6B-1 to unblock Path A's default-flip session, (2) review one or more of the three drafted librqbit PRs to unblock Path B(v), or (3) accept the proposed Session 034 PRD revision under option (d) to unblock the F-013/F-014 RESOLVED flip. F-013 / F-014 §6A closure still gated on either (a) upstream librqbit landing one or more of the drafted PRs followed by a kino dep bump + wiring session, OR (d) human ratification of the Session 034 PRD revision; both paths are formally documented and the Session 041 doc is the complete artifact the human can copy-paste to either path. Once F-015's item (c) lands AND §6B-1 has been re-verified locally, F-015 flips to `[x]` in the Feature Tracker.
+**Last session:** 043 (documentation-only — filed a new PRD Issues entry **"§6A work-exhaustion at Session 043 — three OPEN entries blocked on human action"** catalogueing each of the three remaining OPEN §6A regressions (F-013 / F-014 / F-015) + the specific human action that unblocks each, per Session 042's explicit no-op-session fallback text. No code changes. Verified at session start that all four exhaustion conditions hold: Path A unavailable (§6B-1 still `[ ]`); Path B(iii) empty (no human §6B regression filings); Path B(v) empty (kino-side PRs #42-#45 all merged with zero comments + zero review-comments per `mcp__github__list_pull_requests`; upstream librqbit repo outside the agent's MCP scope so drafts cannot be submitted by the agent); Path B(ii) + (iv) already landed Sessions 039 / 040 / 041 / 042. Also codified the **Session loop stability rule** in the new PRD Issues entry: Sessions 044+ that find the same exhaustion landscape return control IMMEDIATELY without opening a PR — the work-exhaustion is documented once, re-documentation passes are deferred until the landscape changes. Considered + rejected: closure (b) vendor librqbit (presumptuous — Session 034 subordinates (b)/(c) to (a)/(d) and the human has not rejected (a) or (d)), closure (c) swap engine (heaviest, same subordination), F-015 default-flip ahead of §6B-1 (would ship an unverified default), second §6A audit pass (S027's audit was comprehensive — likely no-find make-work), polish on Known Issues / Tech Debt (explicitly "not v1 scope"), pre-emptive documentation (not a PRD requirement), self-running §6B-1 (headless container can't satisfy "home screen visible within 5s" + PRD §6B explicitly carves §6B out as human-verified). No new ADRs, no new Cross-Session Conventions, no Feature Tracker checkbox flips, no code touched.)
+**Next session:** 044 — same Path A / Path B selector as Session 043 with the Session loop stability rule from this session's new PRD Issues entry binding. **Path A (if §6B-1 ✓ at session start):** F-015 `libmpv-inprocess` default-flip — one-line `Cargo.toml::features.default = ["libmpv-inprocess"]` edit + STATE.md §6A entry flip + Feature Tracker checkbox `[x]`. **Path B (if §6B-1 still ✗):** (iii) reactive §6B Regression triage if any human-filed; (v) reactive amend-upstream-drafts on human feedback if any. **Stabilization rule binds (per this session's new PRD Issues entry):** if Path A unavailable AND Path B(iii) empty AND Path B(v) empty at Session 044's start, the correct response is to print the harness's State A status line referencing the most-recently-merged session number AND RETURN CONTROL — do not open a make-work PR re-documenting the same exhaustion. Session 044 in that state runs no `git checkout -b`, no `git commit`, no `mcp__github__create_pull_request`. The work-exhaustion is authoritatively documented in the PRD Issues entry filed this session; future re-documentation is deferred until one of the three required human actions (§6B-1 verification, upstream PR submission, OR PRD revision ratification) is performed and the landscape changes.
 
 ---
 
@@ -78,6 +80,235 @@ a hard requirement.
 ## Sessions Log
 
 _New entries prepended at the top._
+
+### Session 043 — Document agent work-exhaustion at the three OPEN §6A entries (Session 042's no-op-session fallback)
+
+**Branch:** `claude/session-001-bootstrap-jw7uy` (harness-supplied this
+session; see ADR-033 — the branch name does NOT track the session
+number, the harness reuses a per-checkout name and the session number
+lives in commit messages + PR title).
+
+**Scope chosen:** documentation-only. Session 042's next-session text
+named this exact fallback verbatim: "If both (iii) and (v) are empty
+at Session 043's start, the agent's productive-work envelope on this
+branch is effectively exhausted until human input arrives. Session
+043 in that case files a NEW PRD Issues entry observing the
+work-exhaustion and recommending one of: (1) run §6B-1 to unblock
+Path A, (2) review one or more of the librqbit upstream-PR drafts to
+unblock Path B(v), or (3) ratify the Session 034 PRD revision to flip
+F-013/F-014 §6A entries to RESOLVED. The agent does NOT spin a
+'make-work' session; the PRD Issues entry is the honest documentation
+of where the project sits." This session lands exactly that PRD
+Issues entry — no more, no less.
+
+**Verified at session start (the four exhaustion conditions):**
+
+1.  **Path A (F-015 `libmpv-inprocess` default-flip if §6B-1 ✓):**
+    UNAVAILABLE. The §6B Verification list shows §6B-1 through §6B-8
+    all `[ ]`. The harness AGENT_PROMPT Step 14 carves §6B out
+    explicitly: "§6B hardware verification is up to the human." The
+    PRD §6B framework explicitly puts §6B-1 ("Linux AppImage launches
+    on Ubuntu 22.04 and Ubuntu 24.04; home screen visible within 5s
+    after TMDB key entered") in the human-verified column. The agent
+    cannot check §6B-1 itself.
+
+2.  **Path B(iii) (§6B Regression triage):** UNAVAILABLE. The §6B
+    Regressions section contains exactly one entry — the RESOLVED
+    `CI build-android failure on PR #24 (Session 023)` (closed
+    Session 026) — and no fresh human-filed regressions against the
+    v1.0.0-alpha.1 release.
+
+3.  **Path B(v) (amend upstream drafts on human feedback):**
+    UNAVAILABLE. Kino-side PRs #42 (Session 039 — PR A draft),
+    #43 (Session 040 — PR B1 expansion), #44 (Session 041 — PR B2
+    expansion), and #45 (Session 042 — surface-spike feature) all
+    merged with zero `comments` and zero `review_comments` (verified
+    at session start via `mcp__github__list_pull_requests` returning
+    all four with `comments: 0`, `review_comments: 0`). The upstream
+    librqbit repo `ikatson/rqbit` sits outside the agent's GitHub
+    MCP scope (restricted to `moukrea/kino` per the harness Repository
+    Scope block); the agent cannot submit the drafts upstream and
+    cannot solicit maintainer feedback. There is no feedback to
+    react to.
+
+4.  **Path B(ii) + (iv):** ALREADY LANDED.
+
+    -   (ii) re-enable the `KINO_LIBMPV_SURFACE_SPIKE=1` env-var path
+        as a feature-gated debug option — landed Session 042 (ADR-137).
+    -   (iv) draft PR A + PR B1 + PR B2 against librqbit 8.1.1 —
+        landed Sessions 039 / 040 / 041 respectively; the
+        `docs/upstream/librqbit-pr.md` file is 1880 lines of
+        ready-to-paste upstream PR text.
+
+**Considered and rejected (ultrathink alternatives):**
+
+-   **Closure path (b) for F-013 / F-014 — vendor librqbit patches
+    under `[patch.crates-io]` pointing at a local path within
+    `moukrea/kino`.** Technically agent-actionable (vendor ~10k LOC
+    of librqbit source into `vendor/librqbit-patched/` + apply the
+    PR A + B1 + B2 diffs locally). Rejected because Session 034's
+    PRD revision proposal explicitly subordinates (b)/(c) to (a)/(d)
+    — "(b)/(c) only if (a) is rejected upstream and (d) is
+    unacceptable to the human"; the human has not rejected either
+    (a) or (d), so jumping to (b) is presumptuous. (b) also carries
+    a permanent maintenance burden (every librqbit version bump
+    rebases the patches) the human has not ratified. The cleaner
+    closures — (a) human submits upstream, (d) human ratifies PRD
+    revision — are both unilateral human actions the agent unblocks
+    by waiting.
+
+-   **Closure path (c) for F-013 / F-014 — swap to a different
+    torrent engine.** Heaviest closure of the four. Effectively
+    redoes F-013 + F-014 (~1500 LOC of Session 018 / 019 work) plus
+    carries a new engine's evaluation burden the PRD has not
+    authorized. Same Session 034 ordering rationale rejects this.
+
+-   **F-015 Linux libmpv default-flip ahead of §6B-1.** Trivially
+    agent-actionable (one-line `Cargo.toml::features.default` edit)
+    but explicitly gated by the post-§6B-1 framing in Sessions 037
+    / 038 / 040 / 041 / 042 — all five flag the default-flip as
+    "Path A, available iff §6B-1 ✓". Flipping without §6B-1 risks
+    shipping a broken default to a user whose distro the
+    `inject_overlay` GTK surgery hasn't been verified against; this
+    is precisely the regression the §6B-1 gate is designed to catch.
+    Reject.
+
+-   **A second §6A audit pass.** Session 027's audit was
+    comprehensive — re-opened F-003 / F-006 / F-013 / F-014 / F-015
+    / F-016. Of those, F-003 / F-006 / F-016 are now RESOLVED
+    (Sessions 028 / 029 / 030 / 031 / 032) and F-013 / F-014 /
+    F-015 are the three OPEN entries this session records exhaustion
+    against. A second pass would re-survey the same PRD criteria
+    against the same code and either find nothing (most likely) or
+    surface a new gap (low probability given the prior audit's
+    depth). Make-work; reject.
+
+-   **Polish pass on Known Issues / Tech Debt items.** Placeholder
+    Tauri icons, per-provider response_cache TTL wiring, TMDB
+    clearart-bucket documentation, trending dedup IMDb-id
+    enrichment, compileSdk 34 fragility — all documented as "Not
+    blocking for §6A". Per the harness AGENT_PROMPT session-sizing
+    rule "v1 ships. v2 polishes," these are explicitly NOT v1 scope.
+    Reject.
+
+-   **Pre-emptive documentation (release notes, developer docs,
+    README expansion).** None are PRD requirements. PRD §F-018
+    already ships autogenerated release notes via
+    `gh release create --generate-notes`; the README is
+    fit-for-purpose. Reject.
+
+-   **Self-run §6B-1.** The remote-execution container could in
+    principle compile + launch a Linux AppImage, but §6B-1 specifies
+    "Linux AppImage launches on Ubuntu 22.04 and Ubuntu 24.04; home
+    screen visible within 5s after TMDB key entered" — a
+    real-hardware human-eye check requiring an actual user
+    interaction loop. Headless containers don't satisfy that. The
+    harness AGENT_PROMPT Step 14 + PRD §6B both require §6B
+    verification be human-performed; "Never mark §6B items as
+    complete; that's the human's job" is in the AGENT_PROMPT's
+    Hard rules list. Reject.
+
+**What this session DOES change:**
+
+1.  This Sessions Log entry (the Session 043 narrative).
+2.  A new PRD Issues entry: **"§6A work-exhaustion at Session 043 —
+    three OPEN entries blocked on human action"**. Catalogues each
+    OPEN §6A entry, the human action that unblocks it, the agent
+    action that depends on the human action; codifies the **Session
+    loop stability rule** governing Sessions 044+.
+3.  The top Status block: rewritten for Session 043's framing
+    (replaces the Session 042 "Path B(ii) env-var path re-enable"
+    framing). The OLD Session 042 status text is preserved verbatim
+    immediately below as the first "(Prior session context preserved
+    for reference)" paragraph; the prior chain of preserved
+    Sessions 041 / 040 / 039 / 038 / 037 paragraphs is untouched.
+4.  The `**Last session:**` line: bumped 042 → 043.
+5.  The `**Next session:**` line: bumped 043 → 044 with the
+    Session loop stability rule referenced.
+
+**What this session DOES NOT change:**
+
+-   No new ADRs (this is a status observation, not an architectural
+    decision; the "session loop stability" rule is documented inline
+    in the new PRD Issues entry — it's a per-circumstance instruction
+    tied to a specific exhaustion landscape, not a reusable
+    architectural pattern).
+-   No new Cross-Session Conventions (no new pattern emerges).
+-   No Feature Tracker checkbox flips (F-013 / F-014 / F-015 stay
+    `[ ]`; the three OPEN §6A entries stay OPEN).
+-   No code touched. No `Cargo.toml`, no `Cargo.lock`, no `*.rs`, no
+    `*.ts` / `*.tsx`, no `.github/workflows/*.yml`, no PRD edits, no
+    `docs/upstream/librqbit-pr.md` edits.
+
+**Verification (markdown only):**
+
+-   `git diff --stat main..HEAD` shows exactly one file changed
+    (`STATE.md`). No Rust / TypeScript / YAML / TOML / lock files
+    touched.
+-   `cargo fmt --all --check` / `cargo clippy --workspace
+    --all-targets [..] -- -D warnings` / `cargo test --workspace
+    --all-targets [..]`: not exercised. Markdown is not in the
+    formatter / linter / test pipeline; the CI lint+test matrix's
+    two productive feature configurations (`default` /
+    `libmpv-inprocess`) inherit Session 042's green status by
+    construction (no Rust touched, no clippy/test output can
+    change).
+-   `npm run lint` / `npm run typecheck` / `npm test`: not
+    exercised (no frontend touched).
+-   `cargo tauri build` / `cargo tauri android build`: not
+    exercised (no source touched).
+-   CI lint+test (the merge gate per Standing Authorizations
+    item #3) expected green by inheritance.
+
+**ADRs filed this session:** none.
+
+**Cross-Session Conventions added this session:** none.
+
+**PRD Issues / §6A status after this session:**
+
+-   §6A F-013 / Max connections per torrent: UNCHANGED. Closure
+    path (a) PR A draft remains ready-to-submit per
+    `docs/upstream/librqbit-pr.md`. Human action required.
+-   §6A F-014 / Piece-priority window assignment: UNCHANGED.
+    Closure paths (a) PR B1 + PR B2 drafts remain ready-to-submit
+    per `docs/upstream/librqbit-pr.md`. Human action required.
+-   §6A F-015 / Linux libmpv in-window GL surface: UNCHANGED.
+    Driver implementation + CI matrix + bundle deps + developer-
+    affordance debug option all landed (Sessions 037 / 038 / 042).
+    Default-flip + Feature Tracker checkbox flip gated on human
+    §6B-1 verification.
+
+**Next-session implications (Path mapping for Session 044):**
+
+-   **Path A** (`§6B-1 ✓` at session start): F-015
+    `libmpv-inprocess` default-flip. One-line
+    `src-tauri/Cargo.toml::features.default = ["libmpv-inprocess"]`
+    edit + STATE.md §6A entry flip + Feature Tracker checkbox
+    `[x]`. With §6B-1 ✓, the path requirement is met.
+-   **Path B(iii)** (reactive — §6B Regression triage): depends on
+    the §6B Regressions section gaining entries since this session.
+-   **Path B(v)** (reactive — amend upstream drafts on human
+    feedback): depends on the human submitting PR A / B1 / B2
+    upstream AND a librqbit maintainer reviewing them since this
+    session.
+
+**Session loop stability rule (codified in the new PRD Issues
+entry).** If Session 044's start finds the same exhaustion landscape
+as Session 043 (Path A unavailable, B(iii) empty, B(v) empty), the
+correct action is to **return control IMMEDIATELY without opening a
+PR**. The work-exhaustion is already documented in this session's
+new PRD Issues entry; spinning up Session 044 to re-document the
+same exhaustion would itself be the make-work Session 042's plan
+and this session's new entry both prohibit. The harness AGENT_PROMPT
+Step 3 framing ("Pick the smallest coherent unit of work that
+produces a mergeable PR") is permissive of zero-work sessions when
+no coherent unit exists. Sessions 044+ in the same state run no
+branch creation, no commit, no `mcp__github__create_pull_request` —
+they print the State A status line ("Session NNN merged. Returning
+control. Next session: pick up from STATE.md.") with `NNN = 043`
+(the most-recently-merged session number) and stop. Re-documentation
+passes are deferred until the landscape changes (one of the three
+required human actions in the new PRD Issues entry is performed).
 
 ### Session 042 — Re-enable `KINO_LIBMPV_SURFACE_SPIKE=1` env-var path as feature-gated developer affordance (Path B option (ii) per Session 041 plan)
 
@@ -11890,6 +12121,186 @@ Additional ADRs filed by sessions:
   approaches. The recommended order is A → B1 → B2 per the
   doc's Maintenance Notes (smallest surface first; B2's
   scheduler integration is the most invasive of the three).
+- **§6A work-exhaustion at Session 043 — three OPEN entries
+  blocked on human action.** Session 043 documents that the
+  agent's productive-work envelope on `main` is exhausted at
+  the three remaining OPEN §6A Code-Acceptance Regressions;
+  further progress requires human action. Catalogue:
+
+  1.  **F-013 / Max connections per torrent.** The 200-cap
+      constant `MAX_CONNECTIONS_PER_TORRENT` is defined in
+      `crates/kino-core/src/constants.rs` but is not consumed
+      because librqbit 8.1.1's public `SessionOptions` /
+      `AddTorrentOptions` API does not expose a
+      `max_peers_per_torrent` setter (the internal
+      `Arc<Semaphore::new(128)>` at
+      `librqbit/src/torrent_state/live/mod.rs:278` is
+      hardcoded, per ADR-136). Closure paths:
+
+      -   **(a) Upstream PR lands.** PR A draft is
+          ready-to-submit at `docs/upstream/librqbit-pr.md`
+          since Session 039 (real diffs against the
+          surveyed 8.1.1 source + three tokio test stubs +
+          polished PR description in paste-ready format).
+          The agent cannot submit it — the GitHub MCP scope
+          is `moukrea/kino`, not `ikatson/rqbit`.
+          **Required human action:** submit PR A to
+          `ikatson/rqbit` and report back when (or if) it
+          lands. Once it lands, a follow-up agent session
+          bumps the librqbit dep + wires the new
+          `max_peers_per_torrent` option per the doc's
+          "Post-merge kino-side wiring / After PR A lands"
+          subsection.
+      -   **(d) PRD revision.** Session 034 filed the
+          verbatim proposed PRD §F-013 revision text under
+          PRD Issues ("§F-013 max_connections-per-torrent +
+          §F-014 piece-priority — librqbit 8.1.1 public
+          API gap"). **Required human action:** ratify or
+          reject. If ratified, the §6A entry flips to
+          RESOLVED with no code changes — the relaxed
+          invariant ("best-effort, subject to engine
+          capabilities") is satisfied by the current
+          implementation as-is.
+      -   **(b) Vendor librqbit patches**, **(c) Swap
+          engine.** Last-resort options; Session 034 + this
+          entry both explicitly subordinate them to (a)/(d)
+          — "(b)/(c) only if (a) is rejected upstream and
+          (d) is unacceptable to the human". Currently
+          neither precondition holds.
+
+      Either (a) landing OR (d) ratification resolves this
+      entry.
+
+  2.  **F-014 / Piece-priority window assignment.** Same
+      class as F-013. The `PIECE_PRIORITY_HIGH_WINDOW_S` +
+      `PIECE_PRIORITY_MED_WINDOW_S` constants in
+      `crates/kino-core/src/constants.rs` are defined but
+      unconsumed; librqbit 8.1.1's piece-priority API
+      surface (`chunk_tracker.rs::ChunkTracker`'s
+      `priority_streamed_pieces` walk + the per-stream
+      lookahead buffer) is crate-internal. Closure paths:
+
+      -   **(a) Upstream PRs land.** PR B1 (per-stream
+          lookahead buffer configurability) draft is
+          ready-to-submit since Session 040; PR B2 (the
+          `PiecePriority` enum + tiered scheduler walk +
+          `set_piece_priorities` setter) draft is
+          ready-to-submit since Session 041 (both at PR A
+          drafting quality — real diffs against librqbit
+          8.1.1 source + tokio test stubs + paste-ready
+          PR descriptions). **Required human action:**
+          submit one or both upstream and report. The
+          recommended order is A → B1 → B2 per the doc's
+          Maintenance Notes (smallest surface first).
+      -   **(d) PRD revision.** Same Session 034 proposal
+          covers F-014. **Required human action:** ratify
+          or reject.
+
+  3.  **F-015 / Linux libmpv in-window GL surface.** The
+      libmpv-rs in-process driver is implemented behind the
+      `libmpv-inprocess` Cargo feature (Session 037,
+      `crates/kino-player/src/libmpv.rs` ~700 LOC); the CI
+      lint+test matrix exercises it (Session 038, two-entry
+      matrix over the feature flag); a developer-affordance
+      debug option exists (Session 042,
+      `libmpv-surface-spike` Cargo feature gating
+      standalone `inject_overlay` surgery via the
+      `KINO_LIBMPV_SURFACE_SPIKE=1` env var). Remaining
+      gates:
+
+      -   **(c) Default-flip**
+          `src-tauri/Cargo.toml::features.default` from
+          `[]` to `["libmpv-inprocess"]` + Feature Tracker
+          checkbox `[x]` + §6A entry flip to RESOLVED.
+      -   **§6B-1** verification on Ubuntu 22.04 + 24.04
+          hardware (the implicit gate on (c) per Sessions
+          037 / 038 / 040 / 041 / 042 — all five queue (c)
+          for the post-§6B-1 follow-up session).
+
+      **Required human action:** run the Linux AppImage
+      from the `v1.0.0-alpha.1` GitHub Release (or build
+      locally via `cargo tauri build --features
+      kino-app/libmpv-inprocess --target
+      x86_64-unknown-linux-gnu` for the pre-default-flip
+      build), confirm libmpv plays a stream end-to-end with
+      the controls overlay functional, and check §6B-1 in
+      the §6B Verification list. The `libmpv-surface-spike`
+      developer-affordance feature (Session 042 — run via
+      `cargo tauri dev --features kino-app/libmpv-surface-spike`
+      + `KINO_LIBMPV_SURFACE_SPIKE=1`) provides a smaller
+      verification surface that does NOT require
+      `libmpv-dev` installation — useful for distro-shape
+      verification before committing to the full §6B-1
+      setup.
+
+  **Why this entry is filed.** Session 042's next-session
+  text enumerated the only Path-B candidates not yet
+  landed: (ii) re-enable the surface-spike env var
+  (landed S042); (iii) §6B Regression triage (depends on
+  human filings, none filed); (v) amend upstream drafts on
+  human feedback (depends on human submitting + maintainer
+  reviewing the drafts, neither has happened). At Session
+  043's start all three Path-B reactive candidates are
+  empty AND Path A's §6B-1 gate is `[ ]`. The agent has no
+  further code-side work on `main` that wouldn't be either
+  presumptuous (option (b)/(c) without human ratification
+  of the maintenance burden) or make-work (a second §6A
+  audit pass that would re-survey the same code; polish on
+  Known Issues / Tech Debt items that are explicitly "not
+  v1 scope" per the PRD §6A framework). The honest action
+  is to document the exhaustion + the required human
+  actions + return control.
+
+  **Session loop stability rule.** Sessions 044+ that find
+  the same exhaustion landscape as Session 043 (Path A
+  unavailable AND Path B(iii) empty AND Path B(v) empty)
+  **return control IMMEDIATELY without opening a PR**. The
+  harness AGENT_PROMPT Step 3 framing ("Pick the smallest
+  coherent unit of work that produces a mergeable PR") is
+  permissive of zero-work sessions when no coherent unit
+  of work exists. Spinning up a duplicate "work-
+  exhaustion documentation" session would itself be the
+  make-work Session 042's plan and this entry both
+  prohibit. Operationally for Sessions 044+ in this state:
+  no `git checkout -b`, no `git commit`, no
+  `mcp__github__create_pull_request` — just verify the
+  four exhaustion conditions hold (re-check the §6B
+  Verification list, the §6B Regressions section, and the
+  comment counts on the most-recent kino-side PRs via
+  `mcp__github__list_pull_requests`), then print the
+  harness's State A status line ("Session NNN merged.
+  Returning control. Next session: pick up from
+  STATE.md.") with `NNN = 043` (the most-recently-merged
+  session number) and stop. Re-documentation passes are
+  deferred until one of the three required human actions
+  above is performed and the landscape changes; that
+  changed landscape unblocks a substantive Session 044+
+  with real work (and a real PR).
+
+  **Resolution.** This entry is RESOLVED when any one of
+  the following holds:
+
+  -   **(i)** the human runs §6B-1 → the next session
+      lands F-015 `Cargo.toml::features.default` default-
+      flip + the §6A F-015 entry above flips to RESOLVED +
+      the F-015 Feature Tracker checkbox flips to `[x]`;
+  -   **(ii)** the human submits one of the librqbit
+      drafts upstream AND it lands AND the next session
+      bumps the librqbit dep + wires the new fields per the
+      doc's "Post-merge kino-side wiring" subsection +
+      either F-013 or F-014 §6A entry above flips to
+      RESOLVED + the corresponding Feature Tracker
+      checkbox flips to `[x]`;
+  -   **(iii)** the human ratifies the Session 034 PRD
+      revision proposal under PRD Issues → the next session
+      flips F-013 + F-014 §6A entries to RESOLVED + their
+      Feature Tracker checkboxes to `[x]` without code
+      changes (the relaxed PRD invariant is satisfied
+      as-is).
+
+  Until any of the above lands, the entry STAYS OPEN AND
+  the agent's session loop is in no-op-mode per the
+  "Session loop stability" paragraph.
 
 ---
 
