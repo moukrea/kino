@@ -200,6 +200,30 @@ pub fn run() {
             #[cfg(all(target_os = "linux", feature = "libmpv-inprocess"))]
             setup_libmpv_inprocess(app);
 
+            // PRD §F-015 / ADR-133 Route B / ADR-137 (Session 042
+            // developer affordance): when the `libmpv-surface-spike`
+            // Cargo feature is enabled AND the `KINO_LIBMPV_SURFACE_SPIKE`
+            // env var is set to `"1"`, run the GTK widget-tree surgery
+            // STANDALONE (no libmpv driver attached). The subprocess
+            // `MpvPlayer` from ADR-108 keeps vending `player_open`
+            // requests so the app still plays content; the spike's
+            // purpose is to let a developer verify the
+            // [`kino_player::inject_overlay`] surgery on their Linux
+            // distribution before opting into the full
+            // `libmpv-inprocess` feature (which requires `libmpv-dev`).
+            // Mutually exclusive with `libmpv-inprocess`: the cfg
+            // predicate excludes the spike call when the inprocess
+            // path is on (preventing a double-surgery error). Default
+            // builds compile this branch out entirely.
+            #[cfg(all(
+                target_os = "linux",
+                feature = "libmpv-surface-spike",
+                not(feature = "libmpv-inprocess")
+            ))]
+            if std::env::var("KINO_LIBMPV_SURFACE_SPIKE").as_deref() == Ok("1") {
+                run_libmpv_surface_spike(app);
+            }
+
             tracing::info!("kino host started (PRD §F-002 persistence ready)");
             Ok(())
         })
@@ -340,6 +364,59 @@ fn setup_libmpv_inprocess<R: tauri::Runtime>(app: &tauri::App<R>) {
 /// `libmpv-inprocess` feature is enabled on Linux.
 #[cfg(all(target_os = "linux", feature = "libmpv-inprocess"))]
 pub(crate) struct LibmpvPlayerHandle(pub(crate) std::sync::Arc<dyn kino_player::PlayerHandle>);
+
+/// Run the F-015 Linux libmpv GTK-surface spike (ADR-133 Route B,
+/// Session 036 → Session 042 / ADR-137). Reads the main webview window
+/// from the app handle, posts a `with_webview` closure to the GTK main
+/// thread, and inside that closure performs the
+/// [`kino_player::inject_overlay`] surgery on the underlying
+/// `webkit2gtk::WebView` — STANDALONE, with no libmpv driver attach.
+/// Result is logged at `info` (success) or `error` (failure); a failed
+/// surgery is non-fatal — the app continues with the unmodified widget
+/// tree and the subprocess `MpvPlayer` (ADR-108) keeps driving Linux
+/// playback.
+///
+/// Invoked from `setup()` iff the `libmpv-surface-spike` Cargo feature
+/// is enabled AND the `KINO_LIBMPV_SURFACE_SPIKE` env var is set to
+/// `"1"`. Default builds and the `libmpv-inprocess` feature build do
+/// NOT compile this function — the cfg predicate at the call site and
+/// the function definition both exclude it. The developer affordance
+/// lets one verify the GTK surgery on a Linux distro WITHOUT
+/// installing `libmpv-dev`; the inprocess feature ships the full
+/// driver once the surgery is known to work on the target hardware.
+#[cfg(all(
+    target_os = "linux",
+    feature = "libmpv-surface-spike",
+    not(feature = "libmpv-inprocess")
+))]
+fn run_libmpv_surface_spike<R: tauri::Runtime>(app: &tauri::App<R>) {
+    let Some(window) = app.get_webview_window("main") else {
+        tracing::warn!("libmpv-surface-spike: no 'main' webview window found");
+        return;
+    };
+    let result = window.with_webview(|platform_webview| {
+        let webview = platform_webview.inner();
+        match kino_player::inject_overlay(&webview) {
+            Ok(_surgery) => {
+                tracing::info!(
+                    "libmpv-surface-spike: GtkOverlay injected; webview reparented above GtkGLArea (ADR-137 standalone surgery OK)"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "libmpv-surface-spike: surgery failed (ADR-137 standalone surgery FAILED)"
+                );
+            }
+        }
+    });
+    if let Err(e) = result {
+        tracing::warn!(
+            error = %e,
+            "libmpv-surface-spike: with_webview dispatch failed; surgery not attempted"
+        );
+    }
+}
 
 /// Install the global `tracing` subscriber. When the per-platform config
 /// directory is writable, a daily-rotating file appender is layered next to

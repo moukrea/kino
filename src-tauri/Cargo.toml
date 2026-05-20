@@ -101,6 +101,21 @@ default = []
 # introduced. Session 038 adds the apt-install line + bundle deps and
 # flips the feature on by default after §6B-1 hardware verification.
 libmpv-inprocess = ["kino-player/libmpv-inprocess"]
+# F-015 Linux libmpv GTK-surface debug option (Session 042 / ADR-137).
+# Re-enables the `KINO_LIBMPV_SURFACE_SPIKE=1` env-var path that
+# Session 036 introduced and Session 037 superseded by the
+# `libmpv-inprocess` feature. With this feature ON (and the env var
+# set), the host invokes [`kino_player::inject_overlay`] standalone —
+# performing the GtkOverlay surgery without constructing a
+# `LibmpvPlayer`. The developer affordance lets one verify the surgery
+# on their Linux distro WITHOUT installing `libmpv-dev` first (the
+# subprocess `MpvPlayer` from ADR-108 still vends `player_open`
+# requests in this configuration, so playback continues working). The
+# feature is mutually exclusive with `libmpv-inprocess`: when both are
+# enabled the inprocess path runs and the surface-spike path is a
+# no-op (it would otherwise double-surgery the already-reparented
+# webview). Default builds compile out the spike entirely.
+libmpv-surface-spike = []
 
 [lints.rust]
 unsafe_code = "forbid"
