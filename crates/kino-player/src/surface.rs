@@ -88,19 +88,32 @@
 //!
 //! ## Trigger
 //!
-//! For the spike, the surgery is invoked at startup iff the env var
-//! `KINO_LIBMPV_SURFACE_SPIKE` is set to `"1"`. Default builds (and CI)
-//! load the module but do not invoke the surgery — preserving the
-//! Session-020 subprocess driver's runtime behavior unchanged. A human
-//! developer can opt-in by running `KINO_LIBMPV_SURFACE_SPIKE=1 cargo
-//! tauri dev` locally and observing the structural log line emitted by
-//! [`inject_overlay`].
+//! Two host-side call sites in `kino-app` invoke [`inject_overlay`],
+//! gated by mutually-exclusive Cargo features:
 //!
-//! Session 037 will replace the env-var gate with the `libmpv-inprocess`
-//! Cargo feature flag (per ADR-133) once the libmpv driver actually
-//! drives the GL area.
+//! 1.  **`libmpv-inprocess` feature ON (Session 037, ADR-133 / ADR-135).**
+//!     `kino_app_lib::setup_libmpv_inprocess` runs the surgery AND
+//!     attaches a [`LibmpvPlayer`] driver to the freshly-injected
+//!     `GLArea`. Production rollout path; flips on by default after
+//!     §6B-1 hardware verification (Session 038 deferred item (c)).
+//! 2.  **`libmpv-surface-spike` feature ON + `KINO_LIBMPV_SURFACE_SPIKE=1`
+//!     env var (Session 036 → Session 042, ADR-137).** Developer
+//!     affordance: runs the surgery STANDALONE (no driver attach) so a
+//!     developer can verify the widget-tree reparenting on their Linux
+//!     distro WITHOUT installing `libmpv-dev`. Mutually exclusive with
+//!     `libmpv-inprocess` (the cfg predicate excludes the spike call
+//!     when inprocess is on, preventing a double-surgery error). The
+//!     subprocess `MpvPlayer` (ADR-108) keeps driving playback when the
+//!     spike runs, so the app remains operational.
+//!
+//! Default builds compile out both call sites entirely. CI exercises
+//! the inprocess feature via the `lint` / `test` matrix (Session 038);
+//! the surface-spike feature is not in the matrix because its surface
+//! is small (one env-var check + a delegate call into `inject_overlay`)
+//! and ADR-137 explains the trade-off.
 //!
 //! [`libmpv2`]: https://crates.io/crates/libmpv2
+//! [`LibmpvPlayer`]: ../libmpv/struct.LibmpvPlayer.html
 
 #![cfg(target_os = "linux")]
 
